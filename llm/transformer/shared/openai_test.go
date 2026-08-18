@@ -1,6 +1,7 @@
 package shared
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -98,4 +99,12 @@ func TestOpenAIEncodeDecodeRoundTrip(t *testing.T) {
 	decoded := DecodeOpenAIEncryptedContent(encoded)
 	require.NotNil(t, decoded)
 	require.Equal(t, *original, *decoded)
+}
+
+func TestDecodeOpenAIEncryptedContent_RejectsConcatenatedBlobs(t *testing.T) {
+	first := "gAAAA" + strings.Repeat("A", 1287)
+	second := "gAAAA" + strings.Repeat("B", 1287)
+	content := first + second
+
+	require.Nil(t, DecodeOpenAIEncryptedContent(&content))
 }

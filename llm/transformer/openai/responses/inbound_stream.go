@@ -489,7 +489,26 @@ func (s *responsesInboundStream) handleReasoningSignature(delta *llm.Message, me
 	}
 	s.accumulatedReasoningSignature.WriteString(*delta.ReasoningSignature)
 
+	// When an item-scoped reasoning item is done, decide whether to coalesce
+	// or close based on whether the item has summary text.
+	//
+	// Upstream (e.g. gpt-5.6-luna xhigh) may emit a series of tiny reasoning
+	// items, each containing a single token of summary text and its own
+	// encrypted_content. By deferring the close when summary text exists,
+	// subsequent reasoning deltas are appended to the same item, producing
+	// one merged reasoning block for the client.
+	//
+	// Items with only encrypted_content (no summary text) — the normal
+	// gpt-5.x behavior — stay separate as the upstream intended.
+	//
+	// The final encrypted_content blob (from the last item.done) is kept as
+	// the item's signature; earlier provisional blobs are discarded.
 	if itemScoped && itemMetadata.Done {
+		if s.accumulatedReasoning.Len() > 0 {
+			// Has summary text — defer close to allow coalescing.
+			return nil
+		}
+		// No summary text (encrypted-only item) — close immediately.
 		return s.closeReasoningItem()
 	}
 
@@ -541,9 +560,13 @@ func (s *responsesInboundStream) ensureReasoningItemStarted(sourceID string) err
 			return nil
 		}
 
-		if err := s.closeReasoningItem(); err != nil {
-			return err
-		}
+		// Coalesce mode: a new reasoning sourceID arrived while the current
+		// reasoning item is still open (because we deferred closeReasoningItem
+		// in handleReasoningSignature). Instead of closing and reopening,
+		// keep the current item open and append the new content to it.
+		// Update the sourceID so subsequent signature events can match.
+		s.currentReasoningSourceID = sourceID
+		return nil
 	}
 
 	// Close any previous output item.

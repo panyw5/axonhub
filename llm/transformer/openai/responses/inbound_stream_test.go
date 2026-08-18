@@ -324,13 +324,13 @@ func TestInboundTransformer_TransformStream_UsesItemMetadataForSummaryDeltas(t *
 		}
 	}
 	require.NoError(t, stream.Err())
-	require.Len(t, doneItems, 2)
-	require.Equal(t, "rs_first", doneItems[0].ID)
-	require.Equal(t, "first", doneItems[0].Summary[0].Text)
-	require.Equal(t, "gAAAA_FIRST_BLOB", lo.FromPtr(doneItems[0].EncryptedContent))
-	require.Equal(t, "rs_second", doneItems[1].ID)
-	require.Equal(t, "second", doneItems[1].Summary[0].Text)
-	require.Equal(t, "gAAAA_SECOND_BLOB", lo.FromPtr(doneItems[1].EncryptedContent))
+
+	// Consecutive reasoning items with summary text are coalesced into one
+	// merged item. The summary texts are concatenated, and the last
+	// encrypted_content blob is kept as the item's signature.
+	require.Len(t, doneItems, 1)
+	require.Equal(t, "firstsecond", doneItems[0].Summary[0].Text)
+	require.Equal(t, "gAAAA_SECOND_BLOB", lo.FromPtr(doneItems[0].EncryptedContent))
 }
 
 func TestInboundTransformer_TransformStream_PreservesWebSearchCallsFromChunkMetadata(t *testing.T) {

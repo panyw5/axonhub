@@ -14,6 +14,7 @@ import (
 	"github.com/looplj/axonhub/llm/httpclient"
 	"github.com/looplj/axonhub/llm/pipeline"
 	"github.com/looplj/axonhub/llm/streams"
+	"github.com/looplj/axonhub/llm/transformer/shared"
 )
 
 // codexResponsesPassThroughHeaders contains client metadata that Codex-compatible
@@ -56,6 +57,15 @@ func (p *PersistentOutboundTransformer) isPassThroughEnabled(ctx context.Context
 		return false
 	}
 
+	if incompatible := countIncompatibleResponsesReasoningSignatures(llmReq); incompatible > 0 {
+		log.Warn(ctx, "disabled Responses pass-through for incompatible reasoning signatures",
+			log.String("channel", channel.Name),
+			log.Int("channel_id", channel.ID),
+			log.Int("signature_count", incompatible),
+		)
+		return false
+	}
+
 	var enabled bool
 
 	switch {
@@ -73,6 +83,35 @@ func (p *PersistentOutboundTransformer) isPassThroughEnabled(ctx context.Context
 	}
 
 	return enabled
+}
+
+func countIncompatibleResponsesReasoningSignatures(request *llm.Request) int {
+	if request == nil ||
+		(request.APIFormat != llm.APIFormatOpenAIResponse && request.APIFormat != llm.APIFormatOpenAIResponseCompact) {
+		return 0
+	}
+
+	count := 0
+	for _, message := range request.Messages {
+		if len(message.ReasoningItems) > 0 {
+			for _, item := range message.ReasoningItems {
+				signature := item.Signature
+				if signature != "" && shared.DecodeOpenAIEncryptedContent(&signature) == nil {
+					count++
+				}
+			}
+			continue
+		}
+
+		if message.ReasoningSignature != nil && *message.ReasoningSignature != "" {
+			signature := *message.ReasoningSignature
+			if shared.DecodeOpenAIEncryptedContent(&signature) == nil {
+				count++
+			}
+		}
+	}
+
+	return count
 }
 
 func passThroughStreamAligned(originalStream, effectiveStream *bool) bool {

@@ -272,6 +272,38 @@ func TestIsPassThroughEnabled_DisablesWhenSupportedStreamParameterChanges(t *tes
 	assert.False(t, outbound.isPassThroughEnabled(ctx, nil))
 }
 
+func TestIsPassThroughEnabled_DisablesForIncompatibleResponsesReasoningSignatures(t *testing.T) {
+	ctx := context.Background()
+	channel := &biz.Channel{
+		Channel: &ent.Channel{
+			ID:   666,
+			Name: "aether",
+			Settings: &objects.ChannelSettings{
+				PassThroughBody: lo.ToPtr(true),
+			},
+		},
+	}
+	state := &PersistenceState{
+		CurrentCandidate: &ChannelModelsCandidate{Channel: channel},
+		LlmRequest: &llm.Request{
+			APIFormat: llm.APIFormatOpenAIResponse,
+			Messages: []llm.Message{{
+				ReasoningItems: []llm.ReasoningItem{{Signature: "7OXj foreign reasoning signature"}},
+			}},
+			RawRequest: &httpclient.Request{
+				APIFormat: string(llm.APIFormatOpenAIResponse),
+				Body:       []byte(`{"model":"gpt-5.6-luna","stream":true}`),
+			},
+		},
+		RawProviderRequest: &httpclient.Request{
+			APIFormat: string(llm.APIFormatOpenAIResponse),
+		},
+	}
+	outbound := &PersistentOutboundTransformer{state: state}
+
+	assert.False(t, outbound.isPassThroughEnabled(ctx, nil))
+}
+
 func TestIsPassThroughEnabled_DisablesWhenSupportedStreamParameterMissingButStreamingRequested(t *testing.T) {
 	ctx := context.Background()
 	channel := &biz.Channel{

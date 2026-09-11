@@ -16,7 +16,7 @@ import (
 )
 
 // TestCommandCodeOutboundRouting locks in the Command Code outbound contract:
-//   - commandcode            -> OpenAI chat completions at baseURL + "/chat/completions", Authorization: Bearer
+//   - commandcode            -> Command Code JSONL API at baseURL + "/alpha/generate", Authorization: Bearer
 //   - commandcode_anthropic  -> Anthropic messages at baseURL + "/messages", Authorization: Bearer
 //   - ordinary anthropic direct channels keep X-API-Key
 func TestCommandCodeOutboundRouting(t *testing.T) {
@@ -35,10 +35,10 @@ func TestCommandCodeOutboundRouting(t *testing.T) {
 		}
 	}
 
-	base := "https://api.commandcode.ai/provider/v1"
+	base := "https://api.commandcode.ai"
 	anthropicBase := "https://api.commandcode.ai/provider/v1"
 
-	t.Run("commandcode chat uses /chat/completions with Bearer", func(t *testing.T) {
+	t.Run("commandcode chat uses /alpha/generate with Bearer", func(t *testing.T) {
 		c := &ent.Channel{
 			ID:          1,
 			Name:        "cc",
@@ -55,9 +55,8 @@ func TestCommandCodeOutboundRouting(t *testing.T) {
 
 		httpReq, err := outbound.TransformRequest(ctx, newRequest("gpt-5-codex"))
 		require.NoError(t, err)
-		require.Equal(t, "https://api.commandcode.ai/provider/v1/chat/completions", httpReq.URL)
-		require.Equal(t, "sk-test", httpReq.Auth.APIKey)
-		require.Equal(t, httpclient.AuthTypeBearer, httpReq.Auth.Type)
+		require.Equal(t, "https://api.commandcode.ai/alpha/generate", httpReq.URL)
+		require.Equal(t, "Bearer sk-test", httpReq.Headers.Get("Authorization"))
 	})
 
 	t.Run("commandcode chat accepts OpenAI-format models", func(t *testing.T) {
@@ -76,7 +75,7 @@ func TestCommandCodeOutboundRouting(t *testing.T) {
 		for _, model := range []string{"gpt-5-codex", "deepseek-v3"} {
 			httpReq, err := outbound.TransformRequest(ctx, newRequest(model))
 			require.NoError(t, err)
-			require.Equal(t, "https://api.commandcode.ai/provider/v1/chat/completions", httpReq.URL)
+			require.Equal(t, "https://api.commandcode.ai/alpha/generate", httpReq.URL)
 		}
 	})
 
@@ -185,7 +184,7 @@ func TestCommandCodeOutboundRouting(t *testing.T) {
 		require.NoError(t, err)
 		httpReq, err := ch.Outbounds[llm.APIFormatOpenAIChatCompletion.String()].TransformRequest(ctx, newRequest("gpt-5-codex"))
 		require.NoError(t, err)
-		require.Equal(t, "stored-key", httpReq.Auth.APIKey)
+		require.Equal(t, "Bearer stored-key", httpReq.Headers.Get("Authorization"))
 	})
 
 	t.Run("insecure base URL is rejected", func(t *testing.T) {

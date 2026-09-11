@@ -75,6 +75,11 @@ const (
 	AuthTypeBearer = "bearer"
 	AuthTypeAPIKey = "api_key"
 
+	// MetadataStreamDecoderContentType overrides response Content-Type only for
+	// stream decoder selection. It is useful for providers that advertise SSE
+	// while sending newline-delimited JSON.
+	MetadataStreamDecoderContentType = "stream_decoder_content_type"
+
 	// BinaryStreamDoneEventType marks EOF for non-SSE streaming responses.
 	BinaryStreamDoneEventType = "binary.done"
 )

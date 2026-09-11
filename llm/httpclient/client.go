@@ -401,6 +401,9 @@ func (hc *HttpClient) DoStream(ctx context.Context, request *Request) (streams.S
 
 	// Determine content type and select appropriate decoder
 	contentType := rawResp.Header.Get("Content-Type")
+	if request.Metadata != nil && request.Metadata[MetadataStreamDecoderContentType] != "" {
+		contentType = request.Metadata[MetadataStreamDecoderContentType]
+	}
 	if contentType == "" {
 		contentType = "text/event-stream" // Default to SSE
 	}

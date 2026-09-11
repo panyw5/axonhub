@@ -26,6 +26,7 @@ import (
 	"github.com/looplj/axonhub/llm/transformer/bailian"
 	"github.com/looplj/axonhub/llm/transformer/cerebras"
 	"github.com/looplj/axonhub/llm/transformer/cline"
+	commandcodetransformer "github.com/looplj/axonhub/llm/transformer/commandcode"
 	"github.com/looplj/axonhub/llm/transformer/deepseek"
 	"github.com/looplj/axonhub/llm/transformer/doubao"
 	"github.com/looplj/axonhub/llm/transformer/fireworks"
@@ -395,6 +396,13 @@ func (svc *ChannelService) buildNonDefaultEndpointOutbound(
 	case llm.APIFormatOpenAIChatCompletion.String():
 		if c.Type == channel.TypeCline {
 			return cline.NewOutboundTransformerWithConfig(&cline.Config{
+				BaseURL:        baseURL,
+				EndpointPath:   ep.Path,
+				APIKeyProvider: apiKeyProvider(),
+			})
+		}
+		if c.Type == channel.TypeCommandcode {
+			return commandcodetransformer.NewOutboundTransformerWithConfig(&commandcodetransformer.Config{
 				BaseURL:        baseURL,
 				EndpointPath:   ep.Path,
 				APIKeyProvider: apiKeyProvider(),
@@ -1129,8 +1137,7 @@ func (svc *ChannelService) buildChannelWithTransformer(c *ent.Channel, apiKeyOve
 
 		return ch, nil
 	case channel.TypeCommandcode:
-		transformer, err := openai.NewOutboundTransformerWithConfig(&openai.Config{
-			PlatformType:   openai.PlatformOpenAI,
+		transformer, err := commandcodetransformer.NewOutboundTransformerWithConfig(&commandcodetransformer.Config{
 			BaseURL:        c.BaseURL,
 			APIKeyProvider: getAPIKeyProvider(ch),
 		})

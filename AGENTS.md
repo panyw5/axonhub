@@ -6,9 +6,36 @@ This file provides guidance to AI coding assistants when working with code in th
 
 ## Global Rules
 
-1. Do NOT run lint or build commands unless explicitly requested by the user.
-2. Do NOT restart the development server — it's already started and managed.
-3. All summary files should be stored in `.agent/summary` directory if available.
+1. Do NOT run lint or build commands unless explicitly REQUESTED by the user.
+2. All summary files should be stored in `.agent/summary` directory if available.
+
+
+## Build and deploy
+
+When user requests to build or deploy the project, follow these steps:
+
+1. Build the frontend
+   ```bash
+   cd frontend
+    pnpm install --ignore-workspace --frozen-lockfile
+    ./node_modules/.bin/vite build
+  ```
+2. Replace the `frontend/dist` directory in the backend with the newly built frontend files.
+   ```bath
+   cd ..
+   rm -rf internal/server/static/dist/assets
+   cp -R frontend/dist/. internal/server/static/dist/
+   ```
+3. Build backend and restart
+   ```
+   go build -ldflags "-s -w" -tags=nomsgpack \
+   -o axonhub ./cmd/axonhub
+
+   ./deploy/stop.sh
+   sudo cp axonhub /usr/local/bin/axonhub
+   ./deploy/start.sh
+   ```
+4. Verify version: check the frontpage js hash
 
 ## Configuration
 

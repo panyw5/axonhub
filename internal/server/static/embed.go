@@ -1,8 +1,10 @@
 package static
 
 import (
+	"crypto/sha256"
 	"embed"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"strings"
 
@@ -35,6 +37,15 @@ func init() {
 	if err != nil {
 		panic(err)
 	}
+
+	index, err := dist.ReadFile("dist/index.html")
+	if err != nil {
+		panic(err)
+	}
+	slog.Info("embedded frontend loaded",
+		slog.Int("index_bytes", len(index)),
+		slog.String("index_sha256", fmt.Sprintf("%x", sha256.Sum256(index))),
+	)
 }
 
 func Handler() gin.HandlerFunc {

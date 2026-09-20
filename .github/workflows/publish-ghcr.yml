@@ -1,6 +1,11 @@
 name: Publish GHCR image
 
 on:
+  push:
+    branches:
+      - v1.0.0-beta10
+    paths:
+      - .github/workflows/publish-ghcr.yml
   workflow_dispatch:
 
 permissions:

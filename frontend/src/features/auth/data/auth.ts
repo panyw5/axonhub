@@ -1,13 +1,18 @@
 import { useEffect } from 'react';
-import { useMutation, useQuery } from '@tanstack/react-query';
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useRouter } from '@tanstack/react-router';
+import { pickFallbackNavUrl } from '@/config/nav-items';
 import { graphqlRequest } from '@/gql/graphql';
 import { ME_QUERY } from '@/gql/users';
 import { toast } from 'sonner';
 import { useAuthStore, setTokenToStorage, removeTokenFromStorage } from '@/stores/authStore';
 import { AuthUser } from '@/stores/authStore';
+import { useProjectStore } from '@/stores/projectStore';
+import { getHiddenNavItems } from '@/stores/sidebarPrefsStore';
 import { authApi } from '@/lib/api-client';
 import i18n from '@/lib/i18n';
+import { isProjectSelectionValid } from '@/lib/project-membership';
+import { consumeOIDCRedirect, getSafeRedirect, storeOIDCRedirect } from '@/lib/auth-redirect';
 
 export interface SignInInput {
   email: string;
@@ -20,14 +25,18 @@ interface MeResponse {
 
 export function useMe(enabled = true) {
   const { setUser } = useAuthStore((state) => state.auth);
+  const accessToken = useAuthStore((state) => state.auth.accessToken);
 
   const query = useQuery({
-    queryKey: ['me'],
+    // Keying by token keeps account switches (including the 401-expiry path,
+    // which doesn't clear the query cache) from reusing another account's
+    // cached memberships.
+    queryKey: ['me', accessToken],
     queryFn: async () => {
       const data = await graphqlRequest<MeResponse>(ME_QUERY);
       return data.me;
     },
-    enabled: enabled && !!useAuthStore.getState().auth.accessToken,
+    enabled: enabled && !!accessToken,
     retry: false,
   });
 
@@ -35,6 +44,15 @@ export function useMe(enabled = true) {
   useEffect(() => {
     if (query.data) {
       const userLanguage = query.data.preferLanguage || 'en';
+
+      // The selected project is persisted per browser, but only valid for the
+      // user it belonged to. Drop any project the current user is not a member
+      // of so a stale selection from a previous account is never sent to the
+      // server as X-Project-ID.
+      const { selectedProjectId, clearSelectedProjectId } = useProjectStore.getState();
+      if (!isProjectSelectionValid(query.data, selectedProjectId)) {
+        clearSelectedProjectId();
+      }
 
       setUser(query.data);
 
@@ -48,7 +66,7 @@ export function useMe(enabled = true) {
   return query;
 }
 
-export function useSignIn() {
+export function useSignIn(redirect?: string) {
   const { setUser, setAccessToken } = useAuthStore((state) => state.auth);
   const router = useRouter();
 
@@ -66,6 +84,11 @@ export function useSignIn() {
       setAccessToken(data.token);
       setUser(data.user);
 
+      // Do not clear the persisted project here: the AuthGuard gates
+      // project-scoped queries until the selected project is validated
+      // against this user's memberships (useMe clears it when stale), so a
+      // returning user keeps their last selection while another account's
+      // stale selection can never leak into a request.
       // Initialize i18n with user's preferred language
       if (userLanguage !== i18n.language) {
         i18n.changeLanguage(userLanguage);
@@ -73,9 +96,18 @@ export function useSignIn() {
 
       toast.success(i18n.t('common.success.signedIn'));
 
-      // Redirect based on user role
-      // Owner users go to dashboard, non-owner users go to requests page
-      const redirectPath = data.user.isOwner ? '/' : '/project/playground';
+      // Return to the page that triggered the sign-in, if any.
+      consumeOIDCRedirect();
+      const safeRedirect = getSafeRedirect(redirect);
+      if (safeRedirect) {
+        router.history.push(safeRedirect);
+        return;
+      }
+
+      // Redirect based on user role, skipping routes the user hid from the sidebar.
+      // Owner users go to dashboard, non-owner users go to requests page.
+      const baseRedirectPath = data.user.isOwner ? '/' : '/project/playground';
+      const redirectPath = pickFallbackNavUrl(baseRedirectPath, getHiddenNavItems(), data.user.isOwner);
       router.navigate({ to: redirectPath });
     },
     onError: (error: any) => {
@@ -88,6 +120,7 @@ export function useSignIn() {
 export function useSignOut() {
   const { reset } = useAuthStore((state) => state.auth);
   const router = useRouter();
+  const queryClient = useQueryClient();
 
   return () => {
     // Clear token from localStorage
@@ -96,13 +129,14 @@ export function useSignOut() {
     // Clear auth store
     reset();
 
+    queryClient.clear();
+
     toast.success(i18n.t('common.success.signedOut'));
 
     // Redirect to sign in page
     router.navigate({ to: '/sign-in' });
   };
 }
-
 
 export function useOIDCProviders() {
   return useQuery({
@@ -116,13 +150,14 @@ export function useOIDCProviders() {
   });
 }
 
-export function useOIDCAuthorize() {
+export function useOIDCAuthorize(redirect?: string) {
   return useMutation({
     mutationFn: async (providerId: string) => {
       return await authApi.getOIDCAuthorizeURL(providerId);
     },
     onSuccess: (response) => {
       if (response && response.data && response.data.url) {
+        storeOIDCRedirect(redirect);
         window.location.href = response.data.url;
       } else {
         toast.error('Invalid authorization URL received');
@@ -145,7 +180,7 @@ export function useOIDCExchange() {
     },
     onSuccess: (response) => {
       const data = response.data;
-      
+
       // Store token in localStorage
       setTokenToStorage(data.token);
 
@@ -155,12 +190,23 @@ export function useOIDCExchange() {
       setAccessToken(data.token);
       setUser(data.user);
 
+      // Do not clear the persisted project here: the AuthGuard gates
+      // project-scoped queries until the selected project is validated
+      // against this user's memberships (useMe clears it when stale), so a
+      // returning user keeps their last selection while another account's
+      // stale selection can never leak into a request.
       // Initialize i18n with user's preferred language
       if (userLanguage !== i18n.language) {
         i18n.changeLanguage(userLanguage);
       }
 
       toast.success(i18n.t('common.success.signedIn'));
+
+      const safeRedirect = consumeOIDCRedirect();
+      if (safeRedirect) {
+        router.history.push(safeRedirect);
+        return;
+      }
 
       // Redirect based on user role
       const redirectPath = data.user.isOwner ? '/' : '/project/playground';
@@ -169,7 +215,7 @@ export function useOIDCExchange() {
     onError: (error: unknown) => {
       const errorMessage = error instanceof Error ? error.message : 'SSO login failed';
       toast.error(errorMessage);
-      router.navigate({ to: '/sign-in' });
+      router.navigate({ to: '/sign-in', search: { redirect: consumeOIDCRedirect() } });
     },
   });
 }

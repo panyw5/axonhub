@@ -130,18 +130,23 @@ func (c *NeuralWattQuotaChecker) parseResponse(body []byte) (QuotaData, error) {
 		}
 	}
 
-	limits := []QuotaLimitStatus{
-		NewTokenLimitStatus(normalizedStatus, usageRatio, nextResetAt),
-	}
+	limit := NewTokenLimitStatus(normalizedStatus, usageRatio, nextResetAt)
+	limit.Window = "kwh"
+	// The kWh window resets monthly at kwh_reset_date; stamping the period
+	// start is what enables the on-track marker and the period cost/quota
+	// estimate shared with the other windowed providers.
+	limit.PeriodStart = PeriodStartFromMonthlyReset(nextResetAt)
 
-	return QuotaData{
+	limits := []QuotaLimitStatus{limit}
+
+	return NormalizeQuotaData(QuotaData{
 		Status:       normalizedStatus,
 		ProviderType: "neuralwatt",
 		RawData:      rawData,
 		NextResetAt:  nextResetAt,
 		Ready:        IsReadyStatus(normalizedStatus),
 		Limits:       limits,
-	}, nil
+	}), nil
 }
 
 func (c *NeuralWattQuotaChecker) SupportsChannel(ch *ent.Channel) bool {
@@ -207,7 +212,6 @@ func convertNeuralWattSubscriptionToMap(sub *NeuralWattSubscription) map[string]
 	if sub.Status != nil {
 		result["status"] = *sub.Status
 	}
-
 
 	if sub.KwhIncluded != nil {
 		result["kwh_included"] = *sub.KwhIncluded

@@ -61,7 +61,12 @@ func hasMessageContent(msg *llm.Message) bool {
 		return true
 	}
 
-	if msg.Audio != nil {
+	// An audio-only assistant message carries no text, tool call or reasoning, so
+	// without this it looks empty and triggers a retry of a response the upstream
+	// already produced and billed. Only audio that actually carries bytes or a
+	// transcript counts; a present-but-empty audio object stays empty, matching the
+	// speech guards above.
+	if msg.Audio != nil && (msg.Audio.Data != "" || msg.Audio.Transcript != "") {
 		return true
 	}
 
@@ -123,6 +128,14 @@ func hasResponseContent(resp *llm.Response) bool {
 	}
 
 	if resp.AlphaSearch != nil && len(resp.AlphaSearch.Body) > 0 {
+		return true
+	}
+
+	if resp.SystemOne != nil && len(resp.SystemOne.Answers) > 0 {
+		return true
+	}
+
+	if resp.Decisions != nil && len(resp.Decisions.Answers) > 0 {
 		return true
 	}
 

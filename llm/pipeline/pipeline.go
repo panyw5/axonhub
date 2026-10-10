@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"time"
 
 	"github.com/looplj/axonhub/llm"
@@ -286,6 +287,9 @@ func (p *pipeline) Process(ctx context.Context, request *httpclient.Request) (*R
 		}
 
 		lastErr = err
+		if errors.Is(lastErr, transformer.ErrUnsupportedConversion) {
+			return nil, lastErr
+		}
 		if errors.Is(lastErr, ErrPreCommitBufferExceeded) || errors.Is(lastErr, httpclient.ErrStreamEventTooLarge) {
 			return nil, lastErr
 		}
@@ -360,12 +364,14 @@ func (p *pipeline) Process(ctx context.Context, request *httpclient.Request) (*R
 
 func (p *pipeline) processRequest(ctx context.Context, request *llm.Request) (*Result, error) {
 	originalWantStream := request.Stream != nil && *request.Stream
+	metadata := maps.Clone(request.TransformerMetadata)
 
 	httpReq, err := p.Outbound.TransformRequest(ctx, request)
 	if err != nil {
 		return nil, fmt.Errorf("failed to transform request: %w", err)
 	}
 
+	httpReq.TransformerMetadata = mergeTransformerMetadata(metadata, httpReq.TransformerMetadata)
 	httpReq = httpclient.MergeInboundRequest(httpReq, request.RawRequest)
 
 	httpReq, err = httpclient.FinalizeAuthHeaders(httpReq)

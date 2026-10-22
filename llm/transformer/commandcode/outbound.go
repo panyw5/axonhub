@@ -22,7 +22,7 @@ import (
 const (
 	defaultBaseURL         = "https://api.commandcode.ai"
 	generatePath           = "/alpha/generate"
-	commandCodeVersion     = "1.28.1"
+	commandCodeVersion     = "1.66.0"
 	defaultMaxOutputTokens = int64(64_000)
 )
 

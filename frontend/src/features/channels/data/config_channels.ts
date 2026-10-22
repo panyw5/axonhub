@@ -902,7 +902,7 @@ export const CHANNEL_CONFIGS: Record<ChannelType, ChannelConfig> = {
   },
   commandcode: {
     channelType: 'commandcode',
-    baseURL: 'https://api.commandcode.ai/provider/v1',
+    baseURL: 'https://api.commandcode.ai',
     defaultModels: [],
     apiFormat: OPENAI_CHAT_COMPLETIONS,
     color: 'bg-cyan-100 text-cyan-800 border-cyan-200',

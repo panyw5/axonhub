@@ -280,7 +280,7 @@ test('channel proxy connection reuse setting is submitted, echoed, and localized
     '适用于 Resin 等按连接切换节点的代理池。开启后每个请求都会重新建立代理连接，并增加 CONNECT 与 TLS 握手开销。'
   );
 });
-test('Command Code exposes OpenAI and Anthropic channel variants with shared base URL', () => {
+test('Command Code uses CLI and Provider API base URLs for its channel variants', () => {
   const schema = read('features/channels/data/schema.ts');
   const channelsConfig = read('features/channels/data/config_channels.ts');
   const providersConfig = read('features/channels/data/config_providers.ts');
@@ -296,13 +296,13 @@ test('Command Code exposes OpenAI and Anthropic channel variants with shared bas
   assert.match(schema, /channelSettingsSchema[\s\S]*providerQuota:[\s\S]*channelProviderQuotaSettingsSchema/);
   assert.match(
     channelsConfig,
-    /commandcode:\s*{[\s\S]*?channelType:\s*'commandcode'[\s\S]*?baseURL:\s*'https:\/\/api\.commandcode\.ai\/provider\/v1'[\s\S]*?defaultModels:\s*\[\][\s\S]*?apiFormat:\s*OPENAI_CHAT_COMPLETIONS,/,
-    'commandcode should use the shared base URL with OpenAI chat completions and no static models'
+    /commandcode:\s*{[\s\S]*?channelType:\s*'commandcode'[\s\S]*?baseURL:\s*'https:\/\/api\.commandcode\.ai'[\s\S]*?defaultModels:\s*\[\][\s\S]*?apiFormat:\s*OPENAI_CHAT_COMPLETIONS,/,
+    'commandcode should use the CLI base URL with OpenAI chat completions and no static models'
   );
   assert.match(
     channelsConfig,
     /commandcode_anthropic:\s*{[\s\S]*?channelType:\s*'commandcode_anthropic'[\s\S]*?baseURL:\s*'https:\/\/api\.commandcode\.ai\/provider\/v1'[\s\S]*?defaultModels:\s*\[\][\s\S]*?apiFormat:\s*ANTHROPIC_MESSAGES,/,
-    'commandcode_anthropic should use the shared base URL with Anthropic messages and no static models'
+    'commandcode_anthropic should use the Provider API base URL with Anthropic messages and no static models'
   );
   assert.match(channelsConfig, /CHANNEL_TYPE_TO_PROVIDER[\s\S]*commandcode_anthropic:\s*'commandcode'/);
   assert.match(

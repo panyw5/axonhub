@@ -455,6 +455,24 @@ func TestPrepareModelsEndpoint(t *testing.T) {
 			expectedURL: "https://ark.cn-beijing.volces.com/api/v3/models",
 		},
 		{
+			name:        "CommandCode CLI root uses provider catalog",
+			channelType: channel.TypeCommandcode,
+			baseURL:     "https://api.commandcode.ai/",
+			expectedURL: "https://api.commandcode.ai/provider/v1/models",
+		},
+		{
+			name:        "CommandCode anthropic root uses provider catalog",
+			channelType: channel.TypeCommandcodeAnthropic,
+			baseURL:     "https://api.commandcode.ai",
+			expectedURL: "https://api.commandcode.ai/provider/v1/models",
+		},
+		{
+			name:        "CommandCode raw root keeps explicit models path",
+			channelType: channel.TypeCommandcode,
+			baseURL:     "https://api.commandcode.ai#",
+			expectedURL: "https://api.commandcode.ai/models",
+		},
+		{
 			name:        "CommandCode provider base without /v1",
 			channelType: channel.TypeCommandcode,
 			baseURL:     "https://api.commandcode.ai/provider",

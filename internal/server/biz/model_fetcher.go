@@ -3,6 +3,7 @@ package biz
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -590,6 +591,9 @@ func (f *ModelFetcher) FetchModels(ctx context.Context, input FetchModelsInput) 
 		if codexChannel != nil {
 			return &FetchModelsResult{Models: f.getDefaultModelsByType(ctx, channel.TypeCodex), Fallback: true}, nil
 		}
+		if isCommandCodeChannelType(channelType) {
+			logCommandCodeModelFetchError(ctx, modelsURL, apiKey, err)
+		}
 		if isQiniuChannelType(channelType) {
 			return &FetchModelsResult{
 				Models: qiniuFallbackModels,
@@ -649,6 +653,36 @@ func parseCodexModels(body []byte) ([]ModelIdentify, error) {
 		return nil, err
 	}
 	return lo.Map(ids, func(id string, _ int) ModelIdentify { return ModelIdentify{ID: id} }), nil
+}
+
+func logCommandCodeModelFetchError(ctx context.Context, modelsURL, apiKey string, err error) {
+	parsedURL, parseErr := url.Parse(modelsURL)
+	if parseErr != nil {
+		slog.ErrorContext(ctx, "Command Code model fetch failed", slog.String("error_type", fmt.Sprintf("%T", err)))
+		return
+	}
+	parsedURL.User = nil
+	parsedURL.RawQuery = ""
+	parsedURL.Fragment = ""
+
+	attrs := []any{slog.String("url", parsedURL.String()), slog.String("error_type", fmt.Sprintf("%T", err))}
+	var httpErr *httpclient.Error
+	if errors.As(err, &httpErr) {
+		responseBody := string(httpErr.Body)
+		if apiKey != "" {
+			responseBody = strings.ReplaceAll(responseBody, apiKey, "[redacted]")
+		}
+		if len(responseBody) > 512 {
+			responseBody = responseBody[:512] + "..."
+		}
+		attrs = append(attrs,
+			slog.Int("status_code", httpErr.StatusCode),
+			slog.String("content_type", httpErr.Headers.Get("Content-Type")),
+			slog.String("trace_id", httpErr.Headers.Get("X-Trace-Id")),
+			slog.String("response_body", responseBody),
+		)
+	}
+	slog.ErrorContext(ctx, "Command Code model fetch failed", attrs...)
 }
 
 type geminiListModelsResponse struct {
@@ -798,6 +832,10 @@ func (f *ModelFetcher) prepareModelsEndpoint(channelType channel.Type, baseURL s
 	case isCommandCodeChannelType(channelType):
 		baseURL = strings.TrimSuffix(baseURL, "/anthropic")
 		baseURL = strings.TrimSuffix(baseURL, "/claude")
+		// CLI inference uses the root host, but the public model catalog is under /provider/v1.
+		if !useRawURL && baseURL == "https://api.commandcode.ai" {
+			return baseURL + "/provider/v1/models", headers
+		}
 
 		if useRawURL {
 			return baseURL + "/models", headers

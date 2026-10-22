@@ -12,6 +12,10 @@
 !Dockerfile
 !VERSION
 
+# Local binary backups produced while swapping builds
+axonhub.bak.*
+axonhub.new
+
 
 # Unignore all dirs
 !*/

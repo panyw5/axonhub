@@ -34,6 +34,12 @@ const { getQuotaLimits, quotaWindowLabel } = await import(
 );
 const t = (key) => key;
 
+test('Devin renders normalized daily and weekly quota windows', () => {
+  const limits = ['daily', 'weekly'].map((window) => ({ type: 'token', status: 'available', ready: true, window, usageRatio: 0.25 }));
+  const parsed = getQuotaLimits({ type: 'devin', providerQuotaStatus: { quotaData: { _limits: limits } } });
+  assert.deepEqual(parsed.map((limit) => limit.window), ['daily', 'weekly']);
+});
+
 test('Antigravity shared pools preserve independent 5h and 7d windows', () => {
   const windows = ['gemini_5h', 'gemini_7d', 'claude_gpt_5h', 'claude_gpt_7d'];
   const limits = windows.map((window, i) => ({ type: 'token', status: 'available', ready: true, window, usageRatio: (i + 1) / 10 }));

@@ -2,6 +2,7 @@ import { z } from 'zod';
 import { pageInfoSchema } from '@/gql/pagination';
 
 export const apiFormatSchema = z.enum([
+  'devin/chat',
   'openai/chat_completions',
   'openai/responses',
   'openai/responses-ws',
@@ -31,6 +32,7 @@ export const apiFormatSchema = z.enum([
 export type ApiFormat = z.infer<typeof apiFormatSchema>;
 
 export const configurableChannelEndpointApiFormats = [
+  'devin/chat',
   'openai/chat_completions',
   'openai/responses',
   'openai/image_generation',
@@ -74,6 +76,7 @@ export type DetectedChannelEndpoint = z.infer<typeof detectedChannelEndpointSche
 
 // Channel Types
 export const channelTypeSchema = z.enum([
+  'devin',
   'openai',
   'openai_responses',
   'atlascloud',

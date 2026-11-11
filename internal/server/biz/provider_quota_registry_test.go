@@ -21,6 +21,7 @@ func TestProviderQuotaService_RegistryCoverageMatrix(t *testing.T) {
 	svc.registerProviderQuotaSupport()
 
 	expectedCheckers := []string{
+		"devin",
 		"apertis", "antigravity", "charm_hyper", "claudecode", "cline", "codex",
 		"commandcode", "github_copilot", "kimi_code", "minimax", "nanogpt",
 		"neuralwatt", "opencode_go", "synthetic", "wafer", "xai_subscription",
@@ -33,6 +34,7 @@ func TestProviderQuotaService_RegistryCoverageMatrix(t *testing.T) {
 		channelType channel.Type
 		baseURL     string
 	}{
+		{"devin", channel.TypeDevin, ""},
 		{"claudecode", channel.TypeClaudecode, ""},
 		{"codex", channel.TypeCodex, ""},
 		{"antigravity", channel.TypeAntigravity, ""},

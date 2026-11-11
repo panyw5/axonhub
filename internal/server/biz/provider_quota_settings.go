@@ -12,6 +12,7 @@ import (
 const SystemKeyProviderQuotaCollectionSettings = "provider_quota_collection_settings"
 
 var supportedProviderQuotaTypes = []string{
+	"devin",
 	"claudecode", "codex", "antigravity", "github_copilot", "nanogpt", "cline",
 	"xai_subscription",
 	"wafer", "synthetic", "neuralwatt", "apertis", "opencode_go",

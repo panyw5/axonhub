@@ -462,6 +462,7 @@
   "system.quota.collection.enabled.description": "关闭后，AxonHub 将停止所有提供商配额请求，并隐藏已保存的配额状态。",
   "system.quota.collection.providers.claudecode": "Claude Code",
   "system.quota.collection.providers.codex": "Codex",
+  "system.quota.collection.providers.devin": "Devin",
   "system.quota.collection.providers.antigravity": "Antigravity",
   "system.quota.collection.providers.xai_subscription": "xAI 订阅",
   "system.quota.collection.providers.github_copilot": "GitHub Copilot",

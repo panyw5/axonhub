@@ -164,9 +164,9 @@ test('NeuralWatt kWh bar shares the elapsed-window marker and label', () => {
 // Regression: the quota-display refactor dropped the OpenCode Go popover
 // without adding the shared-limits replacement, so the channels showed a
 // battery percentage in the trigger but an empty detail popover.
-test('OpenCode Go renders its normalized limit windows', () => {
+test('OpenCode Go and Devin render their normalized limit windows', () => {
   const quotaBadges = read('components/quota-badges.tsx');
-  const start = quotaBadges.indexOf("{(channel.type === 'opencode_go' || channel.type === 'opencode_go_anthropic') &&");
+  const start = quotaBadges.indexOf("{(channel.type === 'devin' || channel.type === 'opencode_go' || channel.type === 'opencode_go_anthropic') &&");
   const end = quotaBadges.indexOf("{isOllamaType(channel.type) &&", start);
 
   assert.ok(start !== -1, 'OpenCode Go popover branch should exist in quota-badges source');
@@ -179,7 +179,7 @@ test('OpenCode Go renders its normalized limit windows', () => {
   assert.match(opencodeBlock, /quota\.limits/, 'OpenCode Go should render normalized limits');
   assert.match(
     opencodeBlock,
-    /limit\.window === '5h'|preferredWindows = \['5h', 'weekly', 'monthly'\]/,
+    /preferredWindows = \['5h', 'daily', 'weekly', 'monthly'\]/,
     'OpenCode Go should map its windows onto the shared labels'
   );
   assert.match(opencodeBlock, /WINDOW_LABEL_KEYS\[limit\.window\]/, 'OpenCode Go labels should resolve through the shared map');

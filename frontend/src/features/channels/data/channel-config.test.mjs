@@ -14,6 +14,22 @@ function parseLocale(locale) {
   return JSON.parse(read(`locales/${locale}/channels.json`));
 }
 
+test('Devin exposes a native session-token channel with localized guidance', () => {
+  const schema = read('features/channels/data/schema.ts');
+  const channelsConfig = read('features/channels/data/config_channels.ts');
+  const providersConfig = read('features/channels/data/config_providers.ts');
+  assert.match(schema, /channelTypeSchema[\s\S]*'devin'/);
+  assert.match(schema, /apiFormatSchema[\s\S]*'devin\/chat'/);
+  assert.match(channelsConfig, /devin:\s*{[\s\S]*baseURL:\s*'https:\/\/server\.codeium\.com'[\s\S]*apiFormat:\s*'devin\/chat'/);
+  assert.match(providersConfig, /devin:\s*{[\s\S]*channelTypes:\s*\['devin'\]/);
+  for (const locale of ['en', 'zh-CN']) {
+    const strings = parseLocale(locale);
+    for (const key of ['channels.types.devin', 'channels.providers.devin', 'channels.dialogs.devin.tokenHint', 'channels.dialogs.fields.apiFormat.formats.devin/chat']) {
+      assert.ok(strings[key], `${locale} must translate ${key}`);
+    }
+  }
+});
+
 test('Cline is available as a channel type in frontend schemas and configs', () => {
   const schema = read('features/channels/data/schema.ts');
   const channelsConfig = read('features/channels/data/config_channels.ts');

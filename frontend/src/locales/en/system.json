@@ -474,6 +474,7 @@
   "system.quota.collection.enabled.description": "When disabled, AxonHub stops all provider quota requests and hides saved quota status.",
   "system.quota.collection.providers.claudecode": "Claude Code",
   "system.quota.collection.providers.codex": "Codex",
+  "system.quota.collection.providers.devin": "Devin",
   "system.quota.collection.providers.antigravity": "Antigravity",
   "system.quota.collection.providers.xai_subscription": "xAI Subscription",
   "system.quota.collection.providers.github_copilot": "GitHub Copilot",

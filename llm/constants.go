@@ -68,6 +68,7 @@ const (
 	APIFormatOpenAIDecisions   APIFormat = "openai/decisions"
 
 	APIFormatOllamaChat    APIFormat = "ollama/chat"
+	APIFormatDevinChat     APIFormat = "devin/chat"
 	APIFormatSeedanceVideo APIFormat = "seedance/video"
 	APIFormatZenmuxVideo   APIFormat = "zenmux/video"
 

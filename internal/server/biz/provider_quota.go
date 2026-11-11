@@ -52,6 +52,7 @@ func quotaErrorCode(err error) string {
 }
 
 var providerQuotaChannelTypes = []channel.Type{
+	channel.TypeDevin,
 	channel.TypeClaudecode,
 	channel.TypeCodex,
 	channel.TypeAntigravity,
@@ -426,6 +427,7 @@ func (svc *ProviderQuotaService) registerCodexSupport() {
 
 func (svc *ProviderQuotaService) registerAntigravitySupport() {
 	svc.checkers["antigravity"] = provider_quota.NewAntigravityQuotaChecker(svc.httpClient)
+	svc.checkers["devin"] = provider_quota.NewDevinQuotaChecker(svc.httpClient)
 }
 
 func (svc *ProviderQuotaService) registerXAISubscriptionSupport() {
@@ -1020,6 +1022,8 @@ func (svc *ProviderQuotaService) saveQuotaError(
 
 func (svc *ProviderQuotaService) getProviderType(ch *ent.Channel) string {
 	switch ch.Type { //nolint:exhaustive
+	case channel.TypeDevin:
+		return "devin"
 	case channel.TypeClaudecode:
 		return "claudecode"
 	case channel.TypeCodex:

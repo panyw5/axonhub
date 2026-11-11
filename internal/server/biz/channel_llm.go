@@ -28,6 +28,7 @@ import (
 	"github.com/looplj/axonhub/llm/transformer/cline"
 	commandcodetransformer "github.com/looplj/axonhub/llm/transformer/commandcode"
 	"github.com/looplj/axonhub/llm/transformer/deepseek"
+	"github.com/looplj/axonhub/llm/transformer/devin"
 	"github.com/looplj/axonhub/llm/transformer/doubao"
 	"github.com/looplj/axonhub/llm/transformer/fireworks"
 	"github.com/looplj/axonhub/llm/transformer/gemini"
@@ -415,6 +416,11 @@ func (svc *ChannelService) buildNonDefaultEndpointOutbound(
 		return nil, fmt.Errorf("websocket transport only supports api_format %q", llm.APIFormatOpenAIResponse.String())
 	}
 	switch ep.APIFormat {
+	case llm.APIFormatDevinChat.String():
+		if c.Type != channel.TypeDevin {
+			return nil, fmt.Errorf("Devin protocol requires a Devin channel")
+		}
+		return devin.NewOutboundTransformerWithConfig(&devin.Config{BaseURL: baseURL, EndpointPath: ep.Path, APIKeyProvider: apiKeyProvider()})
 	case llm.APIFormatOpenAIChatCompletion.String():
 		if c.Type == channel.TypeCline {
 			return cline.NewOutboundTransformerWithConfig(&cline.Config{
@@ -1378,6 +1384,13 @@ func (svc *ChannelService) buildChannelWithTransformer(c *ent.Channel, apiKeyOve
 
 		ch.Outbound = transformer
 
+		return ch, nil
+	case channel.TypeDevin:
+		outbound, err := devin.NewOutboundTransformerWithConfig(&devin.Config{BaseURL: c.BaseURL, APIKeyProvider: getAPIKeyProvider(ch)})
+		if err != nil {
+			return nil, fmt.Errorf("create Devin outbound: %w", err)
+		}
+		ch.Outbound = outbound
 		return ch, nil
 	case channel.TypeAntigravity:
 		transformer, err := antigravity.NewTransformer(

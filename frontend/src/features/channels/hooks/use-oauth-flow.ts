@@ -1,6 +1,6 @@
-import { useState, useCallback } from 'react';
-import { toast } from 'sonner';
+import { useState, useCallback, useEffect, useRef } from 'react';
 import { useTranslation } from 'react-i18next';
+import { toast } from 'sonner';
 import { ProxyType } from '../components/channels-proxy-dialog';
 
 export interface ProxyConfig {
@@ -83,6 +83,13 @@ export interface OAuthFlowActions {
 export function useOAuthFlow(options: OAuthFlowOptions): OAuthFlowState & OAuthFlowActions {
   const { startFn, exchangeFn, proxyConfig, onSuccess } = options;
   const { t } = useTranslation();
+  const generation = useRef(0);
+  useEffect(
+    () => () => {
+      generation.current += 1;
+    },
+    []
+  );
 
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [authUrl, setAuthUrl] = useState<string | null>(null);
@@ -91,19 +98,26 @@ export function useOAuthFlow(options: OAuthFlowOptions): OAuthFlowState & OAuthF
   const [isExchanging, setIsExchanging] = useState(false);
 
   const start = useCallback(async () => {
+    const current = ++generation.current;
+    setSessionId(null);
+    setAuthUrl(null);
+    setCallbackUrl('');
+    setIsExchanging(false);
     setIsStarting(true);
     try {
       const result = await startFn();
+      if (current !== generation.current) return;
       setSessionId(result.session_id);
       setAuthUrl(result.auth_url);
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : String(error));
+      if (current === generation.current) toast.error(error instanceof Error ? error.message : String(error));
     } finally {
-      setIsStarting(false);
+      if (current === generation.current) setIsStarting(false);
     }
   }, [startFn]);
 
   const exchange = useCallback(async () => {
+    const current = generation.current;
     if (!sessionId) {
       toast.error(t('channels.dialogs.oauth.errors.sessionMissing'));
       return;
@@ -132,20 +146,25 @@ export function useOAuthFlow(options: OAuthFlowOptions): OAuthFlowState & OAuthF
       }
 
       const result = await exchangeFn(exchangeInput);
+      if (current !== generation.current) return;
 
       if (onSuccess) {
         onSuccess(result.credentials);
       }
+      setCallbackUrl('');
+      setSessionId(null);
+      setAuthUrl(null);
 
       toast.success(t('channels.dialogs.oauth.messages.credentialsImported'));
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : String(error));
+      if (current === generation.current) toast.error(error instanceof Error ? error.message : String(error));
     } finally {
-      setIsExchanging(false);
+      if (current === generation.current) setIsExchanging(false);
     }
   }, [sessionId, callbackUrl, exchangeFn, onSuccess, t, proxyConfig]);
 
   const reset = useCallback(() => {
+    generation.current += 1;
     setSessionId(null);
     setAuthUrl(null);
     setCallbackUrl('');

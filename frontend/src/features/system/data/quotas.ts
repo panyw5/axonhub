@@ -667,6 +667,10 @@ export type ProviderQuotaChannel = {
   };
 } & (
   | {
+      type: 'devin';
+      quotaStatus: { quotaData: ProviderQuotaDataCommon };
+    }
+  | {
       type: 'claudecode';
       quotaStatus: {
         quotaData: ProviderClaudeQuotaData;

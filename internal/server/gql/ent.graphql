@@ -1272,6 +1272,7 @@ enum ChannelType @goModel(model: "github.com/looplj/axonhub/internal/ent/channel
   atlascloud
   cline
   codex
+  devin
   vercel
   anthropic
   anthropic_aws
@@ -3784,6 +3785,7 @@ ProviderQuotaStatusProviderType is enum for the field provider_type
 enum ProviderQuotaStatusProviderType @goModel(model: "github.com/looplj/axonhub/internal/ent/providerquotastatus.ProviderType") {
   claudecode
   codex
+  devin
   antigravity
   xai_subscription
   github_copilot

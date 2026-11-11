@@ -141,6 +141,14 @@ test('removes stale ZenMux video overrides when an edited channel leaves video f
 
 const configurableFormats = ['openai/chat_completions', 'openai/responses', 'typesafe/systemone', 'openai/decisions'];
 
+test('Devin native endpoints are offered only on Devin channels', () => {
+  const formats = [...configurableFormats, 'devin/chat'];
+  assert.deepEqual(getConfigurableApiFormatsForChannelType('devin', formats), ['devin/chat']);
+  for (const channelType of ['openai', 'anthropic', 'gemini', 'codex', 'typesafe']) {
+    assert.ok(!getConfigurableApiFormatsForChannelType(channelType, formats).includes('devin/chat'));
+  }
+});
+
 test('shows the OpenAI Decisions endpoint only for the OpenAI create/edit channel type', () => {
   const openai = getConfigurableApiFormatsForChannelType('openai', configurableFormats);
   assert.ok(openai.includes('openai/decisions'), 'openai channel type should offer openai/decisions');

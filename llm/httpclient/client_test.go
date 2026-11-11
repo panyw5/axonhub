@@ -869,6 +869,16 @@ data: [DONE]
 
 // TestBuildHttpRequest_UserAgentPassThrough tests the User-Agent handling with pass-through settings.
 func TestBuildHttpRequest_UserAgentPassThrough(t *testing.T) {
+	t.Run("disable HTTP compression negotiation", func(t *testing.T) {
+		req, err := BuildHttpRequest(context.Background(), &Request{Method: "GET", URL: "https://example.invalid", DisableCompression: true})
+		require.NoError(t, err)
+		require.Equal(t, "identity", req.Header.Get("Accept-Encoding"))
+	})
+	t.Run("explicit empty user agent suppresses defaults", func(t *testing.T) {
+		req, err := BuildHttpRequest(context.Background(), &Request{Method: "GET", URL: "https://example.invalid", Headers: http.Header{"User-Agent": {""}}})
+		require.NoError(t, err)
+		require.Equal(t, []string{""}, req.Header["User-Agent"])
+	})
 	client := &HttpClient{
 		client: &http.Client{Timeout: 5 * time.Second},
 	}

@@ -54,14 +54,15 @@ export function getApiFormatsForProvider(provider: string, configs: ProtocolConf
  * backend still accepts manual configuration for other channel types.
  * Other custom endpoint formats remain available everywhere.
  */
-export function getConfigurableApiFormatsForChannelType(
-  channelType: ChannelType,
-  configurableFormats: readonly string[]
-): string[] {
+export function getConfigurableApiFormatsForChannelType(channelType: ChannelType, configurableFormats: readonly string[]): string[] {
+  if (channelType === 'devin') {
+    return ['devin/chat'];
+  }
   if (channelType === 'typesafe') {
     return ['typesafe/systemone'];
   }
   const filtered = configurableFormats
+    .filter((format) => format !== 'devin/chat')
     .filter((format) => format !== 'typesafe/systemone')
     .filter((format) => channelType === 'openai' || format !== 'openai/decisions');
   if (['zenmux', 'zenmux_responses', 'zenmux_anthropic', 'zenmux_gemini', 'zenmux_video'].includes(channelType)) {

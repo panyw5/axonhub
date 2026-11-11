@@ -22,6 +22,7 @@ import (
 	"github.com/looplj/axonhub/llm/httpclient"
 	"github.com/looplj/axonhub/llm/transformer/anthropic/claudecode"
 	"github.com/looplj/axonhub/llm/transformer/cline"
+	"github.com/looplj/axonhub/llm/transformer/devin"
 	"github.com/looplj/axonhub/llm/transformer/gemini/vertex"
 	"github.com/looplj/axonhub/llm/transformer/openai/codex"
 	"github.com/looplj/axonhub/llm/transformer/openai/copilot"
@@ -359,6 +360,13 @@ func fetchModelsInputMatchesChannel(input FetchModelsInput, ch *ent.Channel) boo
 }
 
 func (f *ModelFetcher) FetchModels(ctx context.Context, input FetchModelsInput) (*FetchModelsResult, error) {
+	if input.ChannelType == channel.TypeDevin.String() {
+		models := make([]ModelIdentify, 0)
+		for _, model := range devin.Models() {
+			models = append(models, ModelIdentify{ID: model.ID})
+		}
+		return &FetchModelsResult{Models: models}, nil
+	}
 	if input.ChannelType == channel.TypeAntigravity.String() {
 		models, err := f.fetchAntigravityModels(ctx, input)
 		if err != nil {

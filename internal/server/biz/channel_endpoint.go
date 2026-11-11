@@ -35,6 +35,7 @@ var SupportedAPIFormats = map[string]struct{}{
 	llm.APIFormatJinaRerank.String():            {},
 	llm.APIFormatJinaEmbedding.String():         {},
 	llm.APIFormatTypeSafeSystemOne.String():     {},
+	llm.APIFormatDevinChat.String():             {},
 }
 
 // ValidateEndpoints validates channel endpoint configurations.
@@ -228,6 +229,7 @@ var minimaxDefaultEndpoints = []objects.ChannelEndpoint{
 // built-in contract. User-configured custom endpoints remain external overrides
 // and are not modeled here.
 var defaultEndpointsForChannelType = map[channel.Type][]objects.ChannelEndpoint{
+	channel.TypeDevin:           {{APIFormat: llm.APIFormatDevinChat.String()}},
 	channel.TypeOpenai:          openAIFullDefaultEndpoints,
 	channel.TypeZenmux:          openAIFullDefaultEndpoints,
 	channel.TypeOpenaiResponses: {{APIFormat: llm.APIFormatOpenAIResponse.String()}},

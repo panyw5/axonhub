@@ -34,12 +34,13 @@ import {
   OpenCode,
   Groq,
 } from '@lobehub/icons';
+import { Bot } from 'lucide-react';
 import { AtlasCloudIcon } from '../components/atlas-cloud-icon';
 import { CommandCodeIcon } from '../components/commandcode-icon';
 import { EvolinkIcon } from '../components/evolink-icon';
 import { FennoIcon } from '../components/fenno-icon';
-import { TypeSafeIcon } from '../components/typesafe-icon';
 import { NanoGPTIcon } from '../components/nanogpt-icon';
+import { TypeSafeIcon } from '../components/typesafe-icon';
 import { BURNCLOUD_DEFAULT_MODELS } from './burncloud-models';
 import { ApiFormat, ChannelType } from './schema';
 
@@ -77,6 +78,14 @@ export interface ChannelConfig {
  * Contains default base URLs and models for each channel type
  */
 export const CHANNEL_CONFIGS: Record<ChannelType, ChannelConfig> = {
+  devin: {
+    channelType: 'devin',
+    baseURL: 'https://server.codeium.com',
+    defaultModels: ['swe-2', 'swe-2-flash', 'swe-1-6'],
+    apiFormat: 'devin/chat',
+    color: 'bg-sky-100 text-sky-800 border-sky-200',
+    icon: Bot,
+  },
   openai: {
     channelType: 'openai',
     baseURL: 'https://api.openai.com/v1',
@@ -970,6 +979,7 @@ export type Provider =
   | 'github_copilot'
   | 'cerebras'
   | 'codex'
+  | 'devin'
   | 'antigravity'
   | 'nanogpt'
   | 'fireworks'
@@ -984,6 +994,7 @@ export type Provider =
  * Map channel type to provider
  */
 export const CHANNEL_TYPE_TO_PROVIDER: Record<ChannelType, Provider> = {
+  devin: 'devin',
   openai: 'openai',
   openai_responses: 'openai',
   atlascloud: 'atlascloud',

@@ -35,6 +35,7 @@ import {
 } from '@/features/system/data/system';
 import { usePermissions } from '@/hooks/usePermissions';
 import { antigravityOAuthExchange, antigravityOAuthStart } from '../data/antigravity';
+import { DevinOAuthFlow } from './devin-oauth-flow';
 import {
   useCreateChannel,
   useDuplicateChannel,
@@ -2287,6 +2288,18 @@ export function ChannelsActionDialog({ currentRow, duplicateFromRow, open, onOpe
                         </FormItem>
                       )}
 
+                      {selectedProvider === 'devin' && (
+                        <div className='grid grid-cols-1 items-start gap-x-6 gap-y-2 md:grid-cols-8'>
+                          <div className='col-span-2' />
+                          <div className='md:col-span-6'>
+                            <DevinOAuthFlow proxyConfig={proxyConfig ?? { type: proxyType }} onSuccess={(token) => {
+                              form.setValue('credentials.apiKey', '');
+                              form.setValue('credentials.apiKeys', [token], { shouldDirty: true, shouldTouch: true, shouldValidate: true });
+                            }} />
+                          </div>
+                        </div>
+                      )}
+
                       {(isCodexType || isClaudeCodeType) && (
                         <div className='grid grid-cols-1 items-start gap-x-6 gap-y-2 md:grid-cols-8'>
                           <div className='col-span-2' />
@@ -2426,9 +2439,16 @@ export function ChannelsActionDialog({ currentRow, duplicateFromRow, open, onOpe
                             render={({ field, fieldState }) => (
                               <FormItem className='grid grid-cols-1 items-start gap-x-6 gap-y-2 md:grid-cols-8'>
                                 <FormLabel className='pt-2 font-medium md:col-span-2 md:text-right'>
-                                  {t('channels.dialogs.fields.apiKey.label')}
+                                  {t(
+                                    selectedProvider === 'devin'
+                                      ? 'channels.dialogs.devin.tokenLabel'
+                                      : 'channels.dialogs.fields.apiKey.label'
+                                  )}
                                 </FormLabel>
                                 <div className='space-y-1 md:col-span-6'>
+                                  {selectedProvider === 'devin' && (
+                                    <p className='text-muted-foreground text-xs'>{t('channels.dialogs.devin.tokenHint')}</p>
+                                  )}
                                   {isEdit ? (
                                     <div className='relative'>
                                       <Tooltip open={!showApiKey ? undefined : false}>

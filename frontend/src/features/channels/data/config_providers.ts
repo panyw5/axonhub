@@ -34,12 +34,13 @@ import {
   OpenCode,
   Groq,
 } from '@lobehub/icons';
+import { Bot } from 'lucide-react';
 import { AtlasCloudIcon } from '../components/atlas-cloud-icon';
 import { CommandCodeIcon } from '../components/commandcode-icon';
 import { EvolinkIcon } from '../components/evolink-icon';
 import { FennoIcon } from '../components/fenno-icon';
-import { TypeSafeIcon } from '../components/typesafe-icon';
 import { NanoGPTIcon } from '../components/nanogpt-icon';
+import { TypeSafeIcon } from '../components/typesafe-icon';
 import { CHANNEL_CONFIGS } from './config_channels';
 import {
   getApiFormatsForProvider as getApiFormatsForProviderFromConfigs,
@@ -61,6 +62,12 @@ export interface ProviderConfig {
  * Each provider can support multiple API formats (channel types)
  */
 export const PROVIDER_CONFIGS: Record<string, ProviderConfig> = {
+  devin: {
+    provider: 'devin',
+    icon: Bot,
+    color: 'bg-sky-100 text-sky-800 border-sky-200',
+    channelTypes: ['devin'],
+  },
   openai: {
     provider: 'openai',
     icon: OpenAI,

@@ -56,8 +56,11 @@ type Request struct {
 
 	// SkipInboundQueryMerge when set to true, prevents query parameters from the original
 	// inbound request from being merged into this request during MergeInboundRequest.
-	SkipInboundQueryMerge bool                               `json:"-"`
-	OnResponseHeaders     func(context.Context, http.Header) `json:"-"`
+	SkipInboundQueryMerge bool `json:"-"`
+	// DisableCompression opts out of HTTP-level compression negotiation. Framed
+	// protocols may still independently compress individual response frames.
+	DisableCompression bool                               `json:"-"`
+	OnResponseHeaders  func(context.Context, http.Header) `json:"-"`
 }
 
 func (r *Request) ObserveResponseHeaders(ctx context.Context, headers http.Header) {

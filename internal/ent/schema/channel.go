@@ -41,6 +41,7 @@ func (Channel) Fields() []ent.Field {
 				"atlascloud",
 				"cline",
 				"codex",
+				"devin",
 				"vercel",
 				"anthropic",
 				"anthropic_aws",

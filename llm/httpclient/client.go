@@ -476,14 +476,16 @@ func BuildHttpRequest(
 	if httpReq.Header == nil {
 		httpReq.Header = make(http.Header)
 	}
-	// Handle User-Agent header - only set default if not already present
-	if httpReq.Header.Get("User-Agent") == "" {
-		// No User-Agent set, use default
+	// An explicitly empty User-Agent suppresses net/http's default on the wire.
+	if _, present := httpReq.Header["User-Agent"]; !present {
 		httpReq.Header.Set("User-Agent", "axonhub/1.0")
 	}
 
 	for k := range libManagedHeaders {
 		httpReq.Header.Del(k)
+	}
+	if request.DisableCompression {
+		httpReq.Header.Set("Accept-Encoding", "identity")
 	}
 
 	// Set Content-Type header if specified in request

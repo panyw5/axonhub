@@ -21,6 +21,18 @@ func (f APIKeyFunc) Mutate(ctx context.Context, m ent.Mutation) (ent.Value, erro
 	return nil, fmt.Errorf("unexpected mutation type %T. expect *ent.APIKeyMutation", m)
 }
 
+// The APIKeyProfileTemplateFunc type is an adapter to allow the use of ordinary
+// function as APIKeyProfileTemplate mutator.
+type APIKeyProfileTemplateFunc func(context.Context, *ent.APIKeyProfileTemplateMutation) (ent.Value, error)
+
+// Mutate calls f(ctx, m).
+func (f APIKeyProfileTemplateFunc) Mutate(ctx context.Context, m ent.Mutation) (ent.Value, error) {
+	if mv, ok := m.(*ent.APIKeyProfileTemplateMutation); ok {
+		return f(ctx, mv)
+	}
+	return nil, fmt.Errorf("unexpected mutation type %T. expect *ent.APIKeyProfileTemplateMutation", m)
+}
+
 // The ChannelFunc type is an adapter to allow the use of ordinary
 // function as Channel mutator.
 type ChannelFunc func(context.Context, *ent.ChannelMutation) (ent.Value, error)
@@ -93,6 +105,18 @@ func (f DataStorageFunc) Mutate(ctx context.Context, m ent.Mutation) (ent.Value,
 	return nil, fmt.Errorf("unexpected mutation type %T. expect *ent.DataStorageMutation", m)
 }
 
+// The InvitationFunc type is an adapter to allow the use of ordinary
+// function as Invitation mutator.
+type InvitationFunc func(context.Context, *ent.InvitationMutation) (ent.Value, error)
+
+// Mutate calls f(ctx, m).
+func (f InvitationFunc) Mutate(ctx context.Context, m ent.Mutation) (ent.Value, error) {
+	if mv, ok := m.(*ent.InvitationMutation); ok {
+		return f(ctx, mv)
+	}
+	return nil, fmt.Errorf("unexpected mutation type %T. expect *ent.InvitationMutation", m)
+}
+
 // The ModelFunc type is an adapter to allow the use of ordinary
 // function as Model mutator.
 type ModelFunc func(context.Context, *ent.ModelMutation) (ent.Value, error)
@@ -103,6 +127,18 @@ func (f ModelFunc) Mutate(ctx context.Context, m ent.Mutation) (ent.Value, error
 		return f(ctx, mv)
 	}
 	return nil, fmt.Errorf("unexpected mutation type %T. expect *ent.ModelMutation", m)
+}
+
+// The OIDCIdentityFunc type is an adapter to allow the use of ordinary
+// function as OIDCIdentity mutator.
+type OIDCIdentityFunc func(context.Context, *ent.OIDCIdentityMutation) (ent.Value, error)
+
+// Mutate calls f(ctx, m).
+func (f OIDCIdentityFunc) Mutate(ctx context.Context, m ent.Mutation) (ent.Value, error) {
+	if mv, ok := m.(*ent.OIDCIdentityMutation); ok {
+		return f(ctx, mv)
+	}
+	return nil, fmt.Errorf("unexpected mutation type %T. expect *ent.OIDCIdentityMutation", m)
 }
 
 // The ProjectFunc type is an adapter to allow the use of ordinary
@@ -127,6 +163,18 @@ func (f PromptFunc) Mutate(ctx context.Context, m ent.Mutation) (ent.Value, erro
 		return f(ctx, mv)
 	}
 	return nil, fmt.Errorf("unexpected mutation type %T. expect *ent.PromptMutation", m)
+}
+
+// The PromptProtectionRuleFunc type is an adapter to allow the use of ordinary
+// function as PromptProtectionRule mutator.
+type PromptProtectionRuleFunc func(context.Context, *ent.PromptProtectionRuleMutation) (ent.Value, error)
+
+// Mutate calls f(ctx, m).
+func (f PromptProtectionRuleFunc) Mutate(ctx context.Context, m ent.Mutation) (ent.Value, error) {
+	if mv, ok := m.(*ent.PromptProtectionRuleMutation); ok {
+		return f(ctx, mv)
+	}
+	return nil, fmt.Errorf("unexpected mutation type %T. expect *ent.PromptProtectionRuleMutation", m)
 }
 
 // The ProviderQuotaStatusFunc type is an adapter to allow the use of ordinary

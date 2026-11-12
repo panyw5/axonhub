@@ -12,6 +12,7 @@ interface Project {
   projectID: string;
   isOwner: boolean;
   scopes: string[];
+  effectiveScopes?: string[];
   roles: Role[];
 }
 
@@ -26,6 +27,8 @@ export interface AuthUser {
   scopes: string[];
   roles: Role[];
   projects: Project[];
+  oidcIdentities?: { id: string; idpName: string; issuer: string; subject: string; email: string }[];
+  hasPassword?: boolean;
 }
 
 interface AuthState {

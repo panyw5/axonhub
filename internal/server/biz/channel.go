@@ -2,17 +2,21 @@ package biz
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"regexp"
 	"slices"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
-	"github.com/zhenzou/executors"
+	"github.com/aptible/supercronic/cronexpr"
 	"go.uber.org/fx"
 
+	"github.com/looplj/axonhub/internal/authz"
 	"github.com/looplj/axonhub/internal/ent"
 	"github.com/looplj/axonhub/internal/ent/channel"
-	"github.com/looplj/axonhub/internal/ent/privacy"
 	"github.com/looplj/axonhub/internal/ent/schema/schematype"
 	"github.com/looplj/axonhub/internal/log"
 	"github.com/looplj/axonhub/internal/objects"
@@ -20,8 +24,12 @@ import (
 	"github.com/looplj/axonhub/internal/pkg/xcache"
 	"github.com/looplj/axonhub/internal/pkg/xcache/live"
 	"github.com/looplj/axonhub/internal/pkg/xerrors"
+	"github.com/looplj/axonhub/internal/scopes"
+	"github.com/looplj/axonhub/internal/server/biz/provider_quota"
+	"github.com/looplj/axonhub/internal/server/scheduler"
 	"github.com/looplj/axonhub/llm/httpclient"
 	"github.com/looplj/axonhub/llm/transformer"
+	xaisubscription "github.com/looplj/axonhub/llm/transformer/xai/subscription"
 )
 
 // ChannelModelEntry represents a model that the channel can handle.
@@ -39,8 +47,15 @@ type ChannelModelEntry struct {
 type Channel struct {
 	*ent.Channel
 
-	// Outbound is the outbound transformer for the channel.
+	// Outbound is the primary outbound transformer for the channel.
+	// The primary outbound corresponds to the channel's primary default endpoint.
+	// DEPRECATED: Use Outbounds[key] for multi-endpoint channels.
+	// For backward compatibility, this holds the first resolved default endpoint's outbound.
 	Outbound transformer.Outbound
+
+	// Outbounds maps default endpoint API formats to their corresponding outbound transformers.
+	// Populated from the channel's resolved default endpoints. Keyed by api_format string value.
+	Outbounds map[string]transformer.Outbound
 
 	// HTTPClient is the custom HTTP client for this channel with proxy support
 	HTTPClient *httpclient.HttpClient
@@ -67,15 +82,20 @@ type Channel struct {
 
 	// cachedDisabledKeySet caches disabled key lookup set for O(1) check
 	cachedDisabledKeySet map[string]struct{}
+
+	// apiKeyOverride, if non-empty, forces all outbound transformers to use this key
+	// instead of the channel's normal key selection. Used by the channel key test flow.
+	apiKeyOverride string
 }
 
 type ChannelServiceParams struct {
 	fx.In
 
-	CacheConfig   xcache.Config
-	Executor      executors.ScheduledExecutor
-	Ent           *ent.Client
-	SystemService *SystemService
+	CacheConfig     xcache.Config
+	Ent             *ent.Client
+	SystemService   *SystemService
+	WebhookNotifier *WebhookNotifier
+	HttpClient      *httpclient.HttpClient
 }
 
 func NewChannelService(params ChannelServiceParams) *ChannelService {
@@ -83,20 +103,14 @@ func NewChannelService(params ChannelServiceParams) *ChannelService {
 		AbstractService: &AbstractService{
 			db: params.Ent,
 		},
-		Executors:          params.Executor,
-		SystemService:      params.SystemService,
-		channelPerfMetrics: make(map[int]*channelMetrics),
-		channelErrorCounts: make(map[int]map[int]int),
-		apiKeyErrorCounts:  make(map[int]map[string]map[int]int),
-		perfCh:             make(chan *PerformanceRecord, 1024),
+		SystemService:             params.SystemService,
+		WebhookNotifier:           params.WebhookNotifier,
+		httpClient:                params.HttpClient,
+		channelPerfMetrics:        make(map[int]*channelMetrics),
+		apiKeyErrorCounts:         make(map[int]map[string]map[int]int),
+		apiKeyRuleActionsInFlight: make(map[int]map[string]bool),
+		perfCh:                    make(chan *PerformanceRecord, 1024),
 	}
-
-	// Load channel performance metrics after channels are loaded
-	if err := svc.LoadChannelPerformances(context.Background()); err != nil {
-		log.Error(context.Background(), "failed to load channel performances", log.Cause(err))
-		// Continue loading channels even if metrics loading fails
-	}
-
 	watcherMode := params.CacheConfig.Mode
 	if watcherMode == "" {
 		watcherMode = xcache.ModeMemory
@@ -123,19 +137,11 @@ func NewChannelService(params ChannelServiceParams) *ChannelService {
 		Name:            "axonhub:enabled_channels",
 		InitialValue:    []*Channel{},
 		RefreshInterval: time.Minute,
-		RefreshFunc:     svc.refreshEnabledChannels,
+		RefreshFunc:     svc.onCacheRefreshed,
 		OnSwap:          svc.onEnabledChannelsSwap,
 		Watcher:         svc.channelNotifier,
 	})
 	xerrors.NoErr(svc.enabledChannelsCache.Load(context.Background(), true))
-
-	// Schedule model sync every hour
-	xerrors.NoErr2(
-		svc.Executors.ScheduleFuncAtCronRate(
-			svc.syncChannelModels,
-			executors.CRONRule{Expr: "11 * * * *"},
-		),
-	)
 
 	// Start performance metrics background flush
 	go svc.startPerformanceProcess()
@@ -150,38 +156,73 @@ func (svc *ChannelService) Stop() {
 type ChannelService struct {
 	*AbstractService
 
-	Executors     executors.ScheduledExecutor
-	SystemService *SystemService
+	SystemService   *SystemService
+	WebhookNotifier *WebhookNotifier
+
+	httpClient *httpclient.HttpClient
 
 	enabledChannelsCache *live.Cache[[]*Channel]
 	channelNotifier      watcher.Notifier[live.CacheEvent[struct{}]]
+
+	// limiterForgetter is invoked after channel mutations so the orchestrator's
+	// ChannelLimiterManager can drop the limiter entry for the affected channel.
+	// Optional: when nil, mutations skip the call (used in tests / before wiring).
+	limiterForgetter ChannelLimiterForgetter
+
+	// providerQuotaInvalidator discards stale quota state after a channel changes
+	// its provider identity. Optional for direct service construction in tests.
+	providerQuotaInvalidator ChannelProviderQuotaInvalidator
 
 	// perfWindowSeconds is the configurable sliding window size for performance metrics (in seconds)
 	// If not set (0), uses defaultPerformanceWindowSize (600 seconds = 10 minutes)
 	perfWindowSeconds int64
 
-	// channelPerfMetrics stores the performance metrics for each channel
-	// protected by channelPerfMetricsLock
+	// channelPerfMetricsLock protects map lookups and publication only.
+	// Each channelMetrics protects its own mutable state with its mu.
 	channelPerfMetrics     map[int]*channelMetrics
 	channelPerfMetricsLock sync.RWMutex
 
-	// channelErrorCounts stores the error counts for each channel and status code
-	// channelID -> statusCode -> count
-	channelErrorCounts     map[int]map[int]int
-	channelErrorCountsLock sync.Mutex
+	// apiKeyErrorCounts stores consecutive auto-disable counters.
+	// channelID -> counterKey -> dummy status (always 0) -> count
+	apiKeyErrorCounts         map[int]map[string]map[int]int
+	apiKeyRuleActionsInFlight map[int]map[string]bool
+	apiKeyErrorCountsLock     sync.Mutex
+	apiKeyOpsLock             sync.Mutex
 
-	// apiKeyErrorCounts stores the error counts for each API key and status code
-	// channelID -> apiKey -> statusCode -> count
-	apiKeyErrorCounts     map[int]map[string]map[int]int
-	apiKeyErrorCountsLock sync.Mutex
+	modelSyncMu sync.Mutex
+
+	lastModelSyncExecutionTime time.Time
+
+	// cacheVersion is incremented each time the enabled channels cache data is swapped.
+	// Used by external caches (e.g., association cache) to detect cache refreshes.
+	cacheVersion atomic.Int64
 
 	// perfCh is the channel for performance records for async processing.
 	perfCh chan *PerformanceRecord
 }
 
-func (svc *ChannelService) refreshEnabledChannels(ctx context.Context, current []*Channel, lastUpdate time.Time) ([]*Channel, time.Time, bool, error) {
-	ctx = privacy.DecisionContext(ctx, privacy.Allow)
+func (svc *ChannelService) RegisterScheduledTasks(ctx context.Context, s *scheduler.Scheduler) error {
+	if err := s.Register(ctx, scheduler.TaskSpec{
+		Name:        "channel-model-sync",
+		Description: "Sync channel models every hour",
+		CronExpr:    "11 * * * *",
+		Timezone:    "UTC",
+	}, svc.runSyncChannelModelsPeriodically); err != nil {
+		return err
+	}
 
+	// Ticks every minute rather than every five so that a disable_until_cron rule
+	// recovers within a minute of the instant it scheduled, matching the finest
+	// granularity a crontab expression can express.
+	return s.Register(ctx, scheduler.TaskSpec{
+		Name:        "channel-disabled-api-key-cleanup",
+		Description: "Recover temporarily disabled channel credentials and the channels they gated",
+		CronExpr:    "* * * * *",
+		Timezone:    "UTC",
+	}, svc.cleanupExpiredDisabledAPIKeys)
+}
+
+func (svc *ChannelService) reloadEnabledChannels(ctx context.Context, current []*Channel, lastUpdate time.Time) ([]*Channel, time.Time, bool, error) {
 	// Query latest updated channel including soft-deleted ones to detect deletions
 	latestUpdatedChannel, err := svc.entFromContext(ctx).Channel.Query().
 		Order(ent.Desc(channel.FieldUpdatedAt)).
@@ -210,7 +251,7 @@ func (svc *ChannelService) refreshEnabledChannels(ctx context.Context, current [
 	var channels []*Channel
 
 	for _, c := range entities {
-		channel, err := svc.buildChannelWithTransformer(c)
+		channel, err := svc.buildChannelWithOutbounds(c)
 		if err != nil {
 			log.Warn(ctx, "failed to build channel",
 				log.String("channel", c.Name),
@@ -248,17 +289,73 @@ func (svc *ChannelService) refreshEnabledChannels(ctx context.Context, current [
 }
 
 func (svc *ChannelService) onEnabledChannelsSwap(old, new []*Channel) {
+	svc.cacheVersion.Add(1)
+
 	for _, ch := range new {
 		if ch != nil && ch.startTokenProvider != nil {
 			ch.startTokenProvider()
 		}
 	}
 
-	for _, ch := range old {
+	if len(old) == 0 {
+		return
+	}
+
+	oldChannels := append([]*Channel(nil), old...)
+	go svc.cleanupSwappedChannels(oldChannels)
+}
+
+func (svc *ChannelService) cleanupSwappedChannels(channels []*Channel) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Error(context.Background(), "channel cache cleanup panicked", log.Any("panic", r))
+		}
+	}()
+
+	for _, ch := range channels {
 		if ch != nil && ch.stopTokenProvider != nil {
 			ch.stopTokenProvider()
 		}
+		stopChannelOutbounds(ch)
+		if ch != nil && ch.HTTPClient != nil && ch.HTTPClient != svc.httpClient {
+			ch.HTTPClient.CloseIdleConnections()
+		}
 	}
+}
+
+type stoppableOutbound interface {
+	Stop()
+}
+
+func stopChannelOutbounds(ch *Channel) {
+	if ch == nil {
+		return
+	}
+
+	seen := map[stoppableOutbound]struct{}{}
+	stopOutbound := func(out transformer.Outbound) {
+		stoppable, ok := out.(stoppableOutbound)
+		if !ok || stoppable == nil {
+			return
+		}
+		if _, ok := seen[stoppable]; ok {
+			return
+		}
+		seen[stoppable] = struct{}{}
+		stoppable.Stop()
+	}
+
+	stopOutbound(ch.Outbound)
+	for _, out := range ch.Outbounds {
+		stopOutbound(out)
+	}
+}
+
+// GetCacheVersion returns the current cache version counter.
+// This is incremented on every enabled channels cache swap and can be used
+// by external caches to detect when the underlying channel data has changed.
+func (svc *ChannelService) GetCacheVersion() int64 {
+	return svc.cacheVersion.Load()
 }
 
 // GetEnabledChannels returns all enabled channels.
@@ -304,7 +401,20 @@ func (svc *ChannelService) GetChannel(ctx context.Context, channelID int) (*Chan
 		return nil, fmt.Errorf("channel not found: %w", err)
 	}
 
-	return svc.buildChannelWithTransformer(entity)
+	return svc.buildChannelWithOutbounds(entity)
+}
+
+// GetChannelWithKey returns a channel with the outbound transformer's API key
+// forced to the given key. This is used by the channel key test flow to test
+// a specific key. Each call creates a fresh channel instance, so the override
+// does not affect other requests.
+func (svc *ChannelService) GetChannelWithKey(ctx context.Context, channelID int, apiKey string) (*Channel, error) {
+	entity, err := svc.entFromContext(ctx).Channel.Get(ctx, channelID)
+	if err != nil {
+		return nil, fmt.Errorf("channel not found: %w", err)
+	}
+
+	return svc.buildChannelWithOutbounds(entity, apiKey)
 }
 
 // ListModelsInput represents the input for listing models with filters.
@@ -319,6 +429,14 @@ type ListModelsInput struct {
 type ModelIdentityWithStatus struct {
 	ID     string
 	Status channel.Status
+}
+
+// SaveChannelEndpointsInput represents input for saving channel endpoints.
+type SaveChannelEndpointsInput struct {
+	ChannelID objects.GUID `json:"channelID"`
+	// Endpoints are user-configured endpoint overrides.
+	// Default endpoints are resolved dynamically from the channel type and are read-only.
+	Endpoints []objects.ChannelEndpoint `json:"endpoints"`
 }
 
 var statusPriority = map[channel.Status]int{
@@ -407,7 +525,42 @@ func (svc *ChannelService) ListModels(ctx context.Context, input ListModelsInput
 // createChannel creates a new channel without triggering a reload.
 // This is useful for batch operations where reload should happen once at the end.
 func (svc *ChannelService) createChannel(ctx context.Context, input ent.CreateChannelInput) (*ent.Channel, error) {
+	sanitizedSettings, err := normalizeCommandCodeQuotaCookieSettings(input.Settings, input.Type)
+	if err != nil {
+		return nil, err
+	}
+	if sanitizedSettings != nil {
+		input.Settings = sanitizedSettings
+	}
+	if input.Type == channel.TypeXaiSubscription {
+		officialBaseURL := xaisubscription.DefaultBaseURL
+		input.BaseURL = &officialBaseURL
+		input.Endpoints = nil
+	}
+	if isCommandCodeChannelType(input.Type) {
+		baseURL := ""
+		if input.BaseURL != nil {
+			baseURL = *input.BaseURL
+		}
+		if err := validateCommandCodeBaseURL(baseURL); err != nil {
+			return nil, err
+		}
+	}
+
+	if err := NormalizeAPIKeyAutoDisableRules(input.Policies); err != nil {
+		return nil, err
+	}
+
 	if input.Settings != nil {
+		// A new channel may intentionally be created before its model list is
+		// populated (for example by a bulk configuration flow). An empty list is
+		// therefore not evidence that every submitted override is stale. Keep the
+		// overrides until the channel has an actual model list; updates retain the
+		// existing cleanup behavior below.
+		if len(input.SupportedModels) > 0 {
+			RemoveRemovedModelProtocolOverrides(input.Settings, input.SupportedModels)
+		}
+
 		if input.Settings.BodyOverrideOperations != nil {
 			if err := ValidateBodyOverrideOperations(input.Settings.BodyOverrideOperations); err != nil {
 				return nil, fmt.Errorf("invalid body override operations: %w", err)
@@ -419,6 +572,28 @@ func (svc *ChannelService) createChannel(ctx context.Context, input ent.CreateCh
 				return nil, fmt.Errorf("invalid header override operations: %w", err)
 			}
 		}
+
+		if err := ValidateRateLimit(input.Settings.RateLimit); err != nil {
+			return nil, fmt.Errorf("invalid rate limit: %w", err)
+		}
+
+		if err := NormalizeRetryableStatusCodes(input.Settings); err != nil {
+			return nil, err
+		}
+
+		if err := NormalizeRetryableErrorPatterns(input.Settings); err != nil {
+			return nil, err
+		}
+
+		if err := ValidateModelProtocols(input.Settings, input.Type, input.Endpoints); err != nil {
+			return nil, fmt.Errorf("invalid model protocols: %w", err)
+		}
+	}
+
+	if input.Endpoints != nil {
+		if err := validateEndpointsForChannelType(input.Type, input.Endpoints); err != nil {
+			return nil, fmt.Errorf("invalid endpoints: %w", err)
+		}
 	}
 
 	createBuilder := svc.entFromContext(ctx).Channel.Create().
@@ -428,9 +603,15 @@ func (svc *ChannelService) createChannel(ctx context.Context, input ent.CreateCh
 		SetName(input.Name).
 		SetCredentials(input.Credentials).
 		SetSupportedModels(input.SupportedModels).
+		SetManualModels(input.ManualModels).
 		SetDefaultTestModel(input.DefaultTestModel).
 		SetNillableAutoSyncSupportedModels(input.AutoSyncSupportedModels).
+		SetNillableAutoSyncModelPattern(input.AutoSyncModelPattern).
 		SetSettings(input.Settings)
+
+	if input.Endpoints != nil {
+		createBuilder.SetEndpoints(input.Endpoints)
+	}
 
 	if input.Tags != nil {
 		createBuilder.SetTags(input.Tags)
@@ -443,11 +624,6 @@ func (svc *ChannelService) createChannel(ctx context.Context, input ent.CreateCh
 	channel, err := createBuilder.Save(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create channel: %w", err)
-	}
-
-	// Initialize ChannelPerformance record for the new channel
-	if err := svc.InitializeChannelPerformance(ctx, channel.ID); err != nil {
-		return nil, fmt.Errorf("failed to initialize channel performance record: %w", err)
 	}
 
 	return channel, nil
@@ -464,22 +640,282 @@ func (svc *ChannelService) CreateChannel(ctx context.Context, input ent.CreateCh
 	}
 
 	if existing != nil {
-		return nil, fmt.Errorf("channel with name '%s' already exists", input.Name)
+		return nil, xerrors.DuplicateNameError("channel", input.Name)
 	}
 
-	channel, err := svc.createChannel(ctx, input)
+	var created *ent.Channel
+	err = svc.RunInTransaction(ctx, func(ctx context.Context) error {
+		channel, err := svc.createChannel(ctx, input)
+		if err != nil {
+			return err
+		}
+
+		if _, err := svc.ensureChannelModelPrices(ctx, channel.ID, input.SupportedModels); err != nil {
+			return err
+		}
+
+		created = channel
+
+		return nil
+	})
 	if err != nil {
 		return nil, err
 	}
+	if ent.TxFromContext(ctx) == nil {
+		created.Unwrap()
+	}
 
-	svc.asyncReloadChannels()
+	svc.reloadChannelsAfterCommit(ctx)
 
-	return channel, nil
+	return created, nil
+}
+
+// NormalizeRetryableStatusCodes validates, deduplicates, and sorts additional
+// retryable HTTP status codes configured on a channel.
+func NormalizeRetryableStatusCodes(settings *objects.ChannelSettings) error {
+	if settings == nil || len(settings.RetryableStatusCodes) == 0 {
+		return nil
+	}
+
+	codes := slices.Clone(settings.RetryableStatusCodes)
+	for _, code := range codes {
+		if code < 400 || code > 599 {
+			return fmt.Errorf("invalid retryable status code %d: must be between 400 and 599", code)
+		}
+	}
+
+	slices.Sort(codes)
+	settings.RetryableStatusCodes = slices.Compact(codes)
+
+	return nil
+}
+
+// NormalizeRetryableErrorPatterns validates, deduplicates, and trims additional
+// retryable error text matchers configured on a channel.
+func NormalizeRetryableErrorPatterns(settings *objects.ChannelSettings) error {
+	if settings == nil || len(settings.RetryableErrorPatterns) == 0 {
+		return nil
+	}
+
+	patterns := make([]objects.RetryableErrorPattern, 0, len(settings.RetryableErrorPatterns))
+	seen := make(map[string]struct{}, len(settings.RetryableErrorPatterns))
+
+	for _, pattern := range settings.RetryableErrorPatterns {
+		pattern.Pattern = strings.TrimSpace(pattern.Pattern)
+		if pattern.Pattern == "" {
+			continue
+		}
+
+		if pattern.Regex {
+			if _, err := regexp.Compile(pattern.Pattern); err != nil {
+				return fmt.Errorf("invalid retryable error regex %q: %w", pattern.Pattern, err)
+			}
+		}
+
+		key := fmt.Sprintf("%t\x00%s", pattern.Regex, pattern.Pattern)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+
+		seen[key] = struct{}{}
+		patterns = append(patterns, pattern)
+	}
+
+	settings.RetryableErrorPatterns = patterns
+
+	return nil
+}
+
+// NormalizeAPIKeyAutoDisableRules validates and canonicalizes channel-scoped
+// API key rules before they are persisted.
+func NormalizeAPIKeyAutoDisableRules(policies *objects.ChannelPolicies) error {
+	if policies == nil {
+		return nil
+	}
+
+	switch policies.APIKeyAutoDisableMode {
+	case objects.APIKeyAutoDisableModeInherit:
+		policies.APIKeyAutoDisableRules = nil
+		return nil
+	case objects.APIKeyAutoDisableModeCustom:
+		if len(policies.APIKeyAutoDisableRules) == 0 {
+			policies.APIKeyAutoDisableMode = objects.APIKeyAutoDisableModeInherit
+			return nil
+		}
+	}
+
+	if len(policies.APIKeyAutoDisableRules) == 0 {
+		return nil
+	}
+
+	rules, err := normalizeAutoDisableRules(policies.APIKeyAutoDisableRules, true)
+	if err != nil {
+		return err
+	}
+	policies.APIKeyAutoDisableRules = rules
+	return nil
+}
+
+// normalizeAutoDisableRules validates a rule list. Global retry policy uses
+// allowDelete=false so permanent_disable_delete is rejected there.
+func normalizeAutoDisableRules(rules []objects.APIKeyAutoDisableRule, allowDelete bool) ([]objects.APIKeyAutoDisableRule, error) {
+	if len(rules) == 0 {
+		return rules, nil
+	}
+
+	normalized := slices.Clone(rules)
+	for i := range normalized {
+		rule := &normalized[i]
+		if rule.Times < 1 {
+			return nil, fmt.Errorf("API key rule %d consecutive error count must be at least 1", i+1)
+		}
+
+		// Each action owns one schedule field; the others are cleared so a rule
+		// edited from one action to another cannot leave stale settings behind.
+		switch rule.Action {
+		case objects.APIKeyAutoDisableActionTemporary:
+			if rule.DisableDurationMinutes == nil {
+				return nil, fmt.Errorf("API key rule %d requires a disable duration for temporary disable", i+1)
+			}
+			if *rule.DisableDurationMinutes < 1 {
+				return nil, fmt.Errorf("API key rule %d disable duration must be at least 1 minute", i+1)
+			}
+
+			rule.DisableUntilCron = ""
+			rule.DisableUntilTimezone = ""
+		case objects.APIKeyAutoDisableActionUntilCron:
+			rule.DisableUntilCron = strings.TrimSpace(rule.DisableUntilCron)
+			rule.DisableUntilTimezone = strings.TrimSpace(rule.DisableUntilTimezone)
+
+			if rule.DisableUntilCron == "" {
+				return nil, fmt.Errorf("API key rule %d requires a cron expression for scheduled recovery", i+1)
+			}
+
+			if _, err := cronexpr.Parse(rule.DisableUntilCron); err != nil {
+				return nil, fmt.Errorf("API key rule %d has invalid cron expression %q: %w", i+1, rule.DisableUntilCron, err)
+			}
+
+			if rule.DisableUntilTimezone != "" {
+				if _, err := time.LoadLocation(rule.DisableUntilTimezone); err != nil {
+					return nil, fmt.Errorf("API key rule %d has invalid timezone %q: %w", i+1, rule.DisableUntilTimezone, err)
+				}
+			}
+
+			rule.DisableDurationMinutes = nil
+		case objects.APIKeyAutoDisableActionPermanent:
+			rule.DisableDurationMinutes = nil
+			rule.DisableUntilCron = ""
+			rule.DisableUntilTimezone = ""
+		case objects.APIKeyAutoDisableActionPermanentDelete:
+			if !allowDelete {
+				return nil, fmt.Errorf("API key rule %d cannot use permanent_disable_delete in global auto-disable settings", i+1)
+			}
+			rule.DisableDurationMinutes = nil
+			rule.DisableUntilCron = ""
+			rule.DisableUntilTimezone = ""
+		default:
+			return nil, fmt.Errorf("API key rule %d has unsupported action %q", i+1, rule.Action)
+		}
+
+		codes := slices.Clone(rule.StatusCodes)
+		for _, code := range codes {
+			if code < 100 || code > 599 {
+				return nil, fmt.Errorf("API key rule %d has invalid HTTP status code %d", i+1, code)
+			}
+		}
+		slices.Sort(codes)
+		rule.StatusCodes = slices.Compact(codes)
+
+		patterns := make([]string, 0, len(rule.KeywordPatterns))
+		seen := make(map[string]struct{}, len(rule.KeywordPatterns))
+		for _, pattern := range rule.KeywordPatterns {
+			pattern = strings.TrimSpace(pattern)
+			if pattern == "" {
+				continue
+			}
+			if _, ok := seen[pattern]; ok {
+				continue
+			}
+			seen[pattern] = struct{}{}
+			patterns = append(patterns, pattern)
+		}
+		rule.KeywordPatterns = patterns
+	}
+
+	return normalized, nil
 }
 
 // UpdateChannel updates an existing channel with the provided input.
 func (svc *ChannelService) UpdateChannel(ctx context.Context, id int, input *ent.UpdateChannelInput) (*ent.Channel, error) {
-	log.Debug(ctx, "UpdateChannel", log.Int("id", id), log.Any("input", input))
+	log.Debug(ctx, "UpdateChannel", log.Int("id", id))
+	// Snapshot the provider identity before normalizing Command Code settings.
+	// Settings-only updates need this snapshot to reject a concurrent type
+	// change that could otherwise leave a quota cookie on the wrong channel.
+	existingIdentity, err := authz.RunWithScopeDecision(ctx, scopes.ScopeWriteChannels, func(queryCtx context.Context) (*ent.Channel, error) {
+		return svc.entFromContext(queryCtx).Channel.Query().
+			Where(channel.IDEQ(id)).
+			Select(channel.FieldType, channel.FieldBaseURL, channel.FieldUpdatedAt).
+			Only(queryCtx)
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to load channel provider identity: %w", err)
+	}
+
+	effectiveType := existingIdentity.Type
+	if input.Type != nil {
+		effectiveType = *input.Type
+	}
+
+	commandCodeQuotaSettings := input.Settings != nil &&
+		(isCommandCodeChannelType(effectiveType) ||
+			(input.Settings.ProviderQuota != nil && input.Settings.ProviderQuota.CommandCode != nil))
+	guardProviderIdentity := input.Type != nil || input.BaseURL != nil || input.Endpoints != nil || commandCodeQuotaSettings
+
+	// A cleared Command Code quota cookie must invalidate the old persisted
+	// status, regardless of whether the client sent null or an empty object.
+	quotaCookieCleared := false
+
+	if input.Settings != nil {
+		if isCommandCodeChannelType(effectiveType) && (input.Settings.ProviderQuota == nil || commandCodeQuotaCookieIsBlank(input.Settings)) {
+			input.Settings = clearCommandCodeQuotaSettings(input.Settings)
+			quotaCookieCleared = true
+		}
+
+		sanitizedSettings, err := normalizeCommandCodeQuotaCookieSettings(input.Settings, effectiveType)
+		if err != nil {
+			return nil, err
+		}
+		if sanitizedSettings != nil {
+			input.Settings = sanitizedSettings
+		}
+	}
+
+	if err := NormalizeAPIKeyAutoDisableRules(input.Policies); err != nil {
+		return nil, err
+	}
+	officialBaseURL := xaisubscription.DefaultBaseURL
+	if input.Type != nil && *input.Type == channel.TypeXaiSubscription {
+		input.BaseURL = &officialBaseURL
+		input.Endpoints = []objects.ChannelEndpoint{}
+	} else if input.Type == nil && (input.BaseURL != nil || input.Endpoints != nil) {
+		existing, err := svc.entFromContext(ctx).Channel.Query().Where(channel.IDEQ(id), channel.TypeEQ(channel.TypeXaiSubscription)).Exist(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("failed to check xAI subscription channel: %w", err)
+		}
+		if existing {
+			input.BaseURL = &officialBaseURL
+			input.Endpoints = []objects.ChannelEndpoint{}
+		}
+	}
+	effectiveBaseURL := existingIdentity.BaseURL
+	if input.BaseURL != nil {
+		effectiveBaseURL = *input.BaseURL
+	}
+	if isCommandCodeChannelType(effectiveType) {
+		if err := validateCommandCodeBaseURL(effectiveBaseURL); err != nil {
+			return nil, err
+		}
+	}
 
 	// Check if name is being updated and if it conflicts with existing channels
 	if input.Name != nil {
@@ -494,23 +930,31 @@ func (svc *ChannelService) UpdateChannel(ctx context.Context, id int, input *ent
 		}
 
 		if existing != nil {
-			return nil, fmt.Errorf("channel with name '%s' already exists", *input.Name)
+			return nil, xerrors.DuplicateNameError("channel", *input.Name)
 		}
 	}
 
-	mut := svc.entFromContext(ctx).Channel.UpdateOneID(id).
-		SetNillableBaseURL(input.BaseURL).
-		SetNillableName(input.Name).
-		SetNillableDefaultTestModel(input.DefaultTestModel).
-		SetNillableOrderingWeight(input.OrderingWeight).
-		SetNillableAutoSyncSupportedModels(input.AutoSyncSupportedModels)
-
+	// Synchronize overrides even for callers that have write_channels without
+	// read_channels. The scoped decision permits only this internal read required
+	// to preserve the write invariant; it does not expose channel data to callers.
 	if input.SupportedModels != nil {
-		mut.SetSupportedModels(input.SupportedModels)
-	}
+		settings := input.Settings
+		if settings == nil {
+			existing, err := authz.RunWithScopeDecision(ctx, scopes.ScopeWriteChannels, func(queryCtx context.Context) (*ent.Channel, error) {
+				return svc.entFromContext(queryCtx).Channel.Query().
+					Where(channel.IDEQ(id)).
+					Select(channel.FieldSettings).
+					Only(queryCtx)
+			})
+			if err != nil {
+				return nil, fmt.Errorf("failed to load channel settings for model protocol sync: %w", err)
+			}
+			settings = existing.Settings
+		}
 
-	if input.Tags != nil {
-		mut.SetTags(input.Tags)
+		if settings != nil && RemoveRemovedModelProtocolOverrides(settings, input.SupportedModels) && input.Settings == nil {
+			input.Settings = settings
+		}
 	}
 
 	if input.Settings != nil {
@@ -527,49 +971,250 @@ func (svc *ChannelService) UpdateChannel(ctx context.Context, id int, input *ent
 			}
 		}
 
-		mut.SetSettings(input.Settings)
+		if err := ValidateRateLimit(input.Settings.RateLimit); err != nil {
+			return nil, fmt.Errorf("invalid rate limit: %w", err)
+		}
+
+		if err := NormalizeRetryableStatusCodes(input.Settings); err != nil {
+			return nil, err
+		}
+
+		if err := NormalizeRetryableErrorPatterns(input.Settings); err != nil {
+			return nil, err
+		}
 	}
 
-	if input.Policies != nil {
-		mut.SetPolicies(*input.Policies)
+	// Per-model protocol overrides must always reference the effective endpoint
+	// surface. They can arrive together with the settings, or already be stored in
+	// settings while this update only changes endpoints / channel type.
+	protocolSettings := input.Settings
+	if protocolSettings == nil && (input.Endpoints != nil || input.Type != nil) {
+		existing, err := authz.RunWithScopeDecision(ctx, scopes.ScopeWriteChannels, func(queryCtx context.Context) (*ent.Channel, error) {
+			return svc.entFromContext(queryCtx).Channel.Query().
+				Where(channel.IDEQ(id)).
+				Select(channel.FieldSettings).
+				Only(queryCtx)
+		})
+		if err != nil {
+			return nil, fmt.Errorf("failed to load channel for model protocol validation: %w", err)
+		}
+
+		protocolSettings = existing.Settings
 	}
 
-	if input.Credentials != nil {
-		mut.SetCredentials(*input.Credentials)
+	if protocolSettings != nil && len(protocolSettings.ModelProtocols) > 0 {
+		// Validation needs the effective channel type and endpoint surface: the
+		// update may change either of them alongside the settings.
+		existing, err := authz.RunWithScopeDecision(ctx, scopes.ScopeWriteChannels, func(queryCtx context.Context) (*ent.Channel, error) {
+			return svc.entFromContext(queryCtx).Channel.Query().
+				Where(channel.IDEQ(id)).
+				Select(channel.FieldType, channel.FieldEndpoints).
+				Only(queryCtx)
+		})
+		if err != nil {
+			return nil, fmt.Errorf("failed to load channel for model protocol validation: %w", err)
+		}
+
+		channelType := existing.Type
+		if input.Type != nil {
+			channelType = *input.Type
+		}
+
+		endpoints := existing.Endpoints
+		if input.Endpoints != nil {
+			endpoints = input.Endpoints
+		}
+
+		if err := ValidateModelProtocols(protocolSettings, channelType, endpoints); err != nil {
+			return nil, fmt.Errorf("invalid model protocols: %w", err)
+		}
 	}
 
-	if input.Remark != nil {
-		mut.SetRemark(*input.Remark)
+	if input.Endpoints != nil || input.Type != nil {
+		existing, err := authz.RunWithScopeDecision(ctx, scopes.ScopeWriteChannels, func(queryCtx context.Context) (*ent.Channel, error) {
+			return svc.entFromContext(queryCtx).Channel.Query().
+				Where(channel.IDEQ(id)).
+				Select(channel.FieldType, channel.FieldEndpoints).
+				Only(queryCtx)
+		})
+		if err != nil {
+			return nil, fmt.Errorf("failed to load channel for endpoint validation: %w", err)
+		}
+
+		channelType := existing.Type
+		if input.Type != nil {
+			channelType = *input.Type
+		}
+		endpoints := existing.Endpoints
+		if input.Endpoints != nil {
+			endpoints = input.Endpoints
+		}
+
+		if err := validateEndpointsForChannelType(channelType, endpoints); err != nil {
+			return nil, fmt.Errorf("invalid endpoints: %w", err)
+		}
 	}
 
-	if input.ClearRemark {
-		mut.ClearRemark()
-	}
+	var updated *ent.Channel
+	providerIdentityChanged := false
+	clearStaleQuotaSettings := input.Settings == nil && input.Type != nil &&
+		!isCommandCodeChannelType(*input.Type)
+	err = svc.RunInTransaction(ctx, func(ctx context.Context) error {
+		db := svc.entFromContext(ctx)
 
-	if input.ClearErrorMessage {
-		mut.ClearErrorMessage()
-	}
+		// Only identity changes and Command Code quota-related settings need
+		// optimistic locking; unrelated channel edits retain their prior behavior.
+		mut := db.Channel.UpdateOneID(id).
+			SetNillableType(input.Type).
+			SetNillableBaseURL(input.BaseURL).
+			SetNillableName(input.Name).
+			SetNillableDefaultTestModel(input.DefaultTestModel).
+			SetNillableOrderingWeight(input.OrderingWeight).
+			SetNillableAutoSyncSupportedModels(input.AutoSyncSupportedModels)
+		if guardProviderIdentity {
+			mut.Where(channel.UpdatedAtEQ(existingIdentity.UpdatedAt))
+		}
 
-	channel, err := mut.Save(ctx)
+		if input.SupportedModels != nil {
+			mut.SetSupportedModels(input.SupportedModels)
+		}
+
+		if input.ManualModels != nil {
+			mut.SetManualModels(input.ManualModels)
+		}
+
+		if input.Tags != nil {
+			mut.SetTags(input.Tags)
+		}
+
+		if input.Settings != nil {
+			mut.SetSettings(input.Settings)
+		} else if clearStaleQuotaSettings {
+			// Type change away from the Command Code variants with no settings
+			// block: read the stored settings inside the same transaction and
+			// drop any orphaned quota cookie.
+			existingSettings, err := db.Channel.Query().
+				Where(channel.IDEQ(id)).
+				Select(channel.FieldSettings).
+				Only(ctx)
+			if err != nil {
+				return fmt.Errorf("failed to load channel settings: %w", err)
+			}
+			mut.SetSettings(clearCommandCodeQuotaSettings(existingSettings.Settings))
+		}
+
+		if input.Policies != nil {
+			mut.SetPolicies(*input.Policies)
+		}
+
+		if input.Credentials != nil {
+			credentials := *input.Credentials
+			existing, err := db.Channel.Query().
+				Where(channel.IDEQ(id)).
+				Select(channel.FieldType, channel.FieldCredentials).
+				Only(ctx)
+			if err != nil {
+				return fmt.Errorf("failed to load existing channel credentials: %w", err)
+			}
+			effectiveType := existing.Type
+			if input.Type != nil {
+				effectiveType = *input.Type
+			}
+			if credentials.ManagementAPIKey == "" && isZenmuxChannelType(effectiveType) {
+				credentials.ManagementAPIKey = existing.Credentials.ManagementAPIKey
+			}
+			mut.SetCredentials(credentials)
+		}
+
+		if input.Remark != nil {
+			mut.SetRemark(*input.Remark)
+		}
+
+		if input.ClearRemark {
+			mut.ClearRemark()
+		}
+
+		if input.ClearAutoSyncModelPattern {
+			mut.ClearAutoSyncModelPattern()
+		} else if input.AutoSyncModelPattern != nil {
+			mut.SetAutoSyncModelPattern(*input.AutoSyncModelPattern)
+		}
+
+		if input.Endpoints != nil {
+			mut.SetEndpoints(input.Endpoints)
+		}
+
+		if input.ClearErrorMessage {
+			mut.ClearErrorMessage()
+		}
+
+		channel, err := mut.Save(ctx)
+		if err != nil {
+			if ent.IsNotFound(err) {
+				return fmt.Errorf("channel was updated concurrently; retry the operation")
+			}
+			return fmt.Errorf("failed to update channel: %w", err)
+		}
+		if guardProviderIdentity {
+			providerIdentityChanged = channel.Type != existingIdentity.Type ||
+				channel.BaseURL != existingIdentity.BaseURL
+		}
+
+		if input.SupportedModels != nil {
+			if _, err := svc.ensureChannelModelPrices(ctx, id, input.SupportedModels); err != nil {
+				return err
+			}
+		}
+
+		updated = channel
+
+		return nil
+	})
 	if err != nil {
-		return nil, fmt.Errorf("failed to update channel: %w", err)
+		return nil, err
+	}
+	if ent.TxFromContext(ctx) == nil {
+		updated.Unwrap()
+	}
+	if providerIdentityChanged || quotaCookieCleared {
+		runAfterCommit(ctx, func(ctx context.Context) {
+			svc.invalidateProviderQuota(ctx, id)
+		})
 	}
 
-	svc.asyncReloadChannels()
+	// Intentionally NO forgetLimiter call: ChannelLimiterManager.GetOrCreate
+	// already detects rate-limit changes via cfg equality and rebuilds on the
+	// next request. Calling Forget on every update (including unrelated
+	// settings) would orphan in-flight slots and let the next batch of
+	// requests transiently exceed MaxConcurrent.
+	svc.reloadChannelsAfterCommit(ctx)
 
-	return channel, nil
+	return updated, nil
+}
+
+func isZenmuxChannelType(channelType channel.Type) bool {
+	switch channelType {
+	case channel.TypeZenmux, channel.TypeZenmuxResponses, channel.TypeZenmuxAnthropic, channel.TypeZenmuxGemini, channel.TypeZenmuxVideo:
+		return true
+	default:
+		return false
+	}
 }
 
 // UpdateChannelStatus updates the status of a channel.
 func (svc *ChannelService) UpdateChannelStatus(ctx context.Context, id int, status channel.Status) (*ent.Channel, error) {
+	// A manual status change takes the channel out of the auto-disable lifecycle,
+	// so the auto-enable schedule no longer applies to it.
 	channel, err := svc.entFromContext(ctx).Channel.UpdateOneID(id).
 		SetStatus(status).
+		ClearAutoDisabledAt().
+		ClearAutoDisableExpiresAt().
 		Save(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to update channel status: %w", err)
 	}
 
-	svc.asyncReloadChannels()
+	svc.reloadChannelsAfterCommit(ctx)
 
 	return channel, nil
 }
@@ -587,13 +1232,59 @@ func (svc *ChannelService) asyncReloadChannels() {
 	}
 }
 
+// reloadChannelsAfterCommit waits for a caller-owned Ent transaction, including
+// the GraphQL Transactioner, before publishing the channel cache refresh.
+func (svc *ChannelService) reloadChannelsAfterCommit(ctx context.Context) {
+	runAfterCommit(ctx, func(context.Context) {
+		svc.asyncReloadChannels()
+	})
+}
+
+// SaveChannelEndpoints updates the endpoints field for a channel.
+// Validates user-configured endpoint overrides before storing them. Runtime
+// endpoint resolution merges matching api_format entries with defaults.
+func (svc *ChannelService) SaveChannelEndpoints(ctx context.Context, input SaveChannelEndpointsInput) (*ent.Channel, error) {
+	ch, err := svc.entFromContext(ctx).Channel.Get(ctx, input.ChannelID.ID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get channel: %w", err)
+	}
+	if err := validateEndpointsForChannelType(ch.Type, input.Endpoints); err != nil {
+		return nil, fmt.Errorf("invalid endpoints: %w", err)
+	}
+	if ch.Type == channel.TypeXaiSubscription {
+		return nil, errors.New("xAI subscription channels do not support custom endpoints")
+	}
+
+	// Endpoint changes can invalidate per-model protocol overrides that reference
+	// removed api formats.
+	if err := ValidateModelProtocols(ch.Settings, ch.Type, input.Endpoints); err != nil {
+		return nil, fmt.Errorf("invalid endpoints for configured model protocols: %w", err)
+	}
+
+	ch, err = svc.entFromContext(ctx).Channel.UpdateOneID(ch.ID).
+		Where(channel.UpdatedAtEQ(ch.UpdatedAt)).
+		SetEndpoints(input.Endpoints).
+		Save(ctx)
+	if err != nil {
+		if ent.IsNotFound(err) {
+			return nil, errors.New("channel was updated concurrently; retry the operation")
+		}
+		return nil, fmt.Errorf("failed to update channel endpoints: %w", err)
+	}
+
+	svc.reloadChannelsAfterCommit(ctx)
+
+	return ch, nil
+}
+
 // DeleteChannel deletes a channel by ID.
 func (svc *ChannelService) DeleteChannel(ctx context.Context, id int) error {
 	if err := svc.entFromContext(ctx).Channel.DeleteOneID(id).Exec(ctx); err != nil {
 		return fmt.Errorf("failed to delete channel: %w", err)
 	}
 
-	svc.asyncReloadChannels()
+	svc.forgetLimiter(id)
+	svc.reloadChannelsAfterCommit(ctx)
 
 	return nil
 }
@@ -607,4 +1298,72 @@ func (c *Channel) GetEnabledAPIKeys() []string {
 func (c *Channel) IsAPIKeyDisabled(key string) bool {
 	_, ok := c.cachedDisabledKeySet[key]
 	return ok
+}
+
+// normalizeCommandCodeQuotaCookieSettings is the biz-local gateway to the
+// shared Command Code cookie normalizer (provider_quota package). It keeps
+// channel persistence decoupled from the quota checker while guaranteeing the
+// exact same allowlist is applied before anything is stored. On the two
+// Command Code channel types the raw paste is canonicalized to the allowlisted
+// cookie; on every other type a supplied Command Code quota block is cleared
+// so the browser cookie never persists outside Command Code channels. A nil
+// result means no Command Code quota block was present; callers keep their
+// settings.
+func normalizeCommandCodeQuotaCookieSettings(settings *objects.ChannelSettings, typ channel.Type) (*objects.ChannelSettings, error) {
+	if settings == nil || settings.ProviderQuota == nil || settings.ProviderQuota.CommandCode == nil {
+		return nil, nil
+	}
+
+	if !isCommandCodeChannelType(typ) {
+		// The quota cookie only belongs on the two Command Code channel types.
+		// A type switch away (or a create/update that supplies a quota block on
+		// an unrelated type) must not persist the raw cookie.
+		return clearCommandCodeQuotaSettings(settings), nil
+	}
+
+	cookie, err := provider_quota.NormalizeCommandCodeCookie(settings.ProviderQuota.CommandCode.AuthCookie)
+	if err != nil {
+		return nil, fmt.Errorf("invalid Command Code quota auth cookie: %w", err)
+	}
+
+	providerQuota := *settings.ProviderQuota
+	commandCode := *providerQuota.CommandCode
+	commandCode.AuthCookie = cookie
+	providerQuota.CommandCode = &commandCode
+
+	sanitized := *settings
+	sanitized.ProviderQuota = &providerQuota
+	return &sanitized, nil
+}
+
+// clearCommandCodeQuotaSettings removes the Command Code quota-only settings
+// block. It is applied when a type change leaves a cookie orphaned on a
+// non-Command Code channel, or when a Command Code settings update explicitly
+// blanks the quota auth cookie: the cookie must not survive outside the two
+// Command Code types. settings == nil stays nil (nothing to clear).
+func clearCommandCodeQuotaSettings(settings *objects.ChannelSettings) *objects.ChannelSettings {
+	if settings == nil {
+		return settings
+	}
+	sanitized := *settings
+	if sanitized.ProviderQuota != nil {
+		providerQuota := *sanitized.ProviderQuota
+		providerQuota.CommandCode = nil
+		if providerQuota == (objects.ChannelProviderQuotaSettings{}) {
+			sanitized.ProviderQuota = nil
+		} else {
+			sanitized.ProviderQuota = &providerQuota
+		}
+	}
+	return &sanitized
+}
+
+// commandCodeQuotaCookieIsBlank reports whether a settings update carries a
+// Command Code quota block whose auth cookie is empty or whitespace-only: the
+// explicit "clear the stored quota cookie" signal from the UI.
+func commandCodeQuotaCookieIsBlank(settings *objects.ChannelSettings) bool {
+	return settings != nil &&
+		settings.ProviderQuota != nil &&
+		settings.ProviderQuota.CommandCode != nil &&
+		strings.TrimSpace(settings.ProviderQuota.CommandCode.AuthCookie) == ""
 }

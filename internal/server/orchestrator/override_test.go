@@ -84,6 +84,146 @@ func TestOverrideParametersWithTemplate(t *testing.T) {
 	require.Equal(t, "header-gpt-4", processedRequestWithHeaders.Headers.Get("X-Custom-Model"))
 }
 
+func TestOverrideParametersWithMappedRequestModel(t *testing.T) {
+	ctx := context.Background()
+	channel := &biz.Channel{
+		Channel: &ent.Channel{
+			ID:   1,
+			Name: "mapped-model-test",
+			Settings: &objects.ChannelSettings{
+				BodyOverrideOperations: []objects.OverrideOperation{{
+					Op:        "set",
+					Path:      "service_tier",
+					Value:     "priority",
+					Condition: `{{or (eq .RequestModel "gpt-4-fast") (eq .RequestModel "gpt-4-priority")}}`,
+				}},
+			},
+		},
+		Outbound: &mockTransformer{},
+	}
+	outbound := &PersistentOutboundTransformer{
+		wrapped: &mockTransformer{},
+		state: &PersistenceState{
+			CurrentCandidate: &ChannelModelsCandidate{Channel: channel},
+			LlmRequest:       &llm.Request{Model: "gpt-4"},
+			OriginalModel:    "gpt-4-fast",
+		},
+	}
+
+	processedRequest, err := applyOverrideRequestBody(outbound).OnOutboundRawRequest(ctx, &httpclient.Request{Body: []byte(`{"model":"gpt-4"}`)})
+	require.NoError(t, err)
+	require.Equal(t, "priority", gjson.GetBytes(processedRequest.Body, "service_tier").String())
+}
+
+func TestOverrideParametersWithRequestHeaderTemplate(t *testing.T) {
+	ctx := context.Background()
+
+	llmRequest := &llm.Request{
+		Model: "gpt-4",
+		RawRequest: &httpclient.Request{
+			Headers: http.Header{
+				"X-Trace-Id":       []string{"trace-123"},
+				"X-Multi-Value":    []string{"first", "second"},
+				"Authorization":    []string{"Bearer secret"},
+				"Api-Key":          []string{"secret-api-key"},
+				"X-Google-Api-Key": []string{"google-secret"},
+			},
+		},
+	}
+
+	channel := &biz.Channel{
+		Channel: &ent.Channel{
+			ID:   1,
+			Name: "request-header-template-test",
+			Settings: &objects.ChannelSettings{
+				OverrideParameters: `{
+					"trace_id_lower": "{{index .RequestHeader \"x-trace-id\"}}",
+					"trace_id_canonical": "{{index .RequestHeader \"X-Trace-Id\"}}",
+					"multi_value": "{{index .RequestHeader \"x-multi-value\"}}",
+					"authorization": "{{index .RequestHeader \"authorization\"}}",
+					"api_key": "{{index .RequestHeader \"api-key\"}}",
+					"x_google_api_key": "{{index .RequestHeader \"x-google-api-key\"}}"
+				}`,
+			},
+		},
+		Outbound: &mockTransformer{},
+	}
+
+	outbound := &PersistentOutboundTransformer{
+		wrapped: &mockTransformer{},
+		state: &PersistenceState{
+			CurrentCandidate: &ChannelModelsCandidate{Channel: channel},
+			LlmRequest:       llmRequest,
+		},
+	}
+
+	middleware := applyOverrideRequestBody(outbound)
+	rawRequest := &httpclient.Request{Body: []byte("{}")}
+
+	processedRequest, err := middleware.OnOutboundRawRequest(ctx, rawRequest)
+	require.NoError(t, err)
+
+	bodyStr := string(processedRequest.Body)
+	require.Equal(t, "trace-123", gjson.Get(bodyStr, "trace_id_lower").String())
+	require.Equal(t, "trace-123", gjson.Get(bodyStr, "trace_id_canonical").String())
+	require.Equal(t, "first", gjson.Get(bodyStr, "multi_value").String())
+	require.Empty(t, gjson.Get(bodyStr, "authorization").String())
+	require.Empty(t, gjson.Get(bodyStr, "api_key").String())
+	require.Empty(t, gjson.Get(bodyStr, "x_google_api_key").String())
+}
+
+func TestOverrideParametersWithRequestHeaderTemplate_LowercaseSensitiveHeaders(t *testing.T) {
+	ctx := context.Background()
+
+	llmRequest := &llm.Request{
+		Model: "gpt-4",
+		RawRequest: &httpclient.Request{
+			Headers: http.Header{
+				"authorization":  []string{"Bearer secret"},
+				"api-key":        []string{"secret-api-key"},
+				"x-goog-api-key": []string{"goog-secret"},
+				"x-trace-id":     []string{"trace-lowercase"},
+			},
+		},
+	}
+
+	channel := &biz.Channel{
+		Channel: &ent.Channel{
+			ID:   1,
+			Name: "request-header-lowercase-sensitive-test",
+			Settings: &objects.ChannelSettings{
+				OverrideParameters: `{
+					"trace_id": "{{index .RequestHeader \"x-trace-id\"}}",
+					"authorization": "{{index .RequestHeader \"authorization\"}}",
+					"api_key": "{{index .RequestHeader \"api-key\"}}",
+					"x_goog_api_key": "{{index .RequestHeader \"x-goog-api-key\"}}"
+				}`,
+			},
+		},
+		Outbound: &mockTransformer{},
+	}
+
+	outbound := &PersistentOutboundTransformer{
+		wrapped: &mockTransformer{},
+		state: &PersistenceState{
+			CurrentCandidate: &ChannelModelsCandidate{Channel: channel},
+			LlmRequest:       llmRequest,
+		},
+	}
+
+	middleware := applyOverrideRequestBody(outbound)
+	rawRequest := &httpclient.Request{Body: []byte("{}")}
+
+	processedRequest, err := middleware.OnOutboundRawRequest(ctx, rawRequest)
+	require.NoError(t, err)
+
+	bodyStr := string(processedRequest.Body)
+	require.Equal(t, "trace-lowercase", gjson.Get(bodyStr, "trace_id").String())
+	require.Empty(t, gjson.Get(bodyStr, "authorization").String())
+	require.Empty(t, gjson.Get(bodyStr, "api_key").String())
+	require.Empty(t, gjson.Get(bodyStr, "x_goog_api_key").String())
+}
+
 func TestOverrideParametersComplex(t *testing.T) {
 	ctx := context.Background()
 
@@ -246,6 +386,207 @@ func TestOverrideParametersNumeric(t *testing.T) {
 
 	require.Equal(t, "500", processedRequestWithHeaders.Headers.Get("X-Int-Header"))
 	require.Equal(t, "0.8", processedRequestWithHeaders.Headers.Get("X-Float-Header"))
+}
+
+func TestOverrideHeadersKeepJSONLikeString(t *testing.T) {
+	ctx := context.Background()
+
+	llmRequest := &llm.Request{Model: "gpt-4"}
+
+	expectedValue := `{"session_id":"843634473","camelCase":"AbC","xTraceId":"XyZ-001"}`
+
+	channel := &biz.Channel{
+		Channel: &ent.Channel{
+			ID:   1,
+			Name: "header-json-string-test",
+			Settings: &objects.ChannelSettings{
+				HeaderOverrideOperations: []objects.OverrideOperation{
+					{Op: objects.OverrideOpSet, Path: "Extra", Value: expectedValue},
+				},
+			},
+		},
+		Outbound: &mockTransformer{},
+	}
+
+	outbound := &PersistentOutboundTransformer{
+		wrapped: &mockTransformer{},
+		state: &PersistenceState{
+			CurrentCandidate: &ChannelModelsCandidate{Channel: channel},
+			LlmRequest:       llmRequest,
+		},
+	}
+
+	headerMiddleware := applyOverrideRequestHeaders(outbound)
+	rawRequest := &httpclient.Request{Headers: make(http.Header)}
+
+	processedRequest, err := headerMiddleware.OnOutboundRawRequest(ctx, rawRequest)
+	require.NoError(t, err)
+	require.Equal(t, expectedValue, processedRequest.Headers.Get("Extra"))
+}
+
+func TestOverrideHeadersWithPromptCacheKeyTemplate(t *testing.T) {
+	ctx := context.Background()
+	promptCacheKey := `cache-key-123","admin":true`
+	topLevelPromptCacheKey := "top-level-cache-key"
+
+	tests := []struct {
+		name           string
+		request        *llm.Request
+		expectedHeader string
+	}{
+		{
+			name: "JSON-escapes prompt cache key",
+			request: &llm.Request{
+				Model:          "gpt-5.5",
+				PromptCacheKey: &promptCacheKey,
+			},
+			expectedHeader: `{"session_id":"cache-key-123\",\"admin\":true"}`,
+		},
+		{
+			name:           "skips header when prompt cache key is absent",
+			request:        &llm.Request{Model: "gpt-5.5"},
+			expectedHeader: "",
+		},
+		{
+			name: "uses prompt cache key from compact request",
+			request: &llm.Request{
+				Model:   "gpt-5.5",
+				Compact: &llm.CompactRequest{PromptCacheKey: "compact-cache-key"},
+			},
+			expectedHeader: `{"session_id":"compact-cache-key"}`,
+		},
+		{
+			name: "prefers top-level prompt cache key",
+			request: &llm.Request{
+				Model:          "gpt-5.5",
+				PromptCacheKey: &topLevelPromptCacheKey,
+				Compact:        &llm.CompactRequest{PromptCacheKey: "compact-cache-key"},
+			},
+			expectedHeader: `{"session_id":"top-level-cache-key"}`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			channel := &biz.Channel{
+				Channel: &ent.Channel{
+					ID:   1,
+					Name: "prompt-cache-key-template-test",
+					Settings: &objects.ChannelSettings{
+						HeaderOverrideOperations: []objects.OverrideOperation{
+							{
+								Op:        objects.OverrideOpSet,
+								Path:      "Extra",
+								Value:     `{"session_id":{{toJSON .PromptCacheKey}}}`,
+								Condition: `{{if .PromptCacheKey}}true{{end}}`,
+							},
+						},
+					},
+				},
+				Outbound: &mockTransformer{},
+			}
+			outbound := &PersistentOutboundTransformer{
+				wrapped: &mockTransformer{},
+				state: &PersistenceState{
+					CurrentCandidate: &ChannelModelsCandidate{Channel: channel},
+					LlmRequest:       tt.request,
+				},
+			}
+
+			headerMiddleware := applyOverrideRequestHeaders(outbound)
+			processedRequest, err := headerMiddleware.OnOutboundRawRequest(ctx, &httpclient.Request{Headers: make(http.Header)})
+			require.NoError(t, err)
+			actualHeader := processedRequest.Headers.Get("Extra")
+			require.Equal(t, tt.expectedHeader, actualHeader)
+			if tt.expectedHeader != "" {
+				var headerValue map[string]any
+				require.NoError(t, json.Unmarshal([]byte(actualHeader), &headerValue))
+				require.Len(t, headerValue, 1)
+			}
+		})
+	}
+}
+
+func TestOverrideParametersWithRequestHeaderTemplate_NoRawRequest(t *testing.T) {
+	ctx := context.Background()
+
+	llmRequest := &llm.Request{Model: "gpt-4.1"}
+
+	channel := &biz.Channel{
+		Channel: &ent.Channel{
+			ID:   1,
+			Name: "body-request-header-no-raw-request-test",
+			Settings: &objects.ChannelSettings{
+				BodyOverrideOperations: []objects.OverrideOperation{
+					{Op: objects.OverrideOpSet, Path: "missing_header", Value: `{{index .RequestHeader "x-trace-id"}}`},
+					{Op: objects.OverrideOpSet, Path: "model_value", Value: `{{.Model}}`},
+				},
+			},
+		},
+		Outbound: &mockTransformer{},
+	}
+
+	outbound := &PersistentOutboundTransformer{
+		wrapped: &mockTransformer{},
+		state: &PersistenceState{
+			CurrentCandidate: &ChannelModelsCandidate{Channel: channel},
+			LlmRequest:       llmRequest,
+		},
+	}
+
+	middleware := applyOverrideRequestBody(outbound)
+	rawRequest := &httpclient.Request{Body: []byte(`{}`)}
+
+	processedRequest, err := middleware.OnOutboundRawRequest(ctx, rawRequest)
+	require.NoError(t, err)
+
+	bodyStr := string(processedRequest.Body)
+	require.Equal(t, "", gjson.Get(bodyStr, "missing_header").String())
+	require.Equal(t, "gpt-4.1", gjson.Get(bodyStr, "model_value").String())
+}
+
+func TestOverrideHeadersWithRequestHeaderTemplate(t *testing.T) {
+	ctx := context.Background()
+
+	llmRequest := &llm.Request{
+		Model: "gpt-4.1",
+		RawRequest: &httpclient.Request{
+			Headers: http.Header{
+				"X-Trace-Id": []string{"trace-123"},
+				"X-Api-Key":  []string{"secret-key"},
+			},
+		},
+	}
+
+	channel := &biz.Channel{
+		Channel: &ent.Channel{
+			ID:   1,
+			Name: "header-request-header-template-test",
+			Settings: &objects.ChannelSettings{
+				HeaderOverrideOperations: []objects.OverrideOperation{
+					{Op: objects.OverrideOpSet, Path: "X-Upstream-Trace", Value: `{{index .RequestHeader "X-Trace-Id"}}`},
+					{Op: objects.OverrideOpSet, Path: "X-Filtered-Api-Key", Value: `{{index .RequestHeader "x-api-key"}}`},
+				},
+			},
+		},
+		Outbound: &mockTransformer{},
+	}
+
+	outbound := &PersistentOutboundTransformer{
+		wrapped: &mockTransformer{},
+		state: &PersistenceState{
+			CurrentCandidate: &ChannelModelsCandidate{Channel: channel},
+			LlmRequest:       llmRequest,
+		},
+	}
+
+	headerMiddleware := applyOverrideRequestHeaders(outbound)
+	rawRequest := &httpclient.Request{Headers: make(http.Header)}
+
+	processedRequest, err := headerMiddleware.OnOutboundRawRequest(ctx, rawRequest)
+	require.NoError(t, err)
+	require.Equal(t, "trace-123", processedRequest.Headers.Get("X-Upstream-Trace"))
+	require.Equal(t, "", processedRequest.Headers.Get("X-Filtered-Api-Key"))
 }
 
 // TestOverrideParameters tests that TransformRequest works correctly.
@@ -1622,6 +1963,208 @@ func TestOverrideLegacyFormatCompatibility(t *testing.T) {
 	require.Equal(t, "yes", gjson.Get(bodyStr, "keep").String())
 }
 
+func TestOverrideBodySetIfAbsent(t *testing.T) {
+	ctx := context.Background()
+
+	tests := []struct {
+		name     string
+		body     string
+		op       objects.OverrideOperation
+		metadata map[string]string
+		expected string
+	}{
+		{
+			name:     "sets top-level default when path is absent",
+			body:     `{"model":"gpt-5.5"}`,
+			op:       objects.OverrideOperation{Op: objects.OverrideOpSetIfAbsent, Path: "max_output_tokens", Value: "32000"},
+			expected: `{"model":"gpt-5.5","max_output_tokens":32000}`,
+		},
+		{
+			name:     "preserves existing number",
+			body:     `{"max_output_tokens":8000}`,
+			op:       objects.OverrideOperation{Op: objects.OverrideOpSetIfAbsent, Path: "max_output_tokens", Value: "32000"},
+			expected: `{"max_output_tokens":8000}`,
+		},
+		{
+			name:     "preserves zero",
+			body:     `{"max_output_tokens":0}`,
+			op:       objects.OverrideOperation{Op: objects.OverrideOpSetIfAbsent, Path: "max_output_tokens", Value: "32000"},
+			expected: `{"max_output_tokens":0}`,
+		},
+		{
+			name:     "preserves false",
+			body:     `{"feature":{"enabled":false}}`,
+			op:       objects.OverrideOperation{Op: objects.OverrideOpSetIfAbsent, Path: "feature.enabled", Value: "true"},
+			expected: `{"feature":{"enabled":false}}`,
+		},
+		{
+			name:     "preserves empty string",
+			body:     `{"label":""}`,
+			op:       objects.OverrideOperation{Op: objects.OverrideOpSetIfAbsent, Path: "label", Value: "fallback"},
+			expected: `{"label":""}`,
+		},
+		{
+			name:     "preserves explicit null",
+			body:     `{"max_output_tokens":null}`,
+			op:       objects.OverrideOperation{Op: objects.OverrideOpSetIfAbsent, Path: "max_output_tokens", Value: "32000"},
+			expected: `{"max_output_tokens":null}`,
+		},
+		{
+			name:     "sets nested default when path is absent",
+			body:     `{"generation":{}}`,
+			op:       objects.OverrideOperation{Op: objects.OverrideOpSetIfAbsent, Path: "generation.max_output_tokens", Value: "32000"},
+			expected: `{"generation":{"max_output_tokens":32000}}`,
+		},
+		{
+			name:     "preserves existing nested value",
+			body:     `{"generation":{"max_output_tokens":16000}}`,
+			op:       objects.OverrideOperation{Op: objects.OverrideOpSetIfAbsent, Path: "generation.max_output_tokens", Value: "32000"},
+			expected: `{"generation":{"max_output_tokens":16000}}`,
+		},
+		{
+			name:     "renders template when path is absent",
+			body:     `{}`,
+			op:       objects.OverrideOperation{Op: objects.OverrideOpSetIfAbsent, Path: "max_output_tokens", Value: `{{index .Metadata "default_max"}}`},
+			metadata: map[string]string{"default_max": "64000"},
+			expected: `{"max_output_tokens":64000}`,
+		},
+		{
+			name:     "respects false condition",
+			body:     `{}`,
+			op:       objects.OverrideOperation{Op: objects.OverrideOpSetIfAbsent, Path: "max_output_tokens", Value: "32000", Condition: `{{eq .Model "other-model"}}`},
+			expected: `{}`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			llmRequest := &llm.Request{Model: "gpt-5.5", Metadata: tt.metadata}
+			channel := &biz.Channel{
+				Channel: &ent.Channel{
+					ID:   1,
+					Name: "set-if-absent-test",
+					Settings: &objects.ChannelSettings{
+						BodyOverrideOperations: []objects.OverrideOperation{tt.op},
+					},
+				},
+				Outbound: &mockTransformer{},
+			}
+			outbound := &PersistentOutboundTransformer{
+				wrapped: &mockTransformer{},
+				state: &PersistenceState{
+					CurrentCandidate: &ChannelModelsCandidate{Channel: channel},
+					LlmRequest:       llmRequest,
+					OriginalModel:    llmRequest.Model,
+				},
+			}
+
+			middleware := applyOverrideRequestBody(outbound)
+			result, err := middleware.OnOutboundRawRequest(ctx, &httpclient.Request{Body: []byte(tt.body)})
+			require.NoError(t, err)
+			require.JSONEq(t, tt.expected, string(result.Body))
+		})
+	}
+}
+
+// TestOverrideBodySetIfAbsentOriginalRequest covers https://github.com/looplj/axonhub/issues/2133:
+// the outbound body is produced by format transformation, so a field the client sent may not
+// survive it (e.g. Anthropic `thinking` mapped to `reasoning_effort`). set_if_absent must treat
+// a field present in the original inbound request body as present.
+func TestOverrideBodySetIfAbsentOriginalRequest(t *testing.T) {
+	ctx := context.Background()
+
+	tests := []struct {
+		name         string
+		originalBody string
+		body         string
+		op           objects.OverrideOperation
+		expected     string
+	}{
+		{
+			name:         "preserves field sent by client but dropped by transformation",
+			originalBody: `{"model":"deepseek-v4-flash","thinking":{"type":"enabled","budget_tokens":13312}}`,
+			body:         `{"model":"deepseek-v4-flash","reasoning_effort":"high"}`,
+			op:           objects.OverrideOperation{Op: objects.OverrideOpSetIfAbsent, Path: "thinking", Value: `{"type":"disabled"}`},
+			expected:     `{"model":"deepseek-v4-flash","reasoning_effort":"high"}`,
+		},
+		{
+			name:         "preserves explicit null sent by client",
+			originalBody: `{"thinking":null}`,
+			body:         `{}`,
+			op:           objects.OverrideOperation{Op: objects.OverrideOpSetIfAbsent, Path: "thinking", Value: `{"type":"disabled"}`},
+			expected:     `{}`,
+		},
+		{
+			name:         "preserves nested field sent by client",
+			originalBody: `{"generation":{"max_output_tokens":16000}}`,
+			body:         `{}`,
+			op:           objects.OverrideOperation{Op: objects.OverrideOpSetIfAbsent, Path: "generation.max_output_tokens", Value: "32000"},
+			expected:     `{}`,
+		},
+		{
+			name:         "sets default when absent from both bodies",
+			originalBody: `{"model":"deepseek-v4-flash"}`,
+			body:         `{"model":"deepseek-v4-flash","reasoning_effort":"high"}`,
+			op:           objects.OverrideOperation{Op: objects.OverrideOpSetIfAbsent, Path: "thinking", Value: `{"type":"disabled"}`},
+			expected:     `{"model":"deepseek-v4-flash","reasoning_effort":"high","thinking":{"type":"disabled"}}`,
+		},
+		{
+			name:         "preserves field present only in transformed body",
+			originalBody: `{}`,
+			body:         `{"max_output_tokens":8000}`,
+			op:           objects.OverrideOperation{Op: objects.OverrideOpSetIfAbsent, Path: "max_output_tokens", Value: "32000"},
+			expected:     `{"max_output_tokens":8000}`,
+		},
+		{
+			name:         "ignores non-JSON original body",
+			originalBody: `not-json`,
+			body:         `{}`,
+			op:           objects.OverrideOperation{Op: objects.OverrideOpSetIfAbsent, Path: "thinking", Value: `{"type":"disabled"}`},
+			expected:     `{"thinking":{"type":"disabled"}}`,
+		},
+		{
+			name:         "sets default when no original request is recorded",
+			originalBody: "",
+			body:         `{}`,
+			op:           objects.OverrideOperation{Op: objects.OverrideOpSetIfAbsent, Path: "thinking", Value: `{"type":"disabled"}`},
+			expected:     `{"thinking":{"type":"disabled"}}`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			llmRequest := &llm.Request{Model: "deepseek-v4-flash"}
+			if tt.originalBody != "" {
+				llmRequest.RawRequest = &httpclient.Request{Body: []byte(tt.originalBody)}
+			}
+
+			channel := &biz.Channel{
+				Channel: &ent.Channel{
+					ID:   1,
+					Name: "set-if-absent-original-test",
+					Settings: &objects.ChannelSettings{
+						BodyOverrideOperations: []objects.OverrideOperation{tt.op},
+					},
+				},
+				Outbound: &mockTransformer{},
+			}
+			outbound := &PersistentOutboundTransformer{
+				wrapped: &mockTransformer{},
+				state: &PersistenceState{
+					CurrentCandidate: &ChannelModelsCandidate{Channel: channel},
+					LlmRequest:       llmRequest,
+					OriginalModel:    llmRequest.Model,
+				},
+			}
+
+			middleware := applyOverrideRequestBody(outbound)
+			result, err := middleware.OnOutboundRawRequest(ctx, &httpclient.Request{Body: []byte(tt.body)})
+			require.NoError(t, err)
+			require.JSONEq(t, tt.expected, string(result.Body))
+		})
+	}
+}
+
 func TestParseOverrideOperations(t *testing.T) {
 	t.Run("empty input", func(t *testing.T) {
 		ops, err := objects.ParseOverrideOperations("")
@@ -1760,4 +2303,310 @@ func TestIssue632Override(t *testing.T) {
 			require.Equal(t, tt.expectedEnabled, kwargs.Get("enable_thinking").Bool(), "enable_thinking mismatch for effort %s", tt.reasoningEffort)
 		})
 	}
+}
+
+func TestOverrideOperationsArrayOps(t *testing.T) {
+	ctx := context.Background()
+
+	llmRequest := &llm.Request{
+		Model: "claude-sonnet-4-6",
+		Metadata: map[string]string{
+			"session_id": "sess-9",
+		},
+	}
+
+	runMiddleware := func(t *testing.T, ops string, body string) string {
+		t.Helper()
+
+		channel := &biz.Channel{
+			Channel: &ent.Channel{
+				ID:   1,
+				Name: "array-test",
+				Settings: &objects.ChannelSettings{
+					OverrideParameters: ops,
+				},
+			},
+			Outbound: &mockTransformer{},
+		}
+		outbound := &PersistentOutboundTransformer{
+			wrapped: &mockTransformer{},
+			state: &PersistenceState{
+				CurrentCandidate: &ChannelModelsCandidate{Channel: channel},
+				LlmRequest:       llmRequest,
+				OriginalModel:    llmRequest.Model,
+			},
+		}
+
+		middleware := applyOverrideRequestBody(outbound)
+
+		result, err := middleware.OnOutboundRawRequest(ctx, &httpclient.Request{Body: []byte(body)})
+		require.NoError(t, err)
+
+		return string(result.Body)
+	}
+
+	t.Run("array_append inserts a single object at the end", func(t *testing.T) {
+		ops := `[{"op":"array_append","path":"system","value":"{\"type\":\"text\",\"text\":\"injected\"}"}]`
+		got := runMiddleware(t, ops, `{"system":[{"type":"text","text":"original"}]}`)
+
+		require.Equal(t, "original", gjson.Get(got, "system.0.text").String())
+		require.Equal(t, "injected", gjson.Get(got, "system.1.text").String())
+		require.Equal(t, int64(2), gjson.Get(got, "system.#").Int())
+	})
+
+	t.Run("array_prepend inserts a single object at the start", func(t *testing.T) {
+		ops := `[{"op":"array_prepend","path":"system","value":"{\"type\":\"text\",\"text\":\"injected\"}"}]`
+		got := runMiddleware(t, ops, `{"system":[{"type":"text","text":"original"}]}`)
+
+		require.Equal(t, "injected", gjson.Get(got, "system.0.text").String())
+		require.Equal(t, "original", gjson.Get(got, "system.1.text").String())
+	})
+
+	t.Run("array_prepend with array value spreads elements (splat default true)", func(t *testing.T) {
+		ops := `[{"op":"array_prepend","path":"system","value":"[{\"text\":\"a\"},{\"text\":\"b\"}]"}]`
+		got := runMiddleware(t, ops, `{"system":[{"text":"original"}]}`)
+
+		require.Equal(t, "a", gjson.Get(got, "system.0.text").String())
+		require.Equal(t, "b", gjson.Get(got, "system.1.text").String())
+		require.Equal(t, "original", gjson.Get(got, "system.2.text").String())
+	})
+
+	t.Run("array_prepend with splat=false inserts the array as a single element", func(t *testing.T) {
+		ops := `[{"op":"array_prepend","path":"tags","value":"[\"a\",\"b\"]","splat":false}]`
+		got := runMiddleware(t, ops, `{"tags":["x"]}`)
+
+		require.True(t, gjson.Get(got, "tags.0").IsArray())
+		require.Equal(t, "a", gjson.Get(got, "tags.0.0").String())
+		require.Equal(t, "b", gjson.Get(got, "tags.0.1").String())
+		require.Equal(t, "x", gjson.Get(got, "tags.1").String())
+	})
+
+	t.Run("array_insert at positive index", func(t *testing.T) {
+		ops := `[{"op":"array_insert","path":"items","index":1,"value":"X"}]`
+		got := runMiddleware(t, ops, `{"items":["a","b","c"]}`)
+
+		require.Equal(t, `["a","X","b","c"]`, gjson.Get(got, "items").Raw)
+	})
+
+	t.Run("array_insert with negative index counts from end", func(t *testing.T) {
+		ops := `[{"op":"array_insert","path":"items","index":-1,"value":"X"}]`
+		got := runMiddleware(t, ops, `{"items":["a","b","c"]}`)
+
+		// -1 means "before last": result -> [a, b, X, c]
+		require.Equal(t, `["a","b","X","c"]`, gjson.Get(got, "items").Raw)
+	})
+
+	t.Run("array_insert clamps out-of-range index", func(t *testing.T) {
+		ops := `[{"op":"array_insert","path":"items","index":99,"value":"X"}]`
+		got := runMiddleware(t, ops, `{"items":["a","b"]}`)
+
+		require.Equal(t, `["a","b","X"]`, gjson.Get(got, "items").Raw)
+	})
+
+	t.Run("array_append on missing path creates new array", func(t *testing.T) {
+		ops := `[{"op":"array_append","path":"system","value":"{\"type\":\"text\",\"text\":\"only\"}"}]`
+		got := runMiddleware(t, ops, `{}`)
+
+		require.Equal(t, "only", gjson.Get(got, "system.0.text").String())
+		require.Equal(t, int64(1), gjson.Get(got, "system.#").Int())
+	})
+
+	t.Run("array_prepend on non-array path is a no-op with warning", func(t *testing.T) {
+		ops := `[{"op":"array_prepend","path":"system","value":"X"}]`
+		got := runMiddleware(t, ops, `{"system":"not-an-array"}`)
+
+		// On error the middleware logs a warning but continues with the unchanged body.
+		require.Equal(t, "not-an-array", gjson.Get(got, "system").String())
+	})
+
+	t.Run("multiple array_prepend ops apply in declared order at index 0", func(t *testing.T) {
+		// Two prepends: each runs against current state and inserts at index 0.
+		// First op inserts B -> [B, original]; second op inserts A -> [A, B, original].
+		ops := `[
+			{"op":"array_prepend","path":"system","value":"{\"text\":\"B\"}"},
+			{"op":"array_prepend","path":"system","value":"{\"text\":\"A\"}"}
+		]`
+		got := runMiddleware(t, ops, `{"system":[{"text":"original"}]}`)
+
+		require.Equal(t, "A", gjson.Get(got, "system.0.text").String())
+		require.Equal(t, "B", gjson.Get(got, "system.1.text").String())
+		require.Equal(t, "original", gjson.Get(got, "system.2.text").String())
+	})
+
+	t.Run("array_prepend supports nested cache_control objects", func(t *testing.T) {
+		ops := `[{"op":"array_prepend","path":"system","value":"{\"type\":\"text\",\"text\":\"prefix\",\"cache_control\":{\"type\":\"ephemeral\"}}"}]`
+		got := runMiddleware(t, ops, `{"system":[{"type":"text","text":"user"}]}`)
+
+		require.Equal(t, "ephemeral", gjson.Get(got, "system.0.cache_control.type").String())
+		require.Equal(t, "prefix", gjson.Get(got, "system.0.text").String())
+		require.Equal(t, "user", gjson.Get(got, "system.1.text").String())
+	})
+
+	t.Run("array op respects condition", func(t *testing.T) {
+		// Condition false: no change.
+		ops := `[{"op":"array_append","path":"system","value":"X","condition":"{{eq .Model \"never\"}}"}]`
+		got := runMiddleware(t, ops, `{"system":["a"]}`)
+		require.Equal(t, `["a"]`, gjson.Get(got, "system").Raw)
+
+		// Condition true: append happens.
+		ops = `[{"op":"array_append","path":"system","value":"X","condition":"{{eq .Model \"claude-sonnet-4-6\"}}"}]`
+		got = runMiddleware(t, ops, `{"system":["a"]}`)
+		require.Equal(t, `["a","X"]`, gjson.Get(got, "system").Raw)
+	})
+
+	t.Run("array_prepend supports templated value", func(t *testing.T) {
+		ops := `[{"op":"array_prepend","path":"system","value":"{\"type\":\"text\",\"text\":\"session-{{index .Metadata \"session_id\"}}\"}"}]`
+		got := runMiddleware(t, ops, `{"system":[{"text":"u"}]}`)
+
+		require.Equal(t, "session-sess-9", gjson.Get(got, "system.0.text").String())
+	})
+
+	t.Run("array_remove removes matching tool by nested name", func(t *testing.T) {
+		ops := `[{
+			"op":"array_remove",
+			"path":"tools",
+			"match":{"path":"function.name","eq":"web_search"}
+		}]`
+		got := runMiddleware(t, ops, `{
+			"tools":[
+				{"type":"function","function":{"name":"get_weather"}},
+				{"type":"function","function":{"name":"web_search"}},
+				{"type":"function","function":{"name":"calculate"}}
+			]
+		}`)
+
+		require.Equal(t, int64(2), gjson.Get(got, "tools.#").Int())
+		require.Equal(t, "get_weather", gjson.Get(got, "tools.0.function.name").String())
+		require.Equal(t, "calculate", gjson.Get(got, "tools.1.function.name").String())
+	})
+
+	t.Run("array_remove keeps non-matching items", func(t *testing.T) {
+		ops := `[{"op":"array_remove","path":"tools","match":{"path":"function.name","eq":"missing"}}]`
+		got := runMiddleware(t, ops, `{"tools":[{"function":{"name":"web_search"}}]}`)
+
+		require.Equal(t, int64(1), gjson.Get(got, "tools.#").Int())
+		require.Equal(t, "web_search", gjson.Get(got, "tools.0.function.name").String())
+	})
+
+	t.Run("array_remove on non-array path is a no-op with warning", func(t *testing.T) {
+		ops := `[{"op":"array_remove","path":"tools","match":{"path":"function.name","eq":"web_search"}}]`
+		got := runMiddleware(t, ops, `{"tools":"not-an-array"}`)
+
+		// On error the middleware logs a warning but continues with the unchanged body.
+		require.Equal(t, "not-an-array", gjson.Get(got, "tools").String())
+	})
+
+	t.Run("array_remove on missing path is a no-op", func(t *testing.T) {
+		ops := `[{"op":"array_remove","path":"tools","match":{"path":"function.name","eq":"web_search"}}]`
+		got := runMiddleware(t, ops, `{"messages":[{"role":"user","content":"hello"}]}`)
+
+		require.False(t, gjson.Get(got, "tools").Exists())
+		require.Equal(t, "hello", gjson.Get(got, "messages.0.content").String())
+	})
+
+	t.Run("array_remove with empty match eq is a no-op with warning", func(t *testing.T) {
+		ops := `[{"op":"array_remove","path":"tools","match":{"path":"function.name","eq":""}}]`
+		got := runMiddleware(t, ops, `{"tools":[{"function":{"name":"web_search"}},{"function":{"name":""}}]}`)
+
+		// Empty match.eq is rejected defensively at runtime so a malformed stored op cannot remove items accidentally.
+		require.Equal(t, int64(2), gjson.Get(got, "tools.#").Int())
+	})
+
+	t.Run("array_remove trims match eq before comparing", func(t *testing.T) {
+		ops := `[{"op":"array_remove","path":"tools","match":{"path":"function.name","eq":" web_search "}}]`
+		got := runMiddleware(t, ops, `{"tools":[{"function":{"name":"web_search"}},{"function":{"name":"calculate"}}]}`)
+
+		require.Equal(t, int64(1), gjson.Get(got, "tools.#").Int())
+		require.Equal(t, "calculate", gjson.Get(got, "tools.0.function.name").String())
+	})
+}
+
+// TestOverrideBodySkipsNonJSONBody guards the image edit regression: sjson rebuilds a
+// non-JSON document from scratch, so applying body overrides to a multipart payload used
+// to replace the whole form with a tiny JSON object while Content-Type still advertised
+// the multipart boundary, producing a truncated upstream request.
+func TestOverrideBodySkipsNonJSONBody(t *testing.T) {
+	ctx := context.Background()
+
+	multipartBody := []byte("--boundary123\r\n" +
+		"Content-Disposition: form-data; name=\"image\"; filename=\"image_1.png\"\r\n" +
+		"Content-Type: image/png\r\n\r\n" +
+		"\x89PNG\r\n\x1a\nbinary-image-bytes\r\n" +
+		"--boundary123\r\n" +
+		"Content-Disposition: form-data; name=\"prompt\"\r\n\r\n" +
+		"make it blue\r\n" +
+		"--boundary123--\r\n")
+
+	newOutbound := func() *PersistentOutboundTransformer {
+		channel := &biz.Channel{
+			Channel: &ent.Channel{
+				ID:              1,
+				Name:            "test-channel",
+				SupportedModels: []string{"gpt-image-1"},
+				Settings: &objects.ChannelSettings{
+					BodyOverrideOperations: []objects.OverrideOperation{
+						{Op: objects.OverrideOpSet, Path: "response_format", Value: "b64_json"},
+					},
+				},
+			},
+			Outbound: &mockTransformer{},
+		}
+
+		return &PersistentOutboundTransformer{
+			wrapped: &mockTransformer{},
+			state: &PersistenceState{
+				CurrentCandidate:      &ChannelModelsCandidate{Channel: channel},
+				CurrentCandidateIndex: 0,
+				CurrentModelIndex:     0,
+				LlmRequest:            &llm.Request{Model: "gpt-image-1"},
+			},
+		}
+	}
+
+	t.Run("multipart body is left untouched", func(t *testing.T) {
+		headers := make(http.Header)
+		headers.Set("Content-Type", "multipart/form-data; boundary=boundary123")
+
+		request := &httpclient.Request{
+			Method:      "POST",
+			URL:         "https://api.example.com/v1/images/edits",
+			Headers:     headers,
+			ContentType: "multipart/form-data; boundary=boundary123",
+			Body:        multipartBody,
+		}
+
+		modified, err := applyOverrideRequestBody(newOutbound()).OnOutboundRawRequest(ctx, request)
+		require.NoError(t, err)
+		require.Equal(t, multipartBody, modified.Body)
+	})
+
+	t.Run("multipart body without explicit content type is left untouched", func(t *testing.T) {
+		request := &httpclient.Request{
+			Method: "POST",
+			URL:    "https://api.example.com/v1/images/edits",
+			Body:   multipartBody,
+		}
+
+		modified, err := applyOverrideRequestBody(newOutbound()).OnOutboundRawRequest(ctx, request)
+		require.NoError(t, err)
+		require.Equal(t, multipartBody, modified.Body)
+	})
+
+	t.Run("json body still gets overridden", func(t *testing.T) {
+		headers := make(http.Header)
+		headers.Set("Content-Type", "application/json")
+
+		request := &httpclient.Request{
+			Method:      "POST",
+			URL:         "https://api.example.com/v1/images/generations",
+			Headers:     headers,
+			ContentType: "application/json",
+			Body:        []byte(`{"model":"gpt-image-1","prompt":"a cat"}`),
+		}
+
+		modified, err := applyOverrideRequestBody(newOutbound()).OnOutboundRawRequest(ctx, request)
+		require.NoError(t, err)
+		require.Equal(t, "b64_json", gjson.GetBytes(modified.Body, "response_format").String())
+		require.Equal(t, "a cat", gjson.GetBytes(modified.Body, "prompt").String())
+	})
 }

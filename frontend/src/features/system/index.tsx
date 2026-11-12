@@ -6,7 +6,7 @@ import { Main } from '@/components/layout/main';
 import { SystemSettingsTabs } from './components/tabs';
 import SystemProvider from './context/system-context';
 
-type SystemTabKey = 'brand' | 'storage' | 'retry' | 'about';
+type SystemTabKey = 'brand' | 'security' | 'storage' | 'retry' | 'webhook' | 'about' | 'general' | 'proxy' | 'backup' | 'diagnostics';
 
 interface SystemContentProps {
   initialTab?: SystemTabKey;
@@ -14,7 +14,7 @@ interface SystemContentProps {
 
 function SystemContent({ initialTab }: SystemContentProps) {
   return (
-    <div className='-mx-4 flex-1 overflow-auto px-4 py-1 lg:flex-row lg:space-y-0 lg:space-x-12'>
+    <div className='-mx-4 flex-1 px-4 py-1 lg:flex-row lg:space-y-0 lg:space-x-12'>
       <SystemSettingsTabs initialTab={initialTab} />
     </div>
   );

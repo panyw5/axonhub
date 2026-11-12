@@ -1,6 +1,7 @@
 package responses
 
 import (
+	"encoding/json"
 	"testing"
 
 	"github.com/samber/lo"
@@ -15,6 +16,21 @@ func TestConvertToolMessage(t *testing.T) {
 		msg      llm.Message
 		expected Item
 	}{
+		{
+			name: "custom tool output uses custom_tool_call_output",
+			msg: llm.Message{
+				Role:       "tool",
+				ToolCallID: lo.ToPtr("call_patch_001"),
+				Content: llm.MessageContent{
+					Content: lo.ToPtr("Patch applied successfully."),
+				},
+			},
+			expected: Item{
+				Type:   "custom_tool_call_output",
+				CallID: "call_patch_001",
+				Output: &Input{Text: lo.ToPtr("Patch applied successfully.")},
+			},
+		},
 		{
 			name: "tool message with simple content",
 			msg: llm.Message{
@@ -92,7 +108,7 @@ func TestConvertToolMessage(t *testing.T) {
 			},
 		},
 		{
-			name: "tool message with multiple content - mixed types (only text extracted)",
+			name: "tool message with multiple content - text and image preserved in order",
 			msg: llm.Message{
 				Role:       "tool",
 				ToolCallID: lo.ToPtr("call_789"),
@@ -122,6 +138,11 @@ func TestConvertToolMessage(t *testing.T) {
 					{
 						Type: "input_text",
 						Text: lo.ToPtr("Text result"),
+					},
+					{
+						Type:     "input_image",
+						ImageURL: lo.ToPtr("https://example.com/image.jpg"),
+						Detail:   lo.ToPtr("auto"),
 					},
 					{
 						Type: "input_text",
@@ -160,7 +181,7 @@ func TestConvertToolMessage(t *testing.T) {
 			},
 		},
 		{
-			name: "tool message with multiple content but no text parts",
+			name: "tool message with image and unsupported parts keeps the image",
 			msg: llm.Message{
 				Role:       "tool",
 				ToolCallID: lo.ToPtr("call_no_text"),
@@ -174,7 +195,7 @@ func TestConvertToolMessage(t *testing.T) {
 						},
 						{
 							Type: "input_audio",
-							Audio: &llm.Audio{
+							InputAudio: &llm.InputAudio{
 								Data:   "audio-data",
 								Format: "wav",
 							},
@@ -186,6 +207,162 @@ func TestConvertToolMessage(t *testing.T) {
 				Type:   "function_call_output",
 				CallID: "call_no_text",
 				Output: &Input{
+					Items: []Item{
+						{
+							Type:     "input_image",
+							ImageURL: lo.ToPtr("https://example.com/image.jpg"),
+							Detail:   lo.ToPtr("auto"),
+						},
+					},
+				},
+			},
+		},
+		{
+			// Shape produced by Codex's view_image tool: the result is a single
+			// base64 image with no text at all. Dropping it made the model see an
+			// empty-but-successful tool result and silently hallucinate instead.
+			name: "image-only tool result is preserved as input_image",
+			msg: llm.Message{
+				Role:       "tool",
+				ToolCallID: lo.ToPtr("call_view_image"),
+				Content: llm.MessageContent{
+					MultipleContent: []llm.MessageContentPart{
+						{
+							Type: "image_url",
+							ImageURL: &llm.ImageURL{
+								URL:    "data:image/png;base64,iVBORw0KGgo=",
+								Detail: lo.ToPtr("high"),
+							},
+						},
+					},
+				},
+			},
+			expected: Item{
+				Type:   "function_call_output",
+				CallID: "call_view_image",
+				Output: &Input{
+					Items: []Item{
+						{
+							Type:     "input_image",
+							ImageURL: lo.ToPtr("data:image/png;base64,iVBORw0KGgo="),
+							Detail:   lo.ToPtr("high"),
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "tool result with text and image keeps both in order",
+			msg: llm.Message{
+				Role:       "tool",
+				ToolCallID: lo.ToPtr("call_mixed"),
+				Content: llm.MessageContent{
+					MultipleContent: []llm.MessageContentPart{
+						{
+							Type: "text",
+							Text: lo.ToPtr("screenshot attached"),
+						},
+						{
+							Type: "image_url",
+							ImageURL: &llm.ImageURL{
+								URL: "https://example.com/shot.png",
+							},
+						},
+					},
+				},
+			},
+			expected: Item{
+				Type:   "function_call_output",
+				CallID: "call_mixed",
+				Output: &Input{
+					Items: []Item{
+						{
+							Type: "input_text",
+							Text: lo.ToPtr("screenshot attached"),
+						},
+						{
+							Type:     "input_image",
+							ImageURL: lo.ToPtr("https://example.com/shot.png"),
+							Detail:   lo.ToPtr("auto"),
+						},
+					},
+				},
+			},
+		},
+		{
+			// custom_tool_call_output shares the FunctionAndCustomToolCallOutput
+			// content union with function_call_output, so images are allowed here too.
+			name: "custom tool output keeps images",
+			msg: llm.Message{
+				Role:       "tool",
+				ToolCallID: lo.ToPtr("call_custom_img"),
+				Content: llm.MessageContent{
+					MultipleContent: []llm.MessageContentPart{
+						{
+							Type: "image_url",
+							ImageURL: &llm.ImageURL{
+								URL: "data:image/png;base64,iVBORw0KGgo=",
+							},
+						},
+					},
+				},
+			},
+			expected: Item{
+				Type:   "custom_tool_call_output",
+				CallID: "call_custom_img",
+				Output: &Input{
+					Items: []Item{
+						{
+							Type:     "input_image",
+							ImageURL: lo.ToPtr("data:image/png;base64,iVBORw0KGgo="),
+							Detail:   lo.ToPtr("auto"),
+						},
+					},
+				},
+			},
+		},
+		{
+			// Known gap, unchanged by this fix: part kinds the current AxonHub
+			// Responses Item model cannot express in a tool result are still dropped
+			// silently, and an all-dropped result is still indistinguishable from a
+			// genuinely empty one. Surfacing that needs structured logging (no logger
+			// reaches this pure converter), so it is left for a separate change rather
+			// than papered over with synthetic output text.
+			name: "tool message with only unsupported parts still degrades to empty string",
+			msg: llm.Message{
+				Role:       "tool",
+				ToolCallID: lo.ToPtr("call_audio_only"),
+				Content: llm.MessageContent{
+					MultipleContent: []llm.MessageContentPart{
+						{
+							Type: "input_audio",
+							InputAudio: &llm.InputAudio{
+								Data:   "audio-data",
+								Format: "wav",
+							},
+						},
+					},
+				},
+			},
+			expected: Item{
+				Type:   "function_call_output",
+				CallID: "call_audio_only",
+				Output: &Input{
+					Text: lo.ToPtr(""),
+				},
+			},
+		},
+		{
+			name: "tool message with no content at all still uses the empty string",
+			msg: llm.Message{
+				Role:       "tool",
+				ToolCallID: lo.ToPtr("call_truly_empty"),
+				Content:    llm.MessageContent{MultipleContent: []llm.MessageContentPart{}},
+			},
+			expected: Item{
+				Type:   "function_call_output",
+				CallID: "call_truly_empty",
+				Output: &Input{
 					Text: lo.ToPtr(""),
 				},
 			},
@@ -194,8 +371,213 @@ func TestConvertToolMessage(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := convertToolMessage(tt.msg)
+			itemType := "function_call_output"
+			if tt.expected.Type != "" {
+				itemType = tt.expected.Type
+			}
+
+			result := convertToolMessageWithType(tt.msg, itemType)
 			require.Equal(t, tt.expected, result)
+		})
+	}
+}
+
+func TestConvertUserMessagePreservesInputFiles(t *testing.T) {
+	input := convertInputFromMessages([]llm.Message{{
+		Role: "user",
+		Content: llm.MessageContent{MultipleContent: []llm.MessageContentPart{
+			{
+				Type: "document",
+				Document: &llm.DocumentURL{
+					URL:      "data:application/pdf;base64,JVBERi0xLjQK",
+					MIMEType: "application/pdf",
+				},
+			},
+			{
+				Type:     "document",
+				Document: &llm.DocumentURL{URL: "https://example.com/report.pdf", Filename: "report.pdf"},
+			},
+			{
+				Type:     "document",
+				Document: &llm.DocumentURL{FileID: "file_123"},
+			},
+		}},
+	}}, llm.TransformOptions{})
+
+	require.Len(t, input.Items, 1)
+	require.NotNil(t, input.Items[0].Content)
+	require.Len(t, input.Items[0].Content.Items, 3)
+	require.Equal(t, "input_file", input.Items[0].Content.Items[0].Type)
+	require.Equal(t, "document.pdf", lo.FromPtr(input.Items[0].Content.Items[0].Filename))
+	require.Equal(t, "data:application/pdf;base64,JVBERi0xLjQK", lo.FromPtr(input.Items[0].Content.Items[0].FileData))
+	require.Equal(t, "https://example.com/report.pdf", lo.FromPtr(input.Items[0].Content.Items[1].FileURL))
+	require.Equal(t, "report.pdf", lo.FromPtr(input.Items[0].Content.Items[1].Filename))
+	require.Equal(t, "file_123", lo.FromPtr(input.Items[0].Content.Items[2].FileID))
+}
+
+// The wire shape matters as much as the struct: a tool result carrying an image
+// has to serialise as an output array of content parts, not as a string.
+func TestConvertToolMessageImageSerializesAsOutputArray(t *testing.T) {
+	item := convertToolMessageWithType(llm.Message{
+		Role:       "tool",
+		ToolCallID: lo.ToPtr("call_wire"),
+		Content: llm.MessageContent{
+			MultipleContent: []llm.MessageContentPart{
+				{Type: "text", Text: lo.ToPtr("look")},
+				{
+					Type: "image_url",
+					ImageURL: &llm.ImageURL{
+						URL:    "data:image/png;base64,iVBORw0KGgo=",
+						Detail: lo.ToPtr("high"),
+					},
+				},
+			},
+		},
+	}, "function_call_output")
+
+	raw, err := json.Marshal(item)
+	require.NoError(t, err)
+
+	var decoded struct {
+		Type   string `json:"type"`
+		CallID string `json:"call_id"`
+		Output []struct {
+			Type     string  `json:"type"`
+			Text     *string `json:"text"`
+			ImageURL *string `json:"image_url"`
+			Detail   *string `json:"detail"`
+		} `json:"output"`
+	}
+
+	require.NoError(t, json.Unmarshal(raw, &decoded))
+	require.Equal(t, "function_call_output", decoded.Type)
+	require.Equal(t, "call_wire", decoded.CallID)
+	require.Len(t, decoded.Output, 2)
+	require.Equal(t, "input_text", decoded.Output[0].Type)
+	require.Equal(t, "look", lo.FromPtr(decoded.Output[0].Text))
+	require.Equal(t, "input_image", decoded.Output[1].Type)
+	require.Equal(t, "data:image/png;base64,iVBORw0KGgo=", lo.FromPtr(decoded.Output[1].ImageURL))
+	require.Equal(t, "high", lo.FromPtr(decoded.Output[1].Detail))
+}
+
+// custom_tool_call_output resolves to InputImageContent, which requires
+// `detail`; assert it reaches the wire even when the source part omits it.
+func TestConvertToolMessageCustomOutputImageCarriesDetail(t *testing.T) {
+	item := convertToolMessageWithType(llm.Message{
+		Role:       "tool",
+		ToolCallID: lo.ToPtr("call_custom_wire"),
+		Content: llm.MessageContent{
+			MultipleContent: []llm.MessageContentPart{
+				{Type: "image_url", ImageURL: &llm.ImageURL{URL: "https://example.com/shot.png"}},
+			},
+		},
+	}, "custom_tool_call_output")
+
+	raw, err := json.Marshal(item)
+	require.NoError(t, err)
+
+	var decoded struct {
+		Type   string `json:"type"`
+		CallID string `json:"call_id"`
+		Output []struct {
+			Type     string  `json:"type"`
+			ImageURL *string `json:"image_url"`
+			Detail   *string `json:"detail"`
+		} `json:"output"`
+	}
+
+	require.NoError(t, json.Unmarshal(raw, &decoded))
+	require.Equal(t, "custom_tool_call_output", decoded.Type)
+	require.Equal(t, "call_custom_wire", decoded.CallID)
+	require.Len(t, decoded.Output, 1)
+	require.Equal(t, "input_image", decoded.Output[0].Type)
+	require.Equal(t, "https://example.com/shot.png", lo.FromPtr(decoded.Output[0].ImageURL))
+	require.Equal(t, "auto", lo.FromPtr(decoded.Output[0].Detail))
+}
+
+func TestConvertWebSearchToTool(t *testing.T) {
+	tests := []struct {
+		name     string
+		src      llm.Tool
+		expected Tool
+	}{
+		{
+			name: "minimal web search tool preserves type without asserting nil internals",
+			src: llm.Tool{
+				Type: llm.ToolTypeWebSearch,
+			},
+			expected: Tool{
+				Type: "web_search",
+			},
+		},
+		{
+			name: "web search maps explicit allowed domains and user location fields",
+			src: llm.Tool{
+				Type: llm.ToolTypeWebSearch,
+				WebSearch: &llm.WebSearch{
+					AllowedDomains: []string{"example.com", "docs.example.com"},
+					UserLocation: llm.WebSearchToolUserLocation{
+						Type:     "approximate",
+						City:     "San Francisco",
+						Region:   "CA",
+						Country:  "US",
+						Timezone: "America/Los_Angeles",
+					},
+				},
+			},
+			expected: Tool{
+				Type: "web_search",
+				Filters: &WebSearchFilters{
+					AllowedDomains: []string{"example.com", "docs.example.com"},
+				},
+				UserLocation: &WebSearchUserLocation{
+					Type:     "approximate",
+					City:     "San Francisco",
+					Region:   "CA",
+					Country:  "US",
+					Timezone: "America/Los_Angeles",
+				},
+			},
+		},
+		{
+			name: "web search defaults location type to approximate when omitted",
+			src: llm.Tool{
+				Type: llm.ToolTypeWebSearch,
+				WebSearch: &llm.WebSearch{
+					UserLocation: llm.WebSearchToolUserLocation{
+						Country: "US",
+					},
+				},
+			},
+			expected: Tool{
+				Type: "web_search",
+				UserLocation: &WebSearchUserLocation{
+					Type:    "approximate",
+					Country: "US",
+				},
+			},
+		},
+		{
+			name: "anthropic only strict and max uses are ignored when they are the only fields",
+			src: llm.Tool{
+				Type: llm.ToolTypeWebSearch,
+				WebSearch: &llm.WebSearch{
+					Strict:  lo.ToPtr(true),
+					MaxUses: lo.ToPtr(int64(3)),
+				},
+			},
+			expected: Tool{
+				Type: "web_search",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := convertWebSearchToTool(tt.src)
+			require.Equal(t, tt.expected, result)
+			require.Equal(t, "web_search", result.Type)
+			require.Empty(t, result.Parameters)
 		})
 	}
 }
@@ -281,6 +663,52 @@ func TestConvertToTextOptions(t *testing.T) {
 			expected: &TextOptions{
 				Format: &TextFormat{
 					Type: "json_object",
+				},
+			},
+		},
+		{
+			name: "json_schema with name and schema",
+			req: &llm.Request{
+				ResponseFormat: &llm.ResponseFormat{
+					Type:       "json_schema",
+					JSONSchema: json.RawMessage(`{"name":"ping_response","schema":{"type":"object","properties":{"pong":{"type":"boolean"}},"required":["pong"],"additionalProperties":false}}`),
+				},
+			},
+			expected: &TextOptions{
+				Format: &TextFormat{
+					Type:   "json_schema",
+					Name:   "ping_response",
+					Schema: json.RawMessage(`{"type":"object","properties":{"pong":{"type":"boolean"}},"required":["pong"],"additionalProperties":false}`),
+				},
+			},
+		},
+		{
+			name: "json_schema with strict",
+			req: &llm.Request{
+				ResponseFormat: &llm.ResponseFormat{
+					Type:       "json_schema",
+					JSONSchema: json.RawMessage(`{"name":"test","strict":true,"schema":{"type":"object"}}`),
+				},
+			},
+			expected: &TextOptions{
+				Format: &TextFormat{
+					Type:   "json_schema",
+					Name:   "test",
+					Schema: json.RawMessage(`{"type":"object"}`),
+					Strict: lo.ToPtr(true),
+				},
+			},
+		},
+		{
+			name: "json_schema type without json_schema field",
+			req: &llm.Request{
+				ResponseFormat: &llm.ResponseFormat{
+					Type: "json_schema",
+				},
+			},
+			expected: &TextOptions{
+				Format: &TextFormat{
+					Type: "json_schema",
 				},
 			},
 		},
@@ -626,6 +1054,21 @@ func TestConvertReasoning(t *testing.T) {
 				Summary: "concise",
 			},
 		},
+		{
+			name: "with only responses reasoning context",
+			req: &llm.Request{
+				ProviderExtensions: &llm.ProviderExtensions{
+					OpenAIResponses: &llm.OpenAIResponsesProviderExtensions{
+						Request: &llm.OpenAIResponsesRequestExtensions{
+							ReasoningContext: "all_turns",
+						},
+					},
+				},
+			},
+			expected: &Reasoning{
+				Context: "all_turns",
+			},
+		},
 	}
 
 	for _, tt := range tests {
@@ -634,4 +1077,663 @@ func TestConvertReasoning(t *testing.T) {
 			require.Equal(t, tt.expected, result)
 		})
 	}
+}
+
+func TestConvertOutputToMessage(t *testing.T) {
+	tests := []struct {
+		name                string
+		output              []Item
+		transformerMetadata map[string]any
+		validate            func(t *testing.T, msg llm.Message)
+	}{
+		{
+			name:   "empty output",
+			output: nil,
+			validate: func(t *testing.T, msg llm.Message) {
+				require.Equal(t, "assistant", msg.Role)
+				require.Nil(t, msg.Content.Content)
+				require.Nil(t, msg.Content.MultipleContent)
+			},
+		},
+		{
+			name: "text message output",
+			output: []Item{
+				{
+					ID:   "msg_001",
+					Type: "message",
+					Content: &Input{Items: []Item{
+						{Type: "output_text", Text: lo.ToPtr("Hello world")},
+					}},
+				},
+			},
+			validate: func(t *testing.T, msg llm.Message) {
+				require.Equal(t, "msg_001", msg.ID)
+				require.NotNil(t, msg.Content.Content)
+				require.Equal(t, "Hello world", *msg.Content.Content)
+			},
+		},
+		{
+			name: "message output with nil content",
+			output: []Item{
+				{
+					ID:      "msg_nil",
+					Type:    "message",
+					Content: nil,
+				},
+			},
+			validate: func(t *testing.T, msg llm.Message) {
+				require.Equal(t, "msg_nil", msg.ID)
+				require.Nil(t, msg.Content.Content)
+				require.Nil(t, msg.Content.MultipleContent)
+				require.Empty(t, msg.Annotations)
+			},
+		},
+		{
+			name: "direct output_text item",
+			output: []Item{
+				{Type: "output_text", Text: lo.ToPtr("Direct text")},
+			},
+			validate: func(t *testing.T, msg llm.Message) {
+				require.NotNil(t, msg.Content.Content)
+				require.Equal(t, "Direct text", *msg.Content.Content)
+			},
+		},
+		{
+			name: "output_text annotations are converted",
+			output: []Item{
+				{
+					ID:   "msg_annotated",
+					Type: "message",
+					Content: &Input{Items: []Item{
+						{
+							Type: "output_text",
+							Text: lo.ToPtr("Alpha"),
+							Annotations: []Annotation{
+								{
+									Type:       "url_citation",
+									StartIndex: lo.ToPtr(int64(0)),
+									EndIndex:   lo.ToPtr(int64(5)),
+									URLCitation: &URLCitation{
+										URL:   "https://example.com/alpha",
+										Title: "Alpha Source",
+									},
+								},
+							},
+						},
+					}},
+				},
+			},
+			validate: func(t *testing.T, msg llm.Message) {
+				require.Equal(t, "msg_annotated", msg.ID)
+				require.NotNil(t, msg.Content.Content)
+				require.Equal(t, "Alpha", *msg.Content.Content)
+				require.Len(t, msg.Annotations, 1)
+				require.Equal(t, "url_citation", msg.Annotations[0].Type)
+				require.NotNil(t, msg.Annotations[0].StartIndex)
+				require.Equal(t, int64(0), *msg.Annotations[0].StartIndex)
+				require.NotNil(t, msg.Annotations[0].EndIndex)
+				require.Equal(t, int64(5), *msg.Annotations[0].EndIndex)
+				require.NotNil(t, msg.Annotations[0].URLCitation)
+				require.Equal(t, "https://example.com/alpha", msg.Annotations[0].URLCitation.URL)
+				require.Equal(t, "Alpha Source", msg.Annotations[0].URLCitation.Title)
+			},
+		},
+		{
+			name: "output_text annotations are rebased across items using rune length",
+			output: []Item{
+				{
+					Type: "message",
+					Content: &Input{Items: []Item{
+						{
+							Type: "output_text",
+							Text: lo.ToPtr("你好"),
+							Annotations: []Annotation{
+								{
+									Type:       "url_citation",
+									StartIndex: lo.ToPtr(int64(0)),
+									EndIndex:   lo.ToPtr(int64(2)),
+									URLCitation: &URLCitation{
+										URL:   "https://example.com/nihao",
+										Title: "Ni Hao",
+									},
+								},
+							},
+						},
+					}},
+				},
+				{
+					Type: "output_text",
+					Text: lo.ToPtr("世界"),
+					Annotations: []Annotation{
+						{
+							Type:       "url_citation",
+							StartIndex: lo.ToPtr(int64(0)),
+							EndIndex:   lo.ToPtr(int64(2)),
+							URLCitation: &URLCitation{
+								URL:   "https://example.com/shijie",
+								Title: "Shi Jie",
+							},
+						},
+					},
+				},
+			},
+			validate: func(t *testing.T, msg llm.Message) {
+				require.NotNil(t, msg.Content.Content)
+				require.Equal(t, "你好世界", *msg.Content.Content)
+				require.Len(t, msg.Annotations, 2)
+				require.NotNil(t, msg.Annotations[0].StartIndex)
+				require.Equal(t, int64(0), *msg.Annotations[0].StartIndex)
+				require.NotNil(t, msg.Annotations[0].EndIndex)
+				require.Equal(t, int64(2), *msg.Annotations[0].EndIndex)
+				require.NotNil(t, msg.Annotations[1].StartIndex)
+				require.Equal(t, int64(2), *msg.Annotations[1].StartIndex)
+				require.NotNil(t, msg.Annotations[1].EndIndex)
+				require.Equal(t, int64(4), *msg.Annotations[1].EndIndex)
+				require.NotNil(t, msg.Annotations[1].URLCitation)
+				require.Equal(t, "https://example.com/shijie", msg.Annotations[1].URLCitation.URL)
+			},
+		},
+		{
+			name: "function call output",
+			output: []Item{
+				{
+					Type:      "function_call",
+					CallID:    "call_123",
+					Name:      "get_weather",
+					Arguments: `{"location":"NYC"}`,
+				},
+			},
+			validate: func(t *testing.T, msg llm.Message) {
+				require.Len(t, msg.ToolCalls, 1)
+				require.Equal(t, "call_123", msg.ToolCalls[0].ID)
+				require.Equal(t, "function", msg.ToolCalls[0].Type)
+				require.Equal(t, "get_weather", msg.ToolCalls[0].Function.Name)
+				require.Equal(t, `{"location":"NYC"}`, msg.ToolCalls[0].Function.Arguments)
+			},
+		},
+		{
+			name: "custom tool call output",
+			output: []Item{
+				{
+					Type:   "custom_tool_call",
+					CallID: "call_custom_1",
+					Name:   "patch_tool",
+					Input:  lo.ToPtr("some input"),
+				},
+			},
+			validate: func(t *testing.T, msg llm.Message) {
+				require.Len(t, msg.ToolCalls, 1)
+				tc := msg.ToolCalls[0]
+				require.Equal(t, "call_custom_1", tc.ID)
+				require.Equal(t, llm.ToolTypeResponsesCustomTool, tc.Type)
+				require.NotNil(t, tc.ResponseCustomToolCall)
+				require.Equal(t, "patch_tool", tc.ResponseCustomToolCall.Name)
+				require.Equal(t, "some input", tc.ResponseCustomToolCall.Input)
+			},
+		},
+		{
+			name: "reasoning output with encrypted content",
+			output: []Item{
+				{
+					Type:             "reasoning",
+					Summary:          []ReasoningSummary{{Type: "summary_text", Text: "Thinking step"}},
+					EncryptedContent: lo.ToPtr("encrypted_data"),
+				},
+			},
+			validate: func(t *testing.T, msg llm.Message) {
+				require.NotNil(t, msg.ReasoningContent)
+				require.Equal(t, "Thinking step", *msg.ReasoningContent)
+				require.NotNil(t, msg.ReasoningSignature)
+				require.Equal(t, "encrypted_data", *msg.ReasoningSignature)
+			},
+		},
+		{
+			name: "multiple reasoning outputs preserve item summaries",
+			output: []Item{
+				{ID: "rs_first", Type: "reasoning", Summary: []ReasoningSummary{{Type: "summary_text", Text: "first"}}, EncryptedContent: lo.ToPtr("gAAAA_FIRST_BLOB")},
+				{ID: "rs_second", Type: "reasoning", Summary: []ReasoningSummary{{Type: "summary_text", Text: "second"}}, EncryptedContent: lo.ToPtr("gAAAA_SECOND_BLOB")},
+			},
+			validate: func(t *testing.T, msg llm.Message) {
+				require.Equal(t, []llm.ReasoningItem{
+					{ID: "rs_first", Content: "first", Signature: "gAAAA_FIRST_BLOB"},
+					{ID: "rs_second", Content: "second", Signature: "gAAAA_SECOND_BLOB"},
+				}, msg.ReasoningItems)
+			},
+		},
+		{
+			name: "image generation output with custom format",
+			output: []Item{
+				{
+					Type:   "image_generation_call",
+					Result: lo.ToPtr("base64data"),
+				},
+			},
+			transformerMetadata: map[string]any{"image_output_format": "webp"},
+			validate: func(t *testing.T, msg llm.Message) {
+				require.Len(t, msg.Content.MultipleContent, 1)
+				part := msg.Content.MultipleContent[0]
+				require.Equal(t, "image_url", part.Type)
+				require.Equal(t, "data:image/webp;base64,base64data", part.ImageURL.URL)
+			},
+		},
+		{
+			name: "image generation output with default png format",
+			output: []Item{
+				{
+					Type:   "image_generation_call",
+					Result: lo.ToPtr("pngdata"),
+				},
+			},
+			validate: func(t *testing.T, msg llm.Message) {
+				require.Len(t, msg.Content.MultipleContent, 1)
+				require.Contains(t, msg.Content.MultipleContent[0].ImageURL.URL, "data:image/png;base64,")
+			},
+		},
+		{
+			name: "compaction output",
+			output: []Item{
+				{
+					ID:               "cmp_001",
+					Type:             "compaction",
+					EncryptedContent: lo.ToPtr("enc_data"),
+					CreatedBy:        lo.ToPtr("assistant"),
+				},
+			},
+			validate: func(t *testing.T, msg llm.Message) {
+				require.Len(t, msg.Content.MultipleContent, 1)
+				part := msg.Content.MultipleContent[0]
+				require.Equal(t, "compaction", part.Type)
+				require.NotNil(t, part.Compact)
+				require.Equal(t, "cmp_001", part.Compact.ID)
+				require.Equal(t, "enc_data", part.Compact.EncryptedContent)
+				require.Equal(t, "assistant", *part.Compact.CreatedBy)
+			},
+		},
+		{
+			name: "compaction_summary output",
+			output: []Item{
+				{
+					ID:               "cmp_sum_001",
+					Type:             "compaction_summary",
+					EncryptedContent: lo.ToPtr("summary_enc"),
+					CreatedBy:        lo.ToPtr("system"),
+				},
+			},
+			validate: func(t *testing.T, msg llm.Message) {
+				require.Len(t, msg.Content.MultipleContent, 1)
+				part := msg.Content.MultipleContent[0]
+				require.Equal(t, "compaction_summary", part.Type)
+				require.NotNil(t, part.Compact)
+				require.Equal(t, "cmp_sum_001", part.Compact.ID)
+				require.Equal(t, "summary_enc", part.Compact.EncryptedContent)
+				require.Equal(t, "system", *part.Compact.CreatedBy)
+			},
+		},
+		{
+			name: "mixed text and compaction",
+			output: []Item{
+				{
+					ID:   "msg_mix",
+					Type: "message",
+					Content: &Input{Items: []Item{
+						{Type: "output_text", Text: lo.ToPtr("Some text")},
+					}},
+				},
+				{
+					ID:               "cmp_002",
+					Type:             "compaction",
+					EncryptedContent: lo.ToPtr("enc_mixed"),
+				},
+			},
+			validate: func(t *testing.T, msg llm.Message) {
+				require.Len(t, msg.Content.MultipleContent, 2)
+				require.Equal(t, "text", msg.Content.MultipleContent[0].Type)
+				require.Equal(t, "Some text", *msg.Content.MultipleContent[0].Text)
+				require.Equal(t, "compaction", msg.Content.MultipleContent[1].Type)
+				require.Equal(t, "enc_mixed", msg.Content.MultipleContent[1].Compact.EncryptedContent)
+			},
+		},
+		{
+			name: "text compaction text preserves order",
+			output: []Item{
+				{
+					ID:   "msg_before",
+					Type: "message",
+					Content: &Input{Items: []Item{
+						{Type: "output_text", Text: lo.ToPtr("before")},
+					}},
+				},
+				{
+					ID:               "cmp_mid",
+					Type:             "compaction",
+					EncryptedContent: lo.ToPtr("enc_mid"),
+				},
+				{
+					ID:   "msg_after",
+					Type: "message",
+					Content: &Input{Items: []Item{
+						{Type: "output_text", Text: lo.ToPtr("after")},
+					}},
+				},
+			},
+			validate: func(t *testing.T, msg llm.Message) {
+				require.Len(t, msg.Content.MultipleContent, 3)
+				require.Equal(t, "text", msg.Content.MultipleContent[0].Type)
+				require.Equal(t, "before", *msg.Content.MultipleContent[0].Text)
+				require.Equal(t, "compaction", msg.Content.MultipleContent[1].Type)
+				require.Equal(t, "enc_mid", msg.Content.MultipleContent[1].Compact.EncryptedContent)
+				require.Equal(t, "text", msg.Content.MultipleContent[2].Type)
+				require.Equal(t, "after", *msg.Content.MultipleContent[2].Text)
+			},
+		},
+		{
+			name: "input_image output",
+			output: []Item{
+				{
+					Type:     "input_image",
+					ImageURL: lo.ToPtr("https://example.com/img.png"),
+				},
+			},
+			validate: func(t *testing.T, msg llm.Message) {
+				require.Len(t, msg.Content.MultipleContent, 1)
+				require.Equal(t, "image_url", msg.Content.MultipleContent[0].Type)
+				require.Equal(t, "https://example.com/img.png", msg.Content.MultipleContent[0].ImageURL.URL)
+			},
+		},
+		{
+			name: "multiple function calls",
+			output: []Item{
+				{Type: "function_call", CallID: "c1", Name: "fn1", Arguments: "{}"},
+				{Type: "function_call", CallID: "c2", Name: "fn2", Arguments: `{"a":1}`},
+			},
+			validate: func(t *testing.T, msg llm.Message) {
+				require.Len(t, msg.ToolCalls, 2)
+				require.Equal(t, "fn1", msg.ToolCalls[0].Function.Name)
+				require.Equal(t, "fn2", msg.ToolCalls[1].Function.Name)
+			},
+		},
+		{
+			name: "reasoning with text and function call",
+			output: []Item{
+				{
+					Type:             "reasoning",
+					Summary:          []ReasoningSummary{{Type: "summary_text", Text: "Thought"}},
+					EncryptedContent: lo.ToPtr("enc_reason"),
+				},
+				{
+					ID:   "msg_r",
+					Type: "message",
+					Content: &Input{Items: []Item{
+						{Type: "output_text", Text: lo.ToPtr("Answer")},
+					}},
+				},
+				{Type: "function_call", CallID: "c1", Name: "fn1", Arguments: "{}"},
+			},
+			validate: func(t *testing.T, msg llm.Message) {
+				require.Equal(t, "msg_r", msg.ID)
+				require.NotNil(t, msg.ReasoningContent)
+				require.Equal(t, "Thought", *msg.ReasoningContent)
+				require.Len(t, msg.Content.MultipleContent, 1)
+				require.Equal(t, "text", msg.Content.MultipleContent[0].Type)
+				require.Equal(t, "Answer", *msg.Content.MultipleContent[0].Text)
+				require.Len(t, msg.ToolCalls, 1)
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			msg := convertOutputToMessage(tt.output, tt.transformerMetadata)
+			tt.validate(t, msg)
+		})
+	}
+}
+
+func TestConvertAssistantMessage_WithCompactContent(t *testing.T) {
+	tests := []struct {
+		name     string
+		msg      llm.Message
+		validate func(t *testing.T, items []Item)
+	}{
+		{
+			name: "assistant message with compaction content part",
+			msg: llm.Message{
+				Role: "assistant",
+				Content: llm.MessageContent{
+					MultipleContent: []llm.MessageContentPart{
+						{
+							Type: "compaction",
+							Compact: &llm.CompactContent{
+								ID:               "compaction_out_123",
+								EncryptedContent: "outbound_encrypted",
+								CreatedBy:        lo.ToPtr("assistant"),
+							},
+						},
+					},
+				},
+			},
+			validate: func(t *testing.T, items []Item) {
+				require.Len(t, items, 1)
+				require.Equal(t, "compaction", items[0].Type)
+				require.Equal(t, "compaction_out_123", items[0].ID)
+				require.NotNil(t, items[0].EncryptedContent)
+				require.Equal(t, "outbound_encrypted", *items[0].EncryptedContent)
+				require.NotNil(t, items[0].CreatedBy)
+				require.Equal(t, "assistant", *items[0].CreatedBy)
+			},
+		},
+		{
+			name: "assistant message with mixed text and compaction content",
+			msg: llm.Message{
+				Role: "assistant",
+				Content: llm.MessageContent{
+					MultipleContent: []llm.MessageContentPart{
+						{
+							Type: "text",
+							Text: lo.ToPtr("Here is some text"),
+						},
+						{
+							Type: "compaction",
+							Compact: &llm.CompactContent{
+								ID:               "compaction_mixed_456",
+								EncryptedContent: "mixed_encrypted_data",
+							},
+						},
+					},
+				},
+			},
+			validate: func(t *testing.T, items []Item) {
+				require.Len(t, items, 2)
+
+				require.Equal(t, "message", items[0].Type)
+				require.Equal(t, "assistant", items[0].Role)
+				require.Len(t, items[0].Content.Items, 1)
+				require.Equal(t, "output_text", items[0].Content.Items[0].Type)
+				require.Equal(t, "Here is some text", *items[0].Content.Items[0].Text)
+
+				require.Equal(t, "compaction", items[1].Type)
+				require.Equal(t, "compaction_mixed_456", items[1].ID)
+				require.NotNil(t, items[1].EncryptedContent)
+				require.Equal(t, "mixed_encrypted_data", *items[1].EncryptedContent)
+				require.Nil(t, items[1].CreatedBy)
+			},
+		},
+		{
+			name: "assistant message with text and tool calls emits message before tool calls",
+			msg: llm.Message{
+				Role: "assistant",
+				ToolCalls: []llm.ToolCall{
+					{
+						ID:   "call_1",
+						Type: "function",
+						Function: llm.FunctionCall{
+							Name:      "fn1",
+							Arguments: "{}",
+						},
+					},
+					{
+						ID:   "call_2",
+						Type: "function",
+						Function: llm.FunctionCall{
+							Name:      "fn2",
+							Arguments: `{"a":1}`,
+						},
+					},
+				},
+				Content: llm.MessageContent{
+					MultipleContent: []llm.MessageContentPart{
+						{
+							Type: "text",
+							Text: lo.ToPtr("msg 1"),
+						},
+					},
+				},
+			},
+			validate: func(t *testing.T, items []Item) {
+				require.Len(t, items, 3)
+				require.Equal(t, "message", items[0].Type)
+				require.Equal(t, "assistant", items[0].Role)
+				require.Len(t, items[0].Content.Items, 1)
+				require.Equal(t, "msg 1", *items[0].Content.Items[0].Text)
+				require.Equal(t, "function_call", items[1].Type)
+				require.Equal(t, "call_1", items[1].CallID)
+				require.Equal(t, "function_call", items[2].Type)
+				require.Equal(t, "call_2", items[2].CallID)
+			},
+		},
+		{
+			name: "assistant message with compaction content without created_by",
+			msg: llm.Message{
+				Role: "assistant",
+				Content: llm.MessageContent{
+					MultipleContent: []llm.MessageContentPart{
+						{
+							Type: "compaction",
+							Compact: &llm.CompactContent{
+								ID:               "compaction_no_created",
+								EncryptedContent: "no_created_by_data",
+							},
+						},
+					},
+				},
+			},
+			validate: func(t *testing.T, items []Item) {
+				require.Len(t, items, 1)
+				require.Equal(t, "compaction", items[0].Type)
+				require.Equal(t, "compaction_no_created", items[0].ID)
+				require.NotNil(t, items[0].EncryptedContent)
+				require.Equal(t, "no_created_by_data", *items[0].EncryptedContent)
+				require.Nil(t, items[0].CreatedBy)
+			},
+		},
+		{
+			name: "assistant message with text compaction text preserves order",
+			msg: llm.Message{
+				Role: "assistant",
+				Content: llm.MessageContent{
+					MultipleContent: []llm.MessageContentPart{
+						{
+							Type: "text",
+							Text: lo.ToPtr("before"),
+						},
+						{
+							Type: "compaction",
+							Compact: &llm.CompactContent{
+								ID:               "compaction_mid",
+								EncryptedContent: "enc_mid",
+							},
+						},
+						{
+							Type: "text",
+							Text: lo.ToPtr("after"),
+						},
+					},
+				},
+			},
+			validate: func(t *testing.T, items []Item) {
+				require.Len(t, items, 3)
+				require.Equal(t, "message", items[0].Type)
+				require.Len(t, items[0].Content.Items, 1)
+				require.Equal(t, "before", *items[0].Content.Items[0].Text)
+				require.Equal(t, "compaction", items[1].Type)
+				require.Equal(t, "compaction_mid", items[1].ID)
+				require.Equal(t, "message", items[2].Type)
+				require.Len(t, items[2].Content.Items, 1)
+				require.Equal(t, "after", *items[2].Content.Items[0].Text)
+			},
+		},
+		{
+			name: "assistant message with multiple compaction content parts",
+			msg: llm.Message{
+				Role: "assistant",
+				Content: llm.MessageContent{
+					MultipleContent: []llm.MessageContentPart{
+						{
+							Type: "compaction",
+							Compact: &llm.CompactContent{
+								ID:               "compaction_multi_1",
+								EncryptedContent: "encrypted_1",
+								CreatedBy:        lo.ToPtr("user_a"),
+							},
+						},
+						{
+							Type: "compaction",
+							Compact: &llm.CompactContent{
+								ID:               "compaction_multi_2",
+								EncryptedContent: "encrypted_2",
+								CreatedBy:        lo.ToPtr("user_b"),
+							},
+						},
+					},
+				},
+			},
+			validate: func(t *testing.T, items []Item) {
+				require.Len(t, items, 2)
+
+				require.Equal(t, "compaction", items[0].Type)
+				require.Equal(t, "compaction_multi_1", items[0].ID)
+				require.Equal(t, "encrypted_1", *items[0].EncryptedContent)
+				require.Equal(t, "user_a", *items[0].CreatedBy)
+
+				require.Equal(t, "compaction", items[1].Type)
+				require.Equal(t, "compaction_multi_2", items[1].ID)
+				require.Equal(t, "encrypted_2", *items[1].EncryptedContent)
+				require.Equal(t, "user_b", *items[1].CreatedBy)
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := convertAssistantMessage(tt.msg)
+			tt.validate(t, result)
+		})
+	}
+}
+
+func TestConvertAssistantMessage_PreservesMultipleReasoningSignaturesBeforeToolCall(t *testing.T) {
+	items := convertAssistantMessage(llm.Message{
+		Role: "assistant",
+		ReasoningItems: []llm.ReasoningItem{
+			{Content: "first", Signature: "gAAAA_FIRST_BLOB"},
+			{Content: "second", Signature: "gAAAA_SECOND_BLOB"},
+		},
+		ToolCalls: []llm.ToolCall{{
+			ID:   "call_task",
+			Type: "function",
+			Function: llm.FunctionCall{
+				Name:      "TaskOutput",
+				Arguments: `{"task_id":"task_1","block":true}`,
+			},
+		}},
+	})
+
+	require.Len(t, items, 3)
+	require.Equal(t, "reasoning", items[0].Type)
+	require.Equal(t, "gAAAA_FIRST_BLOB", *items[0].EncryptedContent)
+	require.Equal(t, []ReasoningSummary{{Type: "summary_text", Text: "first"}}, items[0].Summary)
+	require.Equal(t, "reasoning", items[1].Type)
+	require.Equal(t, "gAAAA_SECOND_BLOB", *items[1].EncryptedContent)
+	require.Equal(t, []ReasoningSummary{{Type: "summary_text", Text: "second"}}, items[1].Summary)
+	require.Equal(t, "function_call", items[2].Type)
 }

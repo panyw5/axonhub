@@ -1,26 +1,37 @@
 import { useEffect, useState, useCallback, useMemo, useRef } from 'react';
+import { format, type Locale } from 'date-fns';
 import { useForm, useFieldArray } from 'react-hook-form';
 import { zodResolver } from '@hookform/resolvers/zod';
-import { IconPlus, IconTrash, IconSettings, IconChevronDown, IconChevronUp } from '@tabler/icons-react';
-import { format, type Locale } from 'date-fns';
-import { zhCN, enUS } from 'date-fns/locale';
+import { IconPlus, IconTrash, IconSettings, IconChevronDown, IconChevronUp, IconInfoCircle } from '@tabler/icons-react';
 import { useQueryModels } from '@/gql/models';
+import { zhCN, enUS } from 'date-fns/locale';
 import { useTranslation } from 'react-i18next';
+import { useSelectedProjectId } from '@/stores/projectStore';
 import { extractNumberID } from '@/lib/utils';
 import { useDebounce } from '@/hooks/use-debounce';
+import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog';
-import { Form, FormControl, FormDescription, FormField, FormItem, FormLabel, FormMessage } from '@/components/ui/form';
+import { Form, FormControl, FormField, FormItem, FormLabel, FormMessage } from '@/components/ui/form';
 import { Input } from '@/components/ui/input';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { Switch } from '@/components/ui/switch';
 import { TagsAutocompleteInput } from '@/components/ui/tags-autocomplete-input';
+import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
 import { AutoComplete } from '@/components/auto-complete';
-import { useAllChannelsForOrdering } from '@/features/channels/data/channels';
+import { useAllChannelSummarys } from '@/features/channels/data/channels';
 import { useApiKeysContext } from '../context/apikeys-context';
 import { useApiKeyQuotaUsages } from '../data/apikeys';
-import { updateApiKeyProfilesInputSchemaFactory, type ApiKeyProfile, type ApiKeyProfileQuotaUsage, type UpdateApiKeyProfilesInput } from '../data/schema';
+import {
+  normalizeApiKeyProfileRoutingPolicy,
+  updateApiKeyProfilesInputSchemaFactory,
+  type ApiKeyProfile,
+  type ApiKeyProfileQuotaUsage,
+  type UpdateApiKeyProfilesInput,
+} from '../data/schema';
+import { ApiKeyLoadTemplatePopover } from './apikeys-load-template-popover';
+import { ApiKeySaveTemplateDialog } from './apikeys-save-template-dialog';
 
 type ApiKeyQuotaPeriod = NonNullable<NonNullable<ApiKeyProfile['quota']>['period']>;
 
@@ -75,7 +86,9 @@ interface ApiKeyProfilesDialogProps {
 export function ApiKeyProfilesDialog({ open, onOpenChange, onSubmit, loading = false, initialData }: ApiKeyProfilesDialogProps) {
   const { t, i18n } = useTranslation();
   const { selectedApiKey } = useApiKeysContext();
+  const selectedProjectId = useSelectedProjectId();
   const { data: availableModels, mutateAsync: fetchModels } = useQueryModels();
+  const [templateLoadPending, setTemplateLoadPending] = useState(false);
   // 用于解决 Dialog 内 Popover 无法滚动的问题
   const [dialogContent, setDialogContent] = useState<HTMLDivElement | null>(null);
   const locale = i18n.language === 'zh' ? zhCN : enUS;
@@ -91,6 +104,10 @@ export function ApiKeyProfilesDialog({ open, onOpenChange, onSubmit, loading = f
     });
     return map;
   }, [quotaUsagesQuery.data]);
+
+  // Template save/load state
+  const [saveTemplateOpen, setSaveTemplateOpen] = useState(false);
+  const [saveTemplateProfileIndex, setSaveTemplateProfileIndex] = useState<number | null>(null);
 
   useEffect(() => {
     if (open) {
@@ -125,7 +142,7 @@ export function ApiKeyProfilesDialog({ open, onOpenChange, onSubmit, loading = f
 
       return {
         activeProfile: fallbackActiveProfile,
-        profiles: initialData.profiles,
+        profiles: initialData.profiles.map(normalizeApiKeyProfileRoutingPolicy),
       };
     }
 
@@ -167,6 +184,7 @@ export function ApiKeyProfilesDialog({ open, onOpenChange, onSubmit, loading = f
   useEffect(() => {
     if (!open) {
       lastInitialDataRef.current = null;
+      setTemplateLoadPending(false);
       return;
     }
 
@@ -174,13 +192,23 @@ export function ApiKeyProfilesDialog({ open, onOpenChange, onSubmit, loading = f
       return;
     }
 
+    const wasTemplatePending = templateLoadPending;
+    if (wasTemplatePending) {
+      setTemplateLoadPending(false);
+    }
+
     if (lastInitialDataRef.current === normalizedSerialized) {
+      return;
+    }
+
+    if (wasTemplatePending) {
+      lastInitialDataRef.current = normalizedSerialized;
       return;
     }
 
     form.reset(normalizedInitialData);
     lastInitialDataRef.current = normalizedSerialized;
-  }, [open, loading, form, normalizedInitialData, normalizedSerialized]);
+  }, [open, loading, form, normalizedInitialData, normalizedSerialized, templateLoadPending]);
 
   // Scroll to active profile after profiles rendered
   useEffect(() => {
@@ -235,8 +263,10 @@ export function ApiKeyProfilesDialog({ open, onOpenChange, onSubmit, loading = f
       modelMappings: [],
       channelIDs: [],
       channelTags: [],
+      channelTagsMatchMode: 'any',
       modelIDs: [],
-      loadBalanceStrategy: null,
+      loadBalanceStrategy: 'default',
+      traceStickyMode: 'default',
     });
   }, [appendProfile, profileFields]);
 
@@ -280,10 +310,26 @@ export function ApiKeyProfilesDialog({ open, onOpenChange, onSubmit, loading = f
               <form id='apikey-profiles-form' onSubmit={form.handleSubmit(handleSubmit)} className='space-y-6'>
                 <div className='flex items-center justify-between'>
                   <h3 className='text-lg font-medium'>{t('apikeys.profiles.profilesTitle')}</h3>
-                  <Button type='button' variant='outline' size='sm' onClick={addProfile} className='flex items-center gap-2'>
-                    <IconPlus className='h-4 w-4' />
-                    {t('apikeys.profiles.addProfile')}
-                  </Button>
+                  <div className='flex items-center gap-2'>
+                    <ApiKeyLoadTemplatePopover
+                      apiKeyID={apiKeyId}
+                      projectID={selectedProjectId}
+                      portalContainer={dialogContent}
+                      onLoadComplete={(loadedProfiles) => {
+                        const resetData = {
+                          activeProfile: loadedProfiles.activeProfile || loadedProfiles.profiles[0]?.name || '',
+                          profiles: loadedProfiles.profiles.map(normalizeApiKeyProfileRoutingPolicy),
+                        };
+                        setTemplateLoadPending(true);
+                        form.reset(resetData);
+                        lastInitialDataRef.current = JSON.stringify(resetData);
+                      }}
+                    />
+                    <Button type='button' variant='outline' size='sm' onClick={addProfile} className='flex items-center gap-2'>
+                      <IconPlus className='h-4 w-4' />
+                      {t('apikeys.profiles.addProfile')}
+                    </Button>
+                  </div>
                 </div>
               </form>
             </Form>
@@ -319,6 +365,11 @@ export function ApiKeyProfilesDialog({ open, onOpenChange, onSubmit, loading = f
                               quotaUsageByProfileName={quotaUsageByProfileName}
                               defaultExpanded={isActive}
                               portalContainer={dialogContent}
+                              selectedProjectId={selectedProjectId}
+                              onSaveTemplate={(idx) => {
+                                setSaveTemplateProfileIndex(idx);
+                                setSaveTemplateOpen(true);
+                              }}
                             />
                           </div>
                         );
@@ -378,12 +429,23 @@ export function ApiKeyProfilesDialog({ open, onOpenChange, onSubmit, loading = f
             <Button
               type='submit'
               form='apikey-profiles-form'
-              disabled={loading || !form.formState.isValid || Object.keys(form.formState.errors).length > 0}
+              disabled={loading || templateLoadPending || !form.formState.isValid || Object.keys(form.formState.errors).length > 0}
             >
-              {loading ? t('common.buttons.saving') : t('common.buttons.save')}
+              {loading || templateLoadPending ? t('common.buttons.saving') : t('common.buttons.save')}
             </Button>
           </div>
         </DialogFooter>
+        {saveTemplateOpen && saveTemplateProfileIndex !== null && (
+          <ApiKeySaveTemplateDialog
+            open={saveTemplateOpen}
+            onOpenChange={(open) => {
+              setSaveTemplateOpen(open);
+              if (!open) setSaveTemplateProfileIndex(null);
+            }}
+            profileData={form.watch(`profiles.${saveTemplateProfileIndex}`)}
+            projectID={selectedProjectId}
+          />
+        )}
       </DialogContent>
     </Dialog>
   );
@@ -401,6 +463,9 @@ interface ProfileCardProps {
   defaultExpanded?: boolean;
   /** Popover Portal 容器元素，解决 Dialog 内无法滚动的问题 */
   portalContainer?: HTMLElement | null;
+  /** 当前选中的 project ID */
+  selectedProjectId?: string | null;
+  onSaveTemplate: (profileIndex: number) => void;
 }
 
 function ProfileCard({
@@ -414,10 +479,12 @@ function ProfileCard({
   quotaUsageByProfileName,
   defaultExpanded = false,
   portalContainer,
+  selectedProjectId,
+  onSaveTemplate,
 }: ProfileCardProps) {
   const [localProfileName, setLocalProfileName] = useState('');
   const [isCollapsed, setIsCollapsed] = useState(!defaultExpanded);
-  const { data: channelsData } = useAllChannelsForOrdering({ enabled: true });
+  const { data: channelsData } = useAllChannelSummarys(selectedProjectId, { enabled: true });
 
   const debouncedProfileName = useDebounce(localProfileName, 500);
 
@@ -444,6 +511,10 @@ function ProfileCard({
   // Watch all profiles to check for duplicates
   const allProfiles = form.watch('profiles') || [];
   const profileName = form.watch(`profiles.${profileIndex}.name`);
+  const templateID = form.watch(`profiles.${profileIndex}.templateID`);
+  const templateName = form.watch(`profiles.${profileIndex}.templateName`);
+  const channelTagsMatchMode = form.watch(`profiles.${profileIndex}.channelTagsMatchMode`);
+  const isExcludeMode = channelTagsMatchMode === 'none';
   const quotaUsage = profileName ? quotaUsageByProfileName.get(profileName) : undefined;
   const currentQuota = form.watch(`profiles.${profileIndex}.quota`);
   const quotaUsagePeriod = (currentQuota?.period ?? quotaUsage?.quota?.period) as ApiKeyQuotaPeriod | null | undefined;
@@ -527,6 +598,9 @@ function ProfileCard({
             >
               {isCollapsed ? <IconChevronDown className='h-4 w-4' /> : <IconChevronUp className='h-4 w-4' />}
             </Button>
+            <Button type='button' variant='ghost' size='sm' onClick={() => onSaveTemplate(profileIndex)}>
+              {t('apikeys.templates.saveAsTemplateButton')}
+            </Button>
             {canRemove && (
               <Button type='button' variant='ghost' size='sm' onClick={onRemove} className='text-destructive hover:text-destructive'>
                 <IconTrash className='h-4 w-4' />
@@ -534,6 +608,28 @@ function ProfileCard({
             )}
           </div>
         </div>
+        {templateID != null && (
+          <div className='bg-muted/50 mt-3 flex flex-wrap items-center justify-between gap-2 rounded-md px-3 py-2'>
+            <div className='flex min-w-0 items-center gap-2'>
+              <Badge variant='secondary' className='shrink-0'>
+                {t('apikeys.profiles.linked')}
+              </Badge>
+              <span className='truncate text-sm font-medium'>{templateName || `#${templateID}`}</span>
+              <span className='text-muted-foreground hidden text-xs md:inline'>{t('apikeys.profiles.linkedHint')}</span>
+            </div>
+            <Button
+              type='button'
+              variant='ghost'
+              size='sm'
+              onClick={() => {
+                form.setValue(`profiles.${profileIndex}.templateID`, null, { shouldDirty: true });
+                form.setValue(`profiles.${profileIndex}.templateName`, null, { shouldDirty: true });
+              }}
+            >
+              {t('apikeys.profiles.detachTemplate')}
+            </Button>
+          </div>
+        )}
       </CardHeader>
       {!isCollapsed && (
         <CardContent className='space-y-6'>
@@ -698,7 +794,10 @@ function ProfileCard({
                                 type='number'
                                 min={1}
                                 value={(field.value as unknown as number | null | undefined) ?? ''}
-                                onChange={(e) => field.onChange(Number(e.target.value))}
+                                onChange={(e) => {
+                                  const v = e.target.value;
+                                  field.onChange(v === '' ? null : Number(v));
+                                }}
                               />
                             </FormControl>
                             <FormMessage />
@@ -777,7 +876,8 @@ function ProfileCard({
                       <div>
                         <div className='text-muted-foreground text-xs'>{t('apikeys.profiles.quotaCost')}</div>
                         <div className='text-sm'>
-                          {(quotaUsage.usage.totalCost ?? 0).toLocaleString(undefined, { maximumFractionDigits: 6 })}/{currentQuota?.cost ?? '∞'}
+                          {(quotaUsage.usage.totalCost ?? 0).toLocaleString(undefined, { maximumFractionDigits: 6 })}/
+                          {currentQuota?.cost ?? '∞'}
                         </div>
                       </div>
                     </div>
@@ -787,8 +887,7 @@ function ProfileCard({
                         {quotaUsage.window.start ? format(quotaUsage.window.start, 'PPpp', { locale }) : '-'}
                       </div>
                       <div>
-                        {t('common.filters.endTime')}{' '}
-                        {quotaUsageEnd ? format(quotaUsageEnd, 'PPpp', { locale }) : '-'}
+                        {t('common.filters.endTime')} {quotaUsageEnd ? format(quotaUsageEnd, 'PPpp', { locale }) : '-'}
                       </div>
                     </div>
                   </div>
@@ -797,39 +896,88 @@ function ProfileCard({
             )}
           </div>
 
-          {/* Load Balancer Strategy */}
-          <div className='border-t pt-6'>
+          {/* Load Balancer Strategy + Trace/Thread Affinity */}
+          <div className='grid gap-4 border-t pt-6 sm:grid-cols-2'>
             <FormField
               control={form.control}
               name={`profiles.${profileIndex}.loadBalanceStrategy`}
+              render={({ field }) => {
+                const description =
+                  field.value === 'adaptive'
+                    ? t('system.retry.loadBalancerStrategy.documentation.adaptive')
+                    : field.value === 'failover'
+                      ? t('system.retry.loadBalancerStrategy.documentation.failover')
+                      : field.value === 'circuit-breaker'
+                        ? t('system.retry.loadBalancerStrategy.documentation.circuit-breaker')
+                        : field.value === 'round-robin'
+                          ? t('system.retry.loadBalancerStrategy.documentation.round-robin')
+                          : t('apikeys.profiles.loadBalancerStrategyDescription');
+
+                return (
+                  <FormItem className='space-y-0'>
+                    <div className='flex items-center justify-between gap-3'>
+                      <div className='flex items-center gap-1.5'>
+                        <FormLabel className='text-sm font-medium'>{t('apikeys.profiles.loadBalancerStrategy')}</FormLabel>
+                        <Tooltip>
+                          <TooltipTrigger asChild>
+                            <button type='button' className='text-muted-foreground hover:text-foreground inline-flex'>
+                              <IconInfoCircle className='h-3.5 w-3.5' />
+                              <span className='sr-only'>{description}</span>
+                            </button>
+                          </TooltipTrigger>
+                          <TooltipContent className='max-w-xs text-xs'>{description}</TooltipContent>
+                        </Tooltip>
+                      </div>
+                      <FormControl>
+                        <Select onValueChange={field.onChange} value={field.value || 'default'}>
+                          <SelectTrigger className='w-[140px] shrink-0'>
+                            <SelectValue placeholder={t('apikeys.profiles.loadBalancerStrategyPlaceholder')} />
+                          </SelectTrigger>
+                          <SelectContent>
+                            <SelectItem value='default'>{t('apikeys.profiles.loadBalancerStrategyPlaceholder')}</SelectItem>
+                            <SelectItem value='adaptive'>{t('system.retry.loadBalancerStrategy.options.adaptive')}</SelectItem>
+                            <SelectItem value='failover'>{t('system.retry.loadBalancerStrategy.options.failover')}</SelectItem>
+                            <SelectItem value='circuit-breaker'>{t('system.retry.loadBalancerStrategy.options.circuitBreaker')}</SelectItem>
+                            <SelectItem value='round-robin'>{t('system.retry.loadBalancerStrategy.options.roundRobin')}</SelectItem>
+                          </SelectContent>
+                        </Select>
+                      </FormControl>
+                    </div>
+                    <FormMessage />
+                  </FormItem>
+                );
+              }}
+            />
+
+            <FormField
+              control={form.control}
+              name={`profiles.${profileIndex}.traceStickyMode`}
               render={({ field }) => (
-                <FormItem className='space-y-4'>
+                <FormItem className='space-y-0'>
                   <div className='flex items-center justify-between gap-3'>
-                    <div>
-                      <h4 className='text-sm font-medium'>{t('apikeys.profiles.loadBalancerStrategy')}</h4>
-                      <FormDescription className='mt-1 text-xs'>
-                        {field.value === 'adaptive'
-                          ? t('system.retry.loadBalancerStrategy.documentation.adaptive')
-                          : field.value === 'failover'
-                          ? t('system.retry.loadBalancerStrategy.documentation.failover')
-                          : field.value === 'circuit-breaker'
-                          ? t('system.retry.loadBalancerStrategy.documentation.circuit-breaker')
-                          : t('apikeys.profiles.loadBalancerStrategyDescription')}
-                      </FormDescription>
+                    <div className='flex items-center gap-1.5'>
+                      <FormLabel className='text-sm font-medium'>{t('apikeys.profiles.traceStickyMode')}</FormLabel>
+                      <Tooltip>
+                        <TooltipTrigger asChild>
+                          <button type='button' className='text-muted-foreground hover:text-foreground inline-flex'>
+                            <IconInfoCircle className='h-3.5 w-3.5' />
+                            <span className='sr-only'>{t('apikeys.profiles.traceStickyModeDescription')}</span>
+                          </button>
+                        </TooltipTrigger>
+                        <TooltipContent className='max-w-xs text-xs'>{t('apikeys.profiles.traceStickyModeDescription')}</TooltipContent>
+                      </Tooltip>
                     </div>
                     <FormControl>
-                      <Select
-                        onValueChange={(val) => field.onChange(val === 'system_default' ? null : val)}
-                        value={field.value || 'system_default'}
-                      >
-                        <SelectTrigger className='w-[140px]'>
-                          <SelectValue placeholder={t('apikeys.profiles.loadBalancerStrategyPlaceholder')} />
+                      <Select onValueChange={field.onChange} value={field.value || 'default'}>
+                        <SelectTrigger className='w-[180px] shrink-0'>
+                          <SelectValue placeholder={t('apikeys.profiles.traceStickyModePlaceholder')} />
                         </SelectTrigger>
                         <SelectContent>
-                          <SelectItem value='system_default'>{t('apikeys.profiles.loadBalancerStrategyPlaceholder')}</SelectItem>
-                          <SelectItem value='adaptive'>{t('system.retry.loadBalancerStrategy.options.adaptive')}</SelectItem>
-                          <SelectItem value='failover'>{t('system.retry.loadBalancerStrategy.options.failover')}</SelectItem>
-                          <SelectItem value='circuit-breaker'>{t('system.retry.loadBalancerStrategy.options.circuitBreaker')}</SelectItem>
+                          <SelectItem value='default'>{t('apikeys.profiles.traceStickyModePlaceholder')}</SelectItem>
+                          <SelectItem value='prefer_previous_channel'>
+                            {t('system.retry.traceStickyMode.options.preferPreviousChannel')}
+                          </SelectItem>
+                          <SelectItem value='disabled'>{t('system.retry.traceStickyMode.options.disabled')}</SelectItem>
                         </SelectContent>
                       </Select>
                     </FormControl>
@@ -930,8 +1078,38 @@ function ProfileCard({
 
           {/* Channel Tags Restrictions Section */}
           <div className='border-t pt-6'>
-            <h4 className='mb-3 text-sm font-medium'>{t('apikeys.profiles.allowedChannelTags')}</h4>
-            <p className='text-muted-foreground mb-3 text-xs'>{t('apikeys.profiles.allowedChannelTagsDescription')}</p>
+            <div className='mb-3 flex items-start justify-between gap-3'>
+              <div>
+                <h4 className='text-sm font-medium'>
+                  {t(isExcludeMode ? 'apikeys.profiles.excludedChannelTags' : 'apikeys.profiles.allowedChannelTags')}
+                </h4>
+                <p className='text-muted-foreground mt-1 text-xs'>
+                  {t(isExcludeMode ? 'apikeys.profiles.excludedChannelTagsDescription' : 'apikeys.profiles.allowedChannelTagsDescription')}
+                </p>
+              </div>
+              <FormField
+                control={form.control}
+                name={`profiles.${profileIndex}.channelTagsMatchMode`}
+                render={({ field }) => (
+                  <FormItem className='w-[180px]'>
+                    <FormLabel>{t('apikeys.profiles.allowedChannelTagsMatchMode')}</FormLabel>
+                    <FormControl>
+                      <Select value={field.value || 'any'} onValueChange={field.onChange}>
+                        <SelectTrigger>
+                          <SelectValue />
+                        </SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value='any'>{t('apikeys.profiles.allowedChannelTagsMatchModeAny')}</SelectItem>
+                          <SelectItem value='all'>{t('apikeys.profiles.allowedChannelTagsMatchModeAll')}</SelectItem>
+                          <SelectItem value='none'>{t('apikeys.profiles.allowedChannelTagsMatchModeNone')}</SelectItem>
+                        </SelectContent>
+                      </Select>
+                    </FormControl>
+                    <FormMessage />
+                  </FormItem>
+                )}
+              />
+            </div>
             <FormField
               control={form.control}
               name={`profiles.${profileIndex}.channelTags`}
@@ -941,7 +1119,7 @@ function ProfileCard({
                     <TagsAutocompleteInput
                       value={field.value || []}
                       onChange={field.onChange}
-                      placeholder={t('apikeys.profiles.allowedChannelTags')}
+                      placeholder={t(isExcludeMode ? 'apikeys.profiles.excludedChannelTags' : 'apikeys.profiles.allowedChannelTags')}
                       suggestions={allTags}
                       className='h-auto min-h-9 py-1'
                     />

@@ -56,6 +56,20 @@ func (_u *ProviderQuotaStatusUpdate) AddDeletedAt(v int) *ProviderQuotaStatusUpd
 	return _u
 }
 
+// SetProviderType sets the "provider_type" field.
+func (_u *ProviderQuotaStatusUpdate) SetProviderType(v providerquotastatus.ProviderType) *ProviderQuotaStatusUpdate {
+	_u.mutation.SetProviderType(v)
+	return _u
+}
+
+// SetNillableProviderType sets the "provider_type" field if the given value is not nil.
+func (_u *ProviderQuotaStatusUpdate) SetNillableProviderType(v *providerquotastatus.ProviderType) *ProviderQuotaStatusUpdate {
+	if v != nil {
+		_u.SetProviderType(*v)
+	}
+	return _u
+}
+
 // SetStatus sets the "status" field.
 func (_u *ProviderQuotaStatusUpdate) SetStatus(v providerquotastatus.Status) *ProviderQuotaStatusUpdate {
 	_u.mutation.SetStatus(v)
@@ -124,6 +138,26 @@ func (_u *ProviderQuotaStatusUpdate) SetNillableNextCheckAt(v *time.Time) *Provi
 	return _u
 }
 
+// SetAccountKey sets the "account_key" field.
+func (_u *ProviderQuotaStatusUpdate) SetAccountKey(v string) *ProviderQuotaStatusUpdate {
+	_u.mutation.SetAccountKey(v)
+	return _u
+}
+
+// SetNillableAccountKey sets the "account_key" field if the given value is not nil.
+func (_u *ProviderQuotaStatusUpdate) SetNillableAccountKey(v *string) *ProviderQuotaStatusUpdate {
+	if v != nil {
+		_u.SetAccountKey(*v)
+	}
+	return _u
+}
+
+// ClearAccountKey clears the value of the "account_key" field.
+func (_u *ProviderQuotaStatusUpdate) ClearAccountKey() *ProviderQuotaStatusUpdate {
+	_u.mutation.ClearAccountKey()
+	return _u
+}
+
 // Mutation returns the ProviderQuotaStatusMutation object of the builder.
 func (_u *ProviderQuotaStatusUpdate) Mutation() *ProviderQuotaStatusMutation {
 	return _u.mutation
@@ -173,6 +207,11 @@ func (_u *ProviderQuotaStatusUpdate) defaults() error {
 
 // check runs all checks and user-defined validators on the builder.
 func (_u *ProviderQuotaStatusUpdate) check() error {
+	if v, ok := _u.mutation.ProviderType(); ok {
+		if err := providerquotastatus.ProviderTypeValidator(v); err != nil {
+			return &ValidationError{Name: "provider_type", err: fmt.Errorf(`ent: validator failed for field "ProviderQuotaStatus.provider_type": %w`, err)}
+		}
+	}
 	if v, ok := _u.mutation.Status(); ok {
 		if err := providerquotastatus.StatusValidator(v); err != nil {
 			return &ValidationError{Name: "status", err: fmt.Errorf(`ent: validator failed for field "ProviderQuotaStatus.status": %w`, err)}
@@ -211,6 +250,9 @@ func (_u *ProviderQuotaStatusUpdate) sqlSave(ctx context.Context) (_node int, er
 	if value, ok := _u.mutation.AddedDeletedAt(); ok {
 		_spec.AddField(providerquotastatus.FieldDeletedAt, field.TypeInt, value)
 	}
+	if value, ok := _u.mutation.ProviderType(); ok {
+		_spec.SetField(providerquotastatus.FieldProviderType, field.TypeEnum, value)
+	}
 	if value, ok := _u.mutation.Status(); ok {
 		_spec.SetField(providerquotastatus.FieldStatus, field.TypeEnum, value)
 	}
@@ -228,6 +270,12 @@ func (_u *ProviderQuotaStatusUpdate) sqlSave(ctx context.Context) (_node int, er
 	}
 	if value, ok := _u.mutation.NextCheckAt(); ok {
 		_spec.SetField(providerquotastatus.FieldNextCheckAt, field.TypeTime, value)
+	}
+	if value, ok := _u.mutation.AccountKey(); ok {
+		_spec.SetField(providerquotastatus.FieldAccountKey, field.TypeString, value)
+	}
+	if _u.mutation.AccountKeyCleared() {
+		_spec.ClearField(providerquotastatus.FieldAccountKey, field.TypeString)
 	}
 	_spec.AddModifiers(_u.modifiers...)
 	if _node, err = sqlgraph.UpdateNodes(ctx, _u.driver, _spec); err != nil {
@@ -275,6 +323,20 @@ func (_u *ProviderQuotaStatusUpdateOne) SetNillableDeletedAt(v *int) *ProviderQu
 // AddDeletedAt adds value to the "deleted_at" field.
 func (_u *ProviderQuotaStatusUpdateOne) AddDeletedAt(v int) *ProviderQuotaStatusUpdateOne {
 	_u.mutation.AddDeletedAt(v)
+	return _u
+}
+
+// SetProviderType sets the "provider_type" field.
+func (_u *ProviderQuotaStatusUpdateOne) SetProviderType(v providerquotastatus.ProviderType) *ProviderQuotaStatusUpdateOne {
+	_u.mutation.SetProviderType(v)
+	return _u
+}
+
+// SetNillableProviderType sets the "provider_type" field if the given value is not nil.
+func (_u *ProviderQuotaStatusUpdateOne) SetNillableProviderType(v *providerquotastatus.ProviderType) *ProviderQuotaStatusUpdateOne {
+	if v != nil {
+		_u.SetProviderType(*v)
+	}
 	return _u
 }
 
@@ -346,6 +408,26 @@ func (_u *ProviderQuotaStatusUpdateOne) SetNillableNextCheckAt(v *time.Time) *Pr
 	return _u
 }
 
+// SetAccountKey sets the "account_key" field.
+func (_u *ProviderQuotaStatusUpdateOne) SetAccountKey(v string) *ProviderQuotaStatusUpdateOne {
+	_u.mutation.SetAccountKey(v)
+	return _u
+}
+
+// SetNillableAccountKey sets the "account_key" field if the given value is not nil.
+func (_u *ProviderQuotaStatusUpdateOne) SetNillableAccountKey(v *string) *ProviderQuotaStatusUpdateOne {
+	if v != nil {
+		_u.SetAccountKey(*v)
+	}
+	return _u
+}
+
+// ClearAccountKey clears the value of the "account_key" field.
+func (_u *ProviderQuotaStatusUpdateOne) ClearAccountKey() *ProviderQuotaStatusUpdateOne {
+	_u.mutation.ClearAccountKey()
+	return _u
+}
+
 // Mutation returns the ProviderQuotaStatusMutation object of the builder.
 func (_u *ProviderQuotaStatusUpdateOne) Mutation() *ProviderQuotaStatusMutation {
 	return _u.mutation
@@ -408,6 +490,11 @@ func (_u *ProviderQuotaStatusUpdateOne) defaults() error {
 
 // check runs all checks and user-defined validators on the builder.
 func (_u *ProviderQuotaStatusUpdateOne) check() error {
+	if v, ok := _u.mutation.ProviderType(); ok {
+		if err := providerquotastatus.ProviderTypeValidator(v); err != nil {
+			return &ValidationError{Name: "provider_type", err: fmt.Errorf(`ent: validator failed for field "ProviderQuotaStatus.provider_type": %w`, err)}
+		}
+	}
 	if v, ok := _u.mutation.Status(); ok {
 		if err := providerquotastatus.StatusValidator(v); err != nil {
 			return &ValidationError{Name: "status", err: fmt.Errorf(`ent: validator failed for field "ProviderQuotaStatus.status": %w`, err)}
@@ -463,6 +550,9 @@ func (_u *ProviderQuotaStatusUpdateOne) sqlSave(ctx context.Context) (_node *Pro
 	if value, ok := _u.mutation.AddedDeletedAt(); ok {
 		_spec.AddField(providerquotastatus.FieldDeletedAt, field.TypeInt, value)
 	}
+	if value, ok := _u.mutation.ProviderType(); ok {
+		_spec.SetField(providerquotastatus.FieldProviderType, field.TypeEnum, value)
+	}
 	if value, ok := _u.mutation.Status(); ok {
 		_spec.SetField(providerquotastatus.FieldStatus, field.TypeEnum, value)
 	}
@@ -480,6 +570,12 @@ func (_u *ProviderQuotaStatusUpdateOne) sqlSave(ctx context.Context) (_node *Pro
 	}
 	if value, ok := _u.mutation.NextCheckAt(); ok {
 		_spec.SetField(providerquotastatus.FieldNextCheckAt, field.TypeTime, value)
+	}
+	if value, ok := _u.mutation.AccountKey(); ok {
+		_spec.SetField(providerquotastatus.FieldAccountKey, field.TypeString, value)
+	}
+	if _u.mutation.AccountKeyCleared() {
+		_spec.ClearField(providerquotastatus.FieldAccountKey, field.TypeString)
 	}
 	_spec.AddModifiers(_u.modifiers...)
 	_node = &ProviderQuotaStatus{config: _u.config}

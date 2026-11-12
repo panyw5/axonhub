@@ -6,10 +6,10 @@ import (
 
 	"github.com/stretchr/testify/require"
 
+	"github.com/looplj/axonhub/internal/authz"
 	"github.com/looplj/axonhub/internal/contexts"
 	"github.com/looplj/axonhub/internal/ent"
 	"github.com/looplj/axonhub/internal/ent/enttest"
-	"github.com/looplj/axonhub/internal/ent/privacy"
 	"github.com/looplj/axonhub/internal/ent/role"
 	"github.com/looplj/axonhub/internal/pkg/xcache"
 )
@@ -34,7 +34,7 @@ func TestCanGrantScopes(t *testing.T) {
 
 	ctx := context.Background()
 	ctx = ent.NewContext(ctx, client)
-	ctx = privacy.DecisionContext(ctx, privacy.Allow)
+	ctx = authz.WithTestBypass(ctx)
 
 	t.Run("owner can grant any scopes", func(t *testing.T) {
 		// Create owner user
@@ -148,7 +148,7 @@ func TestCanEditUserPermissions(t *testing.T) {
 
 	ctx := context.Background()
 	ctx = ent.NewContext(ctx, client)
-	ctx = privacy.DecisionContext(ctx, privacy.Allow)
+	ctx = authz.WithTestBypass(ctx)
 
 	t.Run("owner can edit any user", func(t *testing.T) {
 		// Create owner
@@ -287,7 +287,7 @@ func TestCanEditRole(t *testing.T) {
 
 	ctx := context.Background()
 	ctx = ent.NewContext(ctx, client)
-	ctx = privacy.DecisionContext(ctx, privacy.Allow)
+	ctx = authz.WithTestBypass(ctx)
 
 	t.Run("user can edit role with scopes they possess", func(t *testing.T) {
 		// Create user with specific scopes
@@ -351,6 +351,39 @@ func TestCanEditRole(t *testing.T) {
 		require.Error(t, err)
 		require.Contains(t, err.Error(), "insufficient permissions")
 	})
+
+	t.Run("project member can edit a project role with its effective scopes", func(t *testing.T) {
+		project, err := client.Project.Create().SetName("role-permission-project").Save(ctx)
+		require.NoError(t, err)
+		managedRole, err := client.Role.Create().
+			SetName("Managed Role").
+			SetLevel(role.LevelProject).
+			SetProjectID(project.ID).
+			SetScopes([]string{"read_prompts"}).
+			Save(ctx)
+		require.NoError(t, err)
+		userRole, err := client.Role.Create().
+			SetName("Project Administrator").
+			SetLevel(role.LevelProject).
+			SetProjectID(project.ID).
+			SetScopes([]string{"read_prompts", "write_roles"}).
+			Save(ctx)
+		require.NoError(t, err)
+		projectAdmin, err := client.User.Create().
+			SetEmail("project-admin@example.com").
+			SetFirstName("Project").
+			SetLastName("Admin").
+			SetPassword("password").
+			AddRoles(userRole).
+			Save(ctx)
+		require.NoError(t, err)
+		_, err = client.UserProject.Create().SetUserID(projectAdmin.ID).SetProjectID(project.ID).Save(ctx)
+		require.NoError(t, err)
+
+		projectAdmin, err = userService.GetUserByID(ctx, projectAdmin.ID)
+		require.NoError(t, err)
+		require.NoError(t, validator.CanEditRole(contexts.WithUser(ctx, projectAdmin), managedRole.ID, nil))
+	})
 }
 
 func TestProjectLevelPermissions(t *testing.T) {
@@ -359,7 +392,7 @@ func TestProjectLevelPermissions(t *testing.T) {
 
 	ctx := context.Background()
 	ctx = ent.NewContext(ctx, client)
-	ctx = privacy.DecisionContext(ctx, privacy.Allow)
+	ctx = authz.WithTestBypass(ctx)
 
 	t.Run("project owner can grant any project scopes", func(t *testing.T) {
 		// Create project
@@ -486,7 +519,7 @@ func TestIntegrationWithRoleService(t *testing.T) {
 
 	ctx := context.Background()
 	ctx = ent.NewContext(ctx, client)
-	ctx = privacy.DecisionContext(ctx, privacy.Allow)
+	ctx = authz.WithTestBypass(ctx)
 
 	t.Run("creating role validates permissions", func(t *testing.T) {
 		// Create user with limited scopes

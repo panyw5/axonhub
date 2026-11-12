@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useMemo, useState } from 'react';
 import {
   ColumnFiltersState,
   RowData,
@@ -14,11 +14,12 @@ import {
 } from '@tanstack/react-table';
 import { motion, AnimatePresence } from 'framer-motion';
 import { useTranslation } from 'react-i18next';
+import type { DateTimeRangeValue } from '@/utils/date-range';
+import type { AutoRefreshInterval } from '@/hooks/use-auto-refresh-interval';
 import { useAnimatedList } from '@/hooks/useAnimatedList';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
 import { TableSkeleton } from '@/components/ui/table-skeleton';
 import { ServerSidePagination } from '@/components/server-side-pagination';
-import type { DateTimeRangeValue } from '@/utils/date-range';
 import { Thread, ThreadConnection } from '../data/schema';
 import { ThreadsTableToolbar } from './data-table-toolbar';
 import { useThreadsColumns } from './threads-columns';
@@ -40,15 +41,18 @@ interface ThreadsTableProps {
   totalCount?: number;
   dateRange?: DateTimeRangeValue;
   threadIdFilter: string;
+  statusFilter?: string[];
   onNextPage: () => void;
   onPreviousPage: () => void;
   onPageSizeChange: (pageSize: number) => void;
   onDateRangeChange: (range: DateTimeRangeValue | undefined) => void;
   onThreadIdFilterChange: (threadId: string) => void;
+  onStatusFilterChange?: (statuses: string[]) => void;
   onRefresh: () => void;
   showRefresh: boolean;
-  autoRefresh?: boolean;
-  onAutoRefreshChange?: (enabled: boolean) => void;
+  autoRefreshInterval?: AutoRefreshInterval;
+  autoRefreshResumeKey?: number;
+  onAutoRefreshIntervalChange?: (interval: AutoRefreshInterval) => void;
 }
 
 export function ThreadsTable({
@@ -59,15 +63,18 @@ export function ThreadsTable({
   pageSize,
   dateRange,
   threadIdFilter,
+  statusFilter = [],
   onNextPage,
   onPreviousPage,
   onPageSizeChange,
   onDateRangeChange,
   onThreadIdFilterChange,
+  onStatusFilterChange,
   onRefresh,
   showRefresh,
-  autoRefresh = false,
-  onAutoRefreshChange,
+  autoRefreshInterval = null,
+  autoRefreshResumeKey = 0,
+  onAutoRefreshIntervalChange,
 }: ThreadsTableProps) {
   const { t } = useTranslation();
   const threadsColumns = useThreadsColumns();
@@ -76,7 +83,11 @@ export function ThreadsTable({
   const [columnVisibility, setColumnVisibility] = useState<VisibilityState>({});
   const [rowSelection, setRowSelection] = useState({});
 
-  const displayedData = useAnimatedList(data, autoRefresh);
+  const animationResetKey = useMemo(
+    () => JSON.stringify({ dateRange, threadIdFilter, statusFilter, autoRefreshResumeKey }),
+    [dateRange, threadIdFilter, statusFilter, autoRefreshResumeKey]
+  );
+  const displayedData = useAnimatedList(data, showRefresh && autoRefreshInterval !== null, pageSize, animationResetKey);
 
   const table = useReactTable({
     data: displayedData,
@@ -110,12 +121,14 @@ export function ThreadsTable({
         onDateRangeChange={onDateRangeChange}
         threadIdFilter={threadIdFilter}
         onThreadIdFilterChange={onThreadIdFilterChange}
+        statusFilter={statusFilter}
+        onStatusFilterChange={onStatusFilterChange}
         onRefresh={onRefresh}
         showRefresh={showRefresh}
-        autoRefresh={autoRefresh}
-        onAutoRefreshChange={onAutoRefreshChange}
+        autoRefreshInterval={autoRefreshInterval}
+        onAutoRefreshIntervalChange={onAutoRefreshIntervalChange}
       />
-      <div className='shadow-soft relative mt-4 flex-1 overflow-auto overflow-x-hidden rounded-2xl border border-[var(--table-border)]'>
+      <div className='shadow-soft relative mt-4 flex-1 overflow-auto rounded-2xl border border-[var(--table-border)]'>
         <Table data-testid='threads-table' className='border-separate border-spacing-0 rounded-2xl bg-[var(--table-background)]'>
           <TableHeader className='sticky top-0 z-20 bg-[var(--table-header)] shadow-sm'>
             {table.getHeaderGroups().map((headerGroup) => (

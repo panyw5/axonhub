@@ -4,15 +4,15 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"sync/atomic"
 	"testing"
 
 	"github.com/stretchr/testify/require"
-	"github.com/zhenzou/executors"
 
+	"github.com/looplj/axonhub/internal/authz"
 	"github.com/looplj/axonhub/internal/ent"
 	"github.com/looplj/axonhub/internal/ent/channel"
 	"github.com/looplj/axonhub/internal/ent/enttest"
-	"github.com/looplj/axonhub/internal/ent/privacy"
 	"github.com/looplj/axonhub/internal/objects"
 	"github.com/looplj/axonhub/internal/pkg/xcache"
 	"github.com/looplj/axonhub/internal/server/biz"
@@ -29,7 +29,6 @@ func newTestChannelServiceForChannels(client *ent.Client) *biz.ChannelService {
 	systemService := newTestSystemService(client)
 
 	return biz.NewChannelService(biz.ChannelServiceParams{
-		Executor:      executors.NewPoolScheduleExecutor(),
 		Ent:           client,
 		SystemService: systemService,
 	})
@@ -48,20 +47,18 @@ func newTestLoadBalancedSelector(
 	client *ent.Client,
 	systemService *biz.SystemService,
 	requestService *biz.RequestService,
-	connectionTracker *DefaultConnectionTracker,
 ) CandidateSelector {
 	strategies := []LoadBalanceStrategy{
-		NewTraceAwareStrategy(requestService),
 		NewErrorAwareStrategy(channelService),
 		NewWeightRoundRobinStrategy(channelService),
-		NewConnectionAwareStrategy(channelService, connectionTracker),
+		NewLatencyAwareStrategy(channelService),
 	}
 	loadBalancer := NewLoadBalancer(systemService, nil, strategies...)
 
 	modelService := newTestModelService(client)
 	baseSelector := NewDefaultSelector(channelService, modelService, systemService)
 
-	return WithLoadBalancedSelector(baseSelector, loadBalancer, systemService)
+	return WithTraceStickyLoadBalancedSelector(baseSelector, loadBalancer, systemService, requestService)
 }
 
 // newTestSystemService creates a minimal system service for testing.
@@ -82,7 +79,7 @@ func newTestRequestServiceForChannels(client *ent.Client, systemService *biz.Sys
 	channelService := biz.NewChannelServiceForTest(client)
 	usageLogService := biz.NewUsageLogService(client, systemService, channelService)
 
-	return biz.NewRequestService(client, systemService, usageLogService, dataStorageService)
+	return biz.NewRequestService(client, systemService.CacheConfig, systemService, usageLogService, dataStorageService, biz.NewLiveStreamRegistry())
 }
 
 // setupTest creates a test context and ent client for testing.
@@ -90,7 +87,7 @@ func setupTest(t *testing.T) (context.Context, *ent.Client) {
 	t.Helper()
 
 	ctx := context.Background()
-	ctx = privacy.DecisionContext(ctx, privacy.Allow)
+	ctx = authz.WithTestBypass(ctx)
 
 	client := enttest.NewEntClient(t, "sqlite3", "file:ent?mode=memory&_fk=0")
 	t.Cleanup(func() { client.Close() })
@@ -186,11 +183,13 @@ type mockExecutor struct {
 	streamEvents  []*httpclient.StreamEvent
 	err           error
 	requestCalled bool
+	requestCalls  atomic.Int64
 	lastRequest   *httpclient.Request
 }
 
 func (m *mockExecutor) Do(ctx context.Context, request *httpclient.Request) (*httpclient.Response, error) {
 	m.requestCalled = true
+	m.requestCalls.Add(1)
 
 	m.lastRequest = request
 	if m.err != nil {
@@ -202,6 +201,7 @@ func (m *mockExecutor) Do(ctx context.Context, request *httpclient.Request) (*ht
 
 func (m *mockExecutor) DoStream(ctx context.Context, request *httpclient.Request) (streams.Stream[*httpclient.StreamEvent], error) {
 	m.requestCalled = true
+	m.requestCalls.Add(1)
 
 	m.lastRequest = request
 	if m.err != nil {
@@ -230,7 +230,7 @@ func setupTestServices(t *testing.T, client *ent.Client) (*biz.ChannelService, *
 
 	channelService := biz.NewChannelServiceForTest(client)
 	usageLogService := biz.NewUsageLogService(client, systemService, channelService)
-	requestService := biz.NewRequestService(client, systemService, usageLogService, dataStorageService)
+	requestService := biz.NewRequestService(client, systemService.CacheConfig, systemService, usageLogService, dataStorageService, biz.NewLiveStreamRegistry())
 
 	channelService = biz.NewChannelServiceForTest(client)
 
@@ -362,16 +362,16 @@ func newTestOrchestrator(
 	channelService, requestService, systemService, usageLogService := setupTestServices(t, client)
 
 	orchestrator := &ChatCompletionOrchestrator{
-		channelSelector:   channelSelector,
-		Inbound:           openai.NewInboundTransformer(),
-		RequestService:    requestService,
-		ChannelService:    channelService,
-		PromptProvider:    &stubPromptProvider{},
-		SystemService:     systemService,
-		UsageLogService:   usageLogService,
-		PipelineFactory:   pipeline.NewFactory(executor),
-		ModelMapper:       NewModelMapper(),
-		connectionTracker: NewDefaultConnectionTracker(1024),
+		channelSelector:       channelSelector,
+		Inbound:               openai.NewInboundTransformer(),
+		RequestService:        requestService,
+		ChannelService:        channelService,
+		PromptProvider:        &stubPromptProvider{},
+		SystemService:         systemService,
+		UsageLogService:       usageLogService,
+		PipelineFactory:       pipeline.NewFactory(executor),
+		ModelMapper:           NewModelMapper(),
+		channelLimiterManager: NewChannelLimiterManager(),
 		Middlewares: []pipeline.Middleware{
 			stream.EnsureUsage(),
 		},

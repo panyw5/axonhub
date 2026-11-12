@@ -13,13 +13,15 @@ import { useModels } from '../context/models-context';
 import { DEVELOPER_IDS, DEVELOPER_ICONS } from '../data/constants';
 import { useBulkCreateModels } from '../data/models';
 import { useDevelopersData } from '../data/providers';
-import { type Provider, type ProviderModel } from '../data/providers.schema';
-import { CreateModelInput, ModelCard } from '../data/schema';
+import { type Provider, type ProviderModel, resolveVision } from '../data/providers.schema';
+import { deriveReasoningEfforts } from '../data/reasoning-efforts';
+import { CreateModelInput, ModelCard, ModelType, modelTypeSchema } from '../data/schema';
 
 interface ModelRow {
   id: string;
   modelId: string;
   developer: string;
+  type: ModelType;
   name: string;
   icon: string;
   group: string;
@@ -95,6 +97,7 @@ export function ModelsBatchCreateDialog() {
           id: generateId(),
           modelId: '',
           developer: '',
+          type: 'chat',
           name: '',
           icon: '',
           group: '',
@@ -115,6 +118,7 @@ export function ModelsBatchCreateDialog() {
         id: generateId(),
         modelId: '',
         developer: '',
+        type: 'chat',
         name: '',
         icon: '',
         group: '',
@@ -134,12 +138,12 @@ export function ModelsBatchCreateDialog() {
           if (row.id !== id) return row;
 
           if (!row.developer) {
-            return { ...row, modelId, name: '', group: '', modelCard: null };
+            return { ...row, modelId, type: 'chat' as ModelType, name: '', group: '', modelCard: null };
           }
 
           const provider = providers.find((p) => p.id === row.developer);
           if (!provider) {
-            return { ...row, modelId, name: '', group: '', modelCard: null };
+            return { ...row, modelId, type: 'chat' as ModelType, name: '', group: '', modelCard: null };
           }
 
           const selectedModel = provider.models.find((m: ProviderModel) => m.id === modelId);
@@ -149,13 +153,14 @@ export function ModelsBatchCreateDialog() {
                 supported: selectedModel.reasoning?.supported || false,
                 default: selectedModel.reasoning?.default || false,
               },
+              reasoningEfforts: deriveReasoningEfforts(selectedModel.reasoning_options),
               toolCall: selectedModel.tool_call || false,
               temperature: selectedModel.temperature || false,
               modalities: {
                 input: selectedModel.modalities?.input || [],
                 output: selectedModel.modalities?.output || [],
               },
-              vision: selectedModel.attachment || false,
+              vision: resolveVision(selectedModel),
               cost: {
                 input: selectedModel.cost?.input || 0,
                 output: selectedModel.cost?.output || 0,
@@ -170,16 +175,21 @@ export function ModelsBatchCreateDialog() {
               releaseDate: selectedModel.release_date,
               lastUpdated: selectedModel.last_updated,
             };
+            const normalizedType = selectedModel.type?.replace(/-/g, '_');
+            const modelType = normalizedType && modelTypeSchema.safeParse(normalizedType).success
+              ? (normalizedType as ModelType)
+              : 'chat' as ModelType;
             return {
               ...row,
               modelId,
+              type: modelType,
               name: selectedModel.display_name || selectedModel.name || '',
               group: selectedModel.family || row.developer,
               modelCard,
             };
           }
 
-          return { ...row, modelId, name: '', group: row.developer, modelCard: null };
+          return { ...row, modelId, type: 'chat' as ModelType, name: '', group: row.developer, modelCard: null };
         })
       );
     },
@@ -196,6 +206,7 @@ export function ModelsBatchCreateDialog() {
           developer,
           icon,
           modelId: '',
+          type: 'chat' as ModelType,
           name: '',
           group: '',
           modelCard: null,
@@ -262,7 +273,7 @@ export function ModelsBatchCreateDialog() {
     const inputs: CreateModelInput[] = validRows.map((row) => ({
       developer: row.developer,
       modelID: row.modelId,
-      type: 'chat',
+      type: row.type,
       name: row.name,
       icon: row.icon,
       group: row.group,
@@ -276,6 +287,8 @@ export function ModelsBatchCreateDialog() {
         limit: { context: 0, output: 0 },
       },
       settings: {
+        loadBalancerStrategy: 'default',
+        traceStickyMode: 'default',
         associations: [
           {
             type: 'model',

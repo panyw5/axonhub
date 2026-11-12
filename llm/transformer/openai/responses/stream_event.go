@@ -1,6 +1,12 @@
 package responses
 
-import "encoding/json"
+import (
+	"bytes"
+	"encoding/json"
+)
+
+const responseMetadataTransformerMetadataKey = "openai_responses_raw_metadata_event"
+const responseHeadersTransformerMetadataKey = "openai_responses_transport_headers"
 
 // StreamEventType defines the type of streaming events for the OpenAI Responses API.
 type StreamEventType string
@@ -12,9 +18,11 @@ const (
 
 	StreamEventTypeResponseCreated    StreamEventType = "response.created"
 	StreamEventTypeResponseInProgress StreamEventType = "response.in_progress"
+	StreamEventTypeResponseMetadata   StreamEventType = "response.metadata"
 	StreamEventTypeResponseCompleted  StreamEventType = "response.completed"
 	StreamEventTypeResponseQueued     StreamEventType = "response.queued"
 	StreamEventTypeResponseFailed     StreamEventType = "response.failed"
+	StreamEventTypeResponseCancelled  StreamEventType = "response.cancelled"
 	StreamEventTypeResponseIncomplete StreamEventType = "response.incomplete"
 
 	// Output item events.
@@ -37,12 +45,19 @@ const (
 	StreamEventTypeFunctionCallArgumentsDelta StreamEventType = "response.function_call_arguments.delta"
 	StreamEventTypeFunctionCallArgumentsDone  StreamEventType = "response.function_call_arguments.done"
 
+	// Custom tool call events.
+
+	StreamEventTypeCustomToolCallInputDelta StreamEventType = "response.custom_tool_call_input.delta"
+	StreamEventTypeCustomToolCallInputDone  StreamEventType = "response.custom_tool_call_input.done"
+
 	// Reasoning events.
 
 	StreamEventTypeReasoningSummaryPartAdded StreamEventType = "response.reasoning_summary_part.added"
 	StreamEventTypeReasoningSummaryPartDone  StreamEventType = "response.reasoning_summary_part.done"
 	StreamEventTypeReasoningSummaryTextDelta StreamEventType = "response.reasoning_summary_text.delta"
 	StreamEventTypeReasoningSummaryTextDone  StreamEventType = "response.reasoning_summary_text.done"
+	StreamEventTypeReasoningTextDelta        StreamEventType = "response.reasoning_text.delta"
+	StreamEventTypeReasoningTextDone         StreamEventType = "response.reasoning_text.done"
 
 	// Image generation events.
 
@@ -58,6 +73,8 @@ type StreamEvent struct {
 	// Common fields
 	Type           StreamEventType `json:"type"`
 	SequenceNumber int             `json:"sequence_number"`
+	Status         int             `json:"status,omitempty"`
+	Error          *Error          `json:"error,omitempty"`
 
 	// For response.* events
 	Response *Response `json:"response,omitempty"`
@@ -66,23 +83,29 @@ type StreamEvent struct {
 	OutputIndex int   `json:"output_index"`
 	Item        *Item `json:"item,omitempty"`
 
-	// For content_part.*, output_text.*, function_call_arguments.* events
+	// For content_part.*, output_text.*, reasoning_summary_text.*, reasoning_text.*,
+	// and function_call_arguments.* events.
 	ItemID       *string `json:"item_id,omitempty"`
 	ContentIndex *int    `json:"content_index,omitempty"`
 
 	// For content_part.added/done events
 	Part *StreamEventContentPart `json:"part,omitempty"`
 
-	// For output_text.delta and function_call_arguments.delta events
+	// For output_text.delta, reasoning_summary_text.delta, reasoning_text.delta,
+	// and function_call_arguments.delta events.
 	Delta string `json:"delta,omitempty"`
 
-	// For output_text.done events
+	// For output_text.done, reasoning_summary_text.done, and reasoning_text.done events.
 	Text string `json:"text,omitempty"`
 
 	// For function_call_arguments.done events
 	Name      string `json:"name,omitempty"`
+	Namespace string `json:"namespace,omitempty"`
 	CallID    string `json:"call_id,omitempty"`
 	Arguments string `json:"arguments,omitempty"`
+
+	// For custom_tool_call_input.done events
+	Input string `json:"input,omitempty"`
 
 	// For reasoning_summary_* events
 	SummaryIndex *int `json:"summary_index,omitempty"`
@@ -92,9 +115,35 @@ type StreamEvent struct {
 	PartialImageIndex *int   `json:"partial_image_index,omitempty"`
 
 	// For error events
-	Code    string `json:"code,omitempty"`
-	Message string `json:"message,omitempty"`
-	Param   string `json:"param,omitempty"`
+	Code    string  `json:"code,omitempty"`
+	Message string  `json:"message,omitempty"`
+	Param   *string `json:"param,omitempty"`
+}
+
+func (e *StreamEvent) UnmarshalJSON(data []byte) error {
+	type streamEvent StreamEvent
+
+	wire := struct {
+		*streamEvent
+		Status json.RawMessage `json:"status"`
+	}{streamEvent: (*streamEvent)(e)}
+	if err := json.Unmarshal(data, &wire); err != nil {
+		return err
+	}
+	if len(wire.Status) == 0 || bytes.Equal(wire.Status, []byte("null")) {
+		return nil
+	}
+	if err := json.Unmarshal(wire.Status, &e.Status); err == nil {
+		return nil
+	}
+
+	var status string
+	if err := json.Unmarshal(wire.Status, &status); err != nil {
+		return err
+	}
+	e.Status = 0
+
+	return nil
 }
 
 // StreamEventContentPart represents a content part in streaming events.
@@ -102,7 +151,9 @@ type StreamEventContentPart struct {
 	// Any of "output_text", "reasoning", "refusal".
 	Type string `json:"type"`
 	// The text of the part, for output_text.
-	Text *string `json:"text,omitempty"`
+	Text string `json:"text"`
+	// The annotations of the output text part.
+	Annotations []Annotation `json:"annotations,omitzero"`
 	// The refusal reason, for refusal.
 	Refusal *string `json:"refusal,omitempty"`
 }

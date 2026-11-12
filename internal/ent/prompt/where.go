@@ -95,6 +95,11 @@ func Content(v string) predicate.Prompt {
 	return predicate.Prompt(sql.FieldEQ(FieldContent, v))
 }
 
+// Order applies equality check predicate on the "order" field. It's identical to OrderEQ.
+func Order(v int) predicate.Prompt {
+	return predicate.Prompt(sql.FieldEQ(FieldOrder, v))
+}
+
 // CreatedAtEQ applies the EQ predicate on the "created_at" field.
 func CreatedAtEQ(v time.Time) predicate.Prompt {
 	return predicate.Prompt(sql.FieldEQ(FieldCreatedAt, v))
@@ -233,26 +238,6 @@ func ProjectIDIn(vs ...int) predicate.Prompt {
 // ProjectIDNotIn applies the NotIn predicate on the "project_id" field.
 func ProjectIDNotIn(vs ...int) predicate.Prompt {
 	return predicate.Prompt(sql.FieldNotIn(FieldProjectID, vs...))
-}
-
-// ProjectIDGT applies the GT predicate on the "project_id" field.
-func ProjectIDGT(v int) predicate.Prompt {
-	return predicate.Prompt(sql.FieldGT(FieldProjectID, v))
-}
-
-// ProjectIDGTE applies the GTE predicate on the "project_id" field.
-func ProjectIDGTE(v int) predicate.Prompt {
-	return predicate.Prompt(sql.FieldGTE(FieldProjectID, v))
-}
-
-// ProjectIDLT applies the LT predicate on the "project_id" field.
-func ProjectIDLT(v int) predicate.Prompt {
-	return predicate.Prompt(sql.FieldLT(FieldProjectID, v))
-}
-
-// ProjectIDLTE applies the LTE predicate on the "project_id" field.
-func ProjectIDLTE(v int) predicate.Prompt {
-	return predicate.Prompt(sql.FieldLTE(FieldProjectID, v))
 }
 
 // NameEQ applies the EQ predicate on the "name" field.
@@ -535,21 +520,61 @@ func StatusNotIn(vs ...Status) predicate.Prompt {
 	return predicate.Prompt(sql.FieldNotIn(FieldStatus, vs...))
 }
 
-// HasProjects applies the HasEdge predicate on the "projects" edge.
-func HasProjects() predicate.Prompt {
+// OrderEQ applies the EQ predicate on the "order" field.
+func OrderEQ(v int) predicate.Prompt {
+	return predicate.Prompt(sql.FieldEQ(FieldOrder, v))
+}
+
+// OrderNEQ applies the NEQ predicate on the "order" field.
+func OrderNEQ(v int) predicate.Prompt {
+	return predicate.Prompt(sql.FieldNEQ(FieldOrder, v))
+}
+
+// OrderIn applies the In predicate on the "order" field.
+func OrderIn(vs ...int) predicate.Prompt {
+	return predicate.Prompt(sql.FieldIn(FieldOrder, vs...))
+}
+
+// OrderNotIn applies the NotIn predicate on the "order" field.
+func OrderNotIn(vs ...int) predicate.Prompt {
+	return predicate.Prompt(sql.FieldNotIn(FieldOrder, vs...))
+}
+
+// OrderGT applies the GT predicate on the "order" field.
+func OrderGT(v int) predicate.Prompt {
+	return predicate.Prompt(sql.FieldGT(FieldOrder, v))
+}
+
+// OrderGTE applies the GTE predicate on the "order" field.
+func OrderGTE(v int) predicate.Prompt {
+	return predicate.Prompt(sql.FieldGTE(FieldOrder, v))
+}
+
+// OrderLT applies the LT predicate on the "order" field.
+func OrderLT(v int) predicate.Prompt {
+	return predicate.Prompt(sql.FieldLT(FieldOrder, v))
+}
+
+// OrderLTE applies the LTE predicate on the "order" field.
+func OrderLTE(v int) predicate.Prompt {
+	return predicate.Prompt(sql.FieldLTE(FieldOrder, v))
+}
+
+// HasProject applies the HasEdge predicate on the "project" edge.
+func HasProject() predicate.Prompt {
 	return predicate.Prompt(func(s *sql.Selector) {
 		step := sqlgraph.NewStep(
 			sqlgraph.From(Table, FieldID),
-			sqlgraph.Edge(sqlgraph.M2M, true, ProjectsTable, ProjectsPrimaryKey...),
+			sqlgraph.Edge(sqlgraph.M2O, true, ProjectTable, ProjectColumn),
 		)
 		sqlgraph.HasNeighbors(s, step)
 	})
 }
 
-// HasProjectsWith applies the HasEdge predicate on the "projects" edge with a given conditions (other predicates).
-func HasProjectsWith(preds ...predicate.Project) predicate.Prompt {
+// HasProjectWith applies the HasEdge predicate on the "project" edge with a given conditions (other predicates).
+func HasProjectWith(preds ...predicate.Project) predicate.Prompt {
 	return predicate.Prompt(func(s *sql.Selector) {
-		step := newProjectsStep()
+		step := newProjectStep()
 		sqlgraph.HasNeighborsWith(s, step, func(s *sql.Selector) {
 			for _, p := range preds {
 				p(s)

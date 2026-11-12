@@ -4,9 +4,9 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/looplj/axonhub/internal/authz"
 	"github.com/looplj/axonhub/internal/contexts"
 	"github.com/looplj/axonhub/internal/ent"
-	"github.com/looplj/axonhub/internal/ent/privacy"
 	entuser "github.com/looplj/axonhub/internal/ent/user"
 )
 
@@ -144,14 +144,15 @@ func (v *PermissionValidator) CanEditUserPermissions(ctx context.Context, target
 	}
 
 	// Get target user
-	ctx = privacy.DecisionContext(ctx, privacy.Allow)
-	client := v.entFromContext(ctx)
+	targetUser, err := authz.RunWithSystemBypass(ctx, "permission-check", func(bypassCtx context.Context) (*ent.User, error) {
+		client := v.entFromContext(bypassCtx)
 
-	targetUser, err := client.User.Query().
-		Where(entuser.IDEQ(targetUserID)).
-		WithRoles().
-		WithProjectUsers().
-		Only(ctx)
+		return client.User.Query().
+			Where(entuser.IDEQ(targetUserID)).
+			WithRoles().
+			WithProjectUsers().
+			Only(bypassCtx)
+	})
 	if err != nil {
 		return fmt.Errorf("failed to get target user: %w", err)
 	}
@@ -214,13 +215,53 @@ func (v *PermissionValidator) CanEditUserPermissions(ctx context.Context, target
 
 // CanEditRole checks if the current user can edit a role.
 func (v *PermissionValidator) CanEditRole(ctx context.Context, roleID int, projectID *int) error {
-	ctx = privacy.DecisionContext(ctx, privacy.Allow)
-	client := v.entFromContext(ctx)
-
-	role, err := client.Role.Get(ctx, roleID)
+	role, err := authz.RunWithSystemBypass(ctx, "permission-check", func(bypassCtx context.Context) (*ent.Role, error) {
+		client := v.entFromContext(bypassCtx)
+		return client.Role.Get(bypassCtx, roleID)
+	})
 	if err != nil {
 		return fmt.Errorf("failed to get role: %w", err)
 	}
+	if projectID == nil && !role.IsSystemRole() {
+		projectID = role.ProjectID
+	}
 
 	return v.CanGrantRole(ctx, role.Scopes, projectID)
+}
+
+// CanDeleteProject checks if the current user can delete a project.
+// Rule: Only system owners can delete a project.
+func (v *PermissionValidator) CanDeleteProject(ctx context.Context, projectID int) error {
+	currentUser, ok := contexts.GetUser(ctx)
+	if !ok || currentUser == nil {
+		return fmt.Errorf("user not found in context")
+	}
+
+	// Only system owners can delete projects
+	if !currentUser.IsOwner {
+		return fmt.Errorf("insufficient permissions: only system owners can delete projects")
+	}
+
+	return nil
+}
+
+// CanDeleteUser checks if the current user can delete a user.
+// Rule: Only system owners can delete users, and cannot delete themselves.
+func (v *PermissionValidator) CanDeleteUser(ctx context.Context, targetUserID int) error {
+	currentUser, ok := contexts.GetUser(ctx)
+	if !ok || currentUser == nil {
+		return fmt.Errorf("user not found in context")
+	}
+
+	// Cannot delete yourself
+	if currentUser.ID == targetUserID {
+		return fmt.Errorf("cannot delete yourself")
+	}
+
+	// Only system owners can delete users
+	if !currentUser.IsOwner {
+		return fmt.Errorf("insufficient permissions: only system owners can delete users")
+	}
+
+	return nil
 }

@@ -11,44 +11,28 @@ import (
 	"go.uber.org/fx"
 	"golang.org/x/crypto/bcrypt"
 
+	"github.com/looplj/axonhub/internal/authz"
 	"github.com/looplj/axonhub/internal/ent"
 	"github.com/looplj/axonhub/internal/ent/apikey"
-	"github.com/looplj/axonhub/internal/ent/privacy"
 	"github.com/looplj/axonhub/internal/ent/project"
 	"github.com/looplj/axonhub/internal/ent/user"
 	"github.com/looplj/axonhub/internal/log"
 )
 
-type AuthServiceParams struct {
-	fx.In
+const OIDC_ONLY_PLACEHOLDER = "!OIDC_SSO_ONLY!"
 
-	SystemService *SystemService
-	APIKeyService *APIKeyService
-	UserService   *UserService
-	Ent           *ent.Client
-}
-
-func NewAuthService(params AuthServiceParams) *AuthService {
-	return &AuthService{
-		AbstractService: &AbstractService{
-			db: params.Ent,
-		},
-		SystemService: params.SystemService,
-		APIKeyService: params.APIKeyService,
-		UserService:   params.UserService,
-	}
-}
-
-type AuthService struct {
-	*AbstractService
-
-	SystemService *SystemService
-	APIKeyService *APIKeyService
-	UserService   *UserService
-}
+const (
+	AdminSessionIdle    = 30 * 24 * time.Hour
+	AdminSessionMaximum = 90 * 24 * time.Hour
+	AdminSessionRenewal = 7 * 24 * time.Hour
+)
 
 // HashPassword hashes a password using bcrypt.
 func HashPassword(password string) (string, error) {
+	if password == OIDC_ONLY_PLACEHOLDER {
+		return OIDC_ONLY_PLACEHOLDER, nil
+	}
+
 	hashedPassword, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
 	if err != nil {
 		return "", fmt.Errorf("failed to hash password: %w", err)
@@ -59,12 +43,50 @@ func HashPassword(password string) (string, error) {
 
 // VerifyPassword verifies a password against a hash.
 func VerifyPassword(hashedPassword, password string) error {
+	if hashedPassword == OIDC_ONLY_PLACEHOLDER {
+		return ErrOIDCLoginRequired
+	}
+
 	decodedHashedPassword, err := hex.DecodeString(hashedPassword)
 	if err != nil {
 		return fmt.Errorf("failed to decode hashed password: %w", err)
 	}
 
 	return bcrypt.CompareHashAndPassword(decodedHashedPassword, []byte(password))
+}
+
+type AuthServiceParams struct {
+	fx.In
+
+	SystemService *SystemService
+	APIKeyService *APIKeyService
+	UserService   *UserService
+	OIDCService   *OIDCService
+	Ent           *ent.Client
+	AllowNoAuth   bool `name:"allow_no_auth"`
+}
+
+func NewAuthService(params AuthServiceParams) *AuthService {
+	return &AuthService{
+		AbstractService: &AbstractService{
+			db: params.Ent,
+		},
+		SystemService: params.SystemService,
+		APIKeyService: params.APIKeyService,
+		UserService:   params.UserService,
+		OIDCService:   params.OIDCService,
+		AllowNoAuth:   params.AllowNoAuth,
+	}
+}
+
+type AuthService struct {
+	*AbstractService
+
+	SystemService *SystemService
+	APIKeyService *APIKeyService
+	UserService   *UserService
+	OIDCService   *OIDCService
+	AllowNoAuth   bool
 }
 
 // GenerateSecretKey generates a random secret key for JWT.
@@ -81,16 +103,28 @@ func GenerateSecretKey() (string, error) {
 
 // GenerateJWTToken generates a JWT token for a user.
 func (s *AuthService) GenerateJWTToken(ctx context.Context, user *ent.User) (string, error) {
-	ctx = privacy.DecisionContext(ctx, privacy.Allow)
+	now := time.Now()
+	return s.GenerateJWTTokenAt(ctx, user, now, now)
+}
 
-	secretKey, err := s.SystemService.SecretKey(ctx)
+func (s *AuthService) GenerateJWTTokenAt(ctx context.Context, user *ent.User, now, authTime time.Time) (string, error) {
+	secretKey, err := authz.RunWithSystemBypass(ctx, "auth-get-secret-key", func(bypassCtx context.Context) (string, error) {
+		return s.SystemService.SecretKey(bypassCtx)
+	})
 	if err != nil {
 		return "", fmt.Errorf("failed to get secret key: %w", err)
 	}
+	expiresAt := now.Add(AdminSessionIdle)
+	maximumExpiresAt := authTime.Add(AdminSessionMaximum)
+	if expiresAt.After(maximumExpiresAt) {
+		expiresAt = maximumExpiresAt
+	}
 
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
-		"user_id": user.ID,
-		"exp":     time.Now().Add(time.Hour * 24 * 7).Unix(), // 7 days
+		"user_id":   user.ID,
+		"iat":       now.Unix(),
+		"auth_time": authTime.Unix(),
+		"exp":       expiresAt.Unix(),
 	})
 
 	tokenString, err := token.SignedString([]byte(secretKey))
@@ -106,15 +140,15 @@ func (s *AuthService) AuthenticateUser(
 	ctx context.Context,
 	email, password string,
 ) (*ent.User, error) {
-	ctx = privacy.DecisionContext(ctx, privacy.Allow)
+	u, err := authz.RunWithSystemBypass(ctx, "auth-lookup", func(bypassCtx context.Context) (*ent.User, error) {
+		client := s.entFromContext(bypassCtx)
 
-	client := s.entFromContext(ctx)
-
-	user, err := client.User.Query().
-		Where(user.EmailEQ(email)).
-		Where(user.StatusEQ(user.StatusActivated)).
-		WithRoles().
-		Only(ctx)
+		return client.User.Query().
+			Where(user.EmailEQ(email)).
+			Where(user.StatusEQ(user.StatusActivated)).
+			WithRoles().
+			Only(bypassCtx)
+	})
 	if err != nil {
 		if ent.IsNotFound(err) {
 			return nil, fmt.Errorf("invalid email or password: %w", ErrInvalidPassword)
@@ -125,22 +159,51 @@ func (s *AuthService) AuthenticateUser(
 		return nil, ErrInternal
 	}
 
-	// Verify password
-	err = VerifyPassword(user.Password, password)
+	if s.OIDCService != nil && s.OIDCService.IsUserRestrictedToOIDC(ctx, u) {
+		return nil, ErrOIDCLoginRequired
+	}
+
+	err = VerifyPassword(u.Password, password)
 	if err != nil {
 		return nil, fmt.Errorf("invalid email or password %w", ErrInvalidPassword)
 	}
 
-	log.Debug(ctx, "user authenticated", log.Int("user_id", user.ID))
+	log.Debug(ctx, "user authenticated", log.Int("user_id", u.ID))
 
-	return user, nil
+	return u, nil
 }
 
 // AuthenticateJWTToken validates a JWT token and returns the user.
 func (s *AuthService) AuthenticateJWTToken(ctx context.Context, tokenString string) (*ent.User, error) {
-	ctx = privacy.DecisionContext(ctx, privacy.Allow)
+	claims, err := s.parseJWTClaims(ctx, tokenString)
+	if err != nil {
+		return nil, err
+	}
+	if authTime, ok := jwtTimeClaim(claims, "auth_time"); ok && !time.Now().Before(authTime.Add(AdminSessionMaximum)) {
+		return nil, fmt.Errorf("%w: maximum session age exceeded", ErrInvalidJWT)
+	}
 
-	secretKey, err := s.SystemService.SecretKey(ctx)
+	userID, ok := claims["user_id"].(float64)
+	if !ok {
+		return nil, fmt.Errorf("%w: invalid token claims", ErrInvalidJWT)
+	}
+
+	u, err := authz.RunWithSystemBypass(ctx, "auth-lookup", func(bypassCtx context.Context) (*ent.User, error) {
+		return s.UserService.GetUserByID(bypassCtx, int(userID))
+	})
+	if err != nil {
+		return nil, fmt.Errorf("%w: failed to get user: %w", ErrInvalidJWT, err)
+	}
+	if u.Status != user.StatusActivated {
+		return nil, fmt.Errorf("%w: user not activated", ErrInvalidJWT)
+	}
+	return u, nil
+}
+
+func (s *AuthService) parseJWTClaims(ctx context.Context, tokenString string) (jwt.MapClaims, error) {
+	secretKey, err := authz.RunWithSystemBypass(ctx, "auth-get-secret-key", func(bypassCtx context.Context) (string, error) {
+		return s.SystemService.SecretKey(bypassCtx)
+	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to get secret key: %w", err)
 	}
@@ -160,28 +223,97 @@ func (s *AuthService) AuthenticateJWTToken(ctx context.Context, tokenString stri
 	if !ok || !token.Valid {
 		return nil, fmt.Errorf("%w: invalid token", ErrInvalidJWT)
 	}
-
-	userID, ok := claims["user_id"].(float64)
-	if !ok {
-		return nil, fmt.Errorf("%w: invalid token claims", ErrInvalidJWT)
-	}
-
-	u, err := s.UserService.GetUserByID(ctx, int(userID))
-	if err != nil {
-		return nil, fmt.Errorf("%w: failed to get user: %w", ErrInvalidJWT, err)
-	}
-
-	if u.Status != user.StatusActivated {
-		return nil, fmt.Errorf("%w: user not activated", ErrInvalidJWT)
-	}
-
-	return u, nil
+	return claims, nil
 }
 
-func (s *AuthService) AnthenticateAPIKey(ctx context.Context, key string) (*ent.APIKey, error) {
-	apiKey, err := s.APIKeyService.GetAPIKey(ctx, key)
+func (s *AuthService) RefreshJWTToken(ctx context.Context, tokenString string, now time.Time) (string, bool, error) {
+	claims, err := s.parseJWTClaims(ctx, tokenString)
+	if err != nil {
+		return "", false, err
+	}
+	expiresAt, ok := jwtTimeClaim(claims, "exp")
+	if !ok || expiresAt.Sub(now) >= AdminSessionRenewal {
+		return "", false, nil
+	}
+	authTime, ok := jwtTimeClaim(claims, "auth_time")
+	if !ok {
+		return "", false, nil
+	}
+	if !now.Before(authTime.Add(AdminSessionMaximum)) {
+		return "", false, fmt.Errorf("%w: maximum session age exceeded", ErrInvalidJWT)
+	}
+	if !now.Add(AdminSessionIdle).Before(authTime.Add(AdminSessionMaximum)) && !expiresAt.Before(authTime.Add(AdminSessionMaximum)) {
+		return "", false, nil
+	}
+	userID, ok := claims["user_id"].(float64)
+	if !ok {
+		return "", false, fmt.Errorf("%w: invalid token claims", ErrInvalidJWT)
+	}
+	authenticatedUser, err := authz.RunWithSystemBypass(ctx, "auth-lookup", func(bypassCtx context.Context) (*ent.User, error) {
+		return s.UserService.GetUserByID(bypassCtx, int(userID))
+	})
+	if err != nil {
+		if ent.IsNotFound(err) {
+			return "", false, fmt.Errorf("%w: failed to get user: %w", ErrInvalidJWT, err)
+		}
+		return "", false, fmt.Errorf("failed to get user: %w", err)
+	}
+	if authenticatedUser.Status != user.StatusActivated {
+		return "", false, fmt.Errorf("%w: user not activated", ErrInvalidJWT)
+	}
+	refreshed, err := s.GenerateJWTTokenAt(ctx, authenticatedUser, now, authTime)
+	if err != nil {
+		return "", false, err
+	}
+	return refreshed, true, nil
+}
+
+func jwtTimeClaim(claims jwt.MapClaims, name string) (time.Time, bool) {
+	value, ok := claims[name].(float64)
+	if !ok || value <= 0 {
+		return time.Time{}, false
+	}
+	return time.Unix(int64(value), 0), true
+}
+
+func (s *AuthService) AuthenticateAPIKey(ctx context.Context, key string) (*ent.APIKey, error) {
+	apiKey, err := authz.RunWithSystemBypass(ctx, "auth-lookup", func(bypassCtx context.Context) (*ent.APIKey, error) {
+		return s.APIKeyService.GetAPIKey(bypassCtx, key)
+	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to get api key: %w", err)
+	}
+
+	if apiKey.Status != apikey.StatusEnabled {
+		return nil, fmt.Errorf("api key not enabled: %w", ErrInvalidAPIKey)
+	}
+
+	proj, err := apiKey.Project(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get api key project: %w", err)
+	}
+
+	if proj == nil || proj.Status != project.StatusActive {
+		return nil, fmt.Errorf("api key project not valid: %w", ErrInvalidAPIKey)
+	}
+
+	if apiKey.Type == apikey.TypeNoauth {
+		return nil, fmt.Errorf("noauth api key is only available when api auth is disabled: %w", ErrInvalidAPIKey)
+	}
+
+	return apiKey, nil
+}
+
+func (s *AuthService) AuthenticateNoAuth(ctx context.Context) (*ent.APIKey, error) {
+	if !s.AllowNoAuth {
+		return nil, fmt.Errorf("%w: API key required", ErrInvalidAPIKey)
+	}
+
+	apiKey, err := authz.RunWithSystemBypass(ctx, "auth-noauth", func(bypassCtx context.Context) (*ent.APIKey, error) {
+		return s.APIKeyService.EnsureNoAuthAPIKey(bypassCtx)
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to ensure noauth api key: %w", err)
 	}
 
 	if apiKey.Status != apikey.StatusEnabled {

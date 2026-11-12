@@ -24,7 +24,7 @@ func (r userScopeQueryRule) EvalQuery(ctx context.Context, q ent.Query) error {
 		return err
 	}
 
-	if userHasSystemScope(user, r.requiredScope) {
+	if HasSystemScope(user, r.requiredScope) {
 		return privacy.Allow
 	}
 
@@ -39,7 +39,7 @@ func UserWriteScopeRule(writeScope ScopeSlug) privacy.MutationRule {
 			return err
 		}
 
-		if userHasSystemScope(user, writeScope) {
+		if HasSystemScope(user, writeScope) {
 			return privacy.Allow
 		}
 
@@ -55,25 +55,12 @@ func UserScopeQueryMutationRule(requiredScope ScopeSlug) privacy.QueryMutationRu
 			return err
 		}
 
-		if userHasSystemScope(user, requiredScope) {
+		if HasSystemScope(user, requiredScope) {
 			return privacy.Allow
 		}
 
 		return privacy.Skipf("user does not have required scope: %s", requiredScope)
 	})
-}
-
-func WithUserScopeDecision(ctx context.Context, requiredScope ScopeSlug) context.Context {
-	user, ok := contexts.GetUser(ctx)
-	if !ok || user == nil {
-		return privacy.DecisionContext(ctx, privacy.Deny)
-	}
-
-	if userHasSystemScope(user, requiredScope) {
-		return privacy.DecisionContext(ctx, privacy.Allow)
-	}
-
-	return privacy.DecisionContext(ctx, privacy.Deny)
 }
 
 func UserHasScope(ctx context.Context, requiredScope ScopeSlug) bool {
@@ -82,7 +69,7 @@ func UserHasScope(ctx context.Context, requiredScope ScopeSlug) bool {
 		return false
 	}
 
-	if userHasSystemScope(user, requiredScope) {
+	if HasSystemScope(user, requiredScope) {
 		return true
 	}
 

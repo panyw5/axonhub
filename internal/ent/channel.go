@@ -40,8 +40,12 @@ type Channel struct {
 	DisabledAPIKeys []objects.DisabledAPIKey `json:"-"`
 	// SupportedModels holds the value of the "supported_models" field.
 	SupportedModels []string `json:"supported_models,omitempty"`
+	// ManualModels holds the value of the "manual_models" field.
+	ManualModels []string `json:"manual_models,omitempty"`
 	// AutoSyncSupportedModels holds the value of the "auto_sync_supported_models" field.
 	AutoSyncSupportedModels bool `json:"auto_sync_supported_models,omitempty"`
+	// Regex pattern to filter models during auto-sync. Empty string means no filtering.
+	AutoSyncModelPattern string `json:"auto_sync_model_pattern,omitempty"`
 	// Tags holds the value of the "tags" field.
 	Tags []string `json:"tags,omitempty"`
 	// DefaultTestModel holds the value of the "default_test_model" field.
@@ -54,8 +58,14 @@ type Channel struct {
 	OrderingWeight int `json:"ordering_weight,omitempty"`
 	// ErrorMessage holds the value of the "error_message" field.
 	ErrorMessage *string `json:"error_message,omitempty"`
+	// Set when the channel was disabled automatically, and cleared when it recovers; distinguishes an automatic disable from an operator one.
+	AutoDisabledAt *time.Time `json:"auto_disabled_at,omitempty"`
+	// When set together with auto_disabled_at, the cleanup task re-enables the channel after this instant. Operator disables leave this null.
+	AutoDisableExpiresAt *time.Time `json:"auto_disable_expires_at,omitempty"`
 	// User-defined remark or note for the channel
 	Remark *string `json:"remark,omitempty"`
+	// Outbound API endpoints for this channel. Each endpoint specifies api_format and optional path. When empty, defaults are derived from channel type.
+	Endpoints []objects.ChannelEndpoint `json:"endpoints,omitempty"`
 	// Edges holds the relations/edges for other nodes in the graph.
 	// The values are being populated by the ChannelQuery when eager-loading is set.
 	Edges        ChannelEdges `json:"edges"`
@@ -150,15 +160,15 @@ func (*Channel) scanValues(columns []string) ([]any, error) {
 	values := make([]any, len(columns))
 	for i := range columns {
 		switch columns[i] {
-		case channel.FieldCredentials, channel.FieldDisabledAPIKeys, channel.FieldSupportedModels, channel.FieldTags, channel.FieldPolicies, channel.FieldSettings:
+		case channel.FieldCredentials, channel.FieldDisabledAPIKeys, channel.FieldSupportedModels, channel.FieldManualModels, channel.FieldTags, channel.FieldPolicies, channel.FieldSettings, channel.FieldEndpoints:
 			values[i] = new([]byte)
 		case channel.FieldAutoSyncSupportedModels:
 			values[i] = new(sql.NullBool)
 		case channel.FieldID, channel.FieldDeletedAt, channel.FieldOrderingWeight:
 			values[i] = new(sql.NullInt64)
-		case channel.FieldType, channel.FieldBaseURL, channel.FieldName, channel.FieldStatus, channel.FieldDefaultTestModel, channel.FieldErrorMessage, channel.FieldRemark:
+		case channel.FieldType, channel.FieldBaseURL, channel.FieldName, channel.FieldStatus, channel.FieldAutoSyncModelPattern, channel.FieldDefaultTestModel, channel.FieldErrorMessage, channel.FieldRemark:
 			values[i] = new(sql.NullString)
-		case channel.FieldCreatedAt, channel.FieldUpdatedAt:
+		case channel.FieldCreatedAt, channel.FieldUpdatedAt, channel.FieldAutoDisabledAt, channel.FieldAutoDisableExpiresAt:
 			values[i] = new(sql.NullTime)
 		default:
 			values[i] = new(sql.UnknownType)
@@ -247,11 +257,25 @@ func (_m *Channel) assignValues(columns []string, values []any) error {
 					return fmt.Errorf("unmarshal field supported_models: %w", err)
 				}
 			}
+		case channel.FieldManualModels:
+			if value, ok := values[i].(*[]byte); !ok {
+				return fmt.Errorf("unexpected type %T for field manual_models", values[i])
+			} else if value != nil && len(*value) > 0 {
+				if err := json.Unmarshal(*value, &_m.ManualModels); err != nil {
+					return fmt.Errorf("unmarshal field manual_models: %w", err)
+				}
+			}
 		case channel.FieldAutoSyncSupportedModels:
 			if value, ok := values[i].(*sql.NullBool); !ok {
 				return fmt.Errorf("unexpected type %T for field auto_sync_supported_models", values[i])
 			} else if value.Valid {
 				_m.AutoSyncSupportedModels = value.Bool
+			}
+		case channel.FieldAutoSyncModelPattern:
+			if value, ok := values[i].(*sql.NullString); !ok {
+				return fmt.Errorf("unexpected type %T for field auto_sync_model_pattern", values[i])
+			} else if value.Valid {
+				_m.AutoSyncModelPattern = value.String
 			}
 		case channel.FieldTags:
 			if value, ok := values[i].(*[]byte); !ok {
@@ -296,12 +320,34 @@ func (_m *Channel) assignValues(columns []string, values []any) error {
 				_m.ErrorMessage = new(string)
 				*_m.ErrorMessage = value.String
 			}
+		case channel.FieldAutoDisabledAt:
+			if value, ok := values[i].(*sql.NullTime); !ok {
+				return fmt.Errorf("unexpected type %T for field auto_disabled_at", values[i])
+			} else if value.Valid {
+				_m.AutoDisabledAt = new(time.Time)
+				*_m.AutoDisabledAt = value.Time
+			}
+		case channel.FieldAutoDisableExpiresAt:
+			if value, ok := values[i].(*sql.NullTime); !ok {
+				return fmt.Errorf("unexpected type %T for field auto_disable_expires_at", values[i])
+			} else if value.Valid {
+				_m.AutoDisableExpiresAt = new(time.Time)
+				*_m.AutoDisableExpiresAt = value.Time
+			}
 		case channel.FieldRemark:
 			if value, ok := values[i].(*sql.NullString); !ok {
 				return fmt.Errorf("unexpected type %T for field remark", values[i])
 			} else if value.Valid {
 				_m.Remark = new(string)
 				*_m.Remark = value.String
+			}
+		case channel.FieldEndpoints:
+			if value, ok := values[i].(*[]byte); !ok {
+				return fmt.Errorf("unexpected type %T for field endpoints", values[i])
+			} else if value != nil && len(*value) > 0 {
+				if err := json.Unmarshal(*value, &_m.Endpoints); err != nil {
+					return fmt.Errorf("unmarshal field endpoints: %w", err)
+				}
 			}
 		default:
 			_m.selectValues.Set(columns[i], values[i])
@@ -397,8 +443,14 @@ func (_m *Channel) String() string {
 	builder.WriteString("supported_models=")
 	builder.WriteString(fmt.Sprintf("%v", _m.SupportedModels))
 	builder.WriteString(", ")
+	builder.WriteString("manual_models=")
+	builder.WriteString(fmt.Sprintf("%v", _m.ManualModels))
+	builder.WriteString(", ")
 	builder.WriteString("auto_sync_supported_models=")
 	builder.WriteString(fmt.Sprintf("%v", _m.AutoSyncSupportedModels))
+	builder.WriteString(", ")
+	builder.WriteString("auto_sync_model_pattern=")
+	builder.WriteString(_m.AutoSyncModelPattern)
 	builder.WriteString(", ")
 	builder.WriteString("tags=")
 	builder.WriteString(fmt.Sprintf("%v", _m.Tags))
@@ -420,10 +472,23 @@ func (_m *Channel) String() string {
 		builder.WriteString(*v)
 	}
 	builder.WriteString(", ")
+	if v := _m.AutoDisabledAt; v != nil {
+		builder.WriteString("auto_disabled_at=")
+		builder.WriteString(v.Format(time.ANSIC))
+	}
+	builder.WriteString(", ")
+	if v := _m.AutoDisableExpiresAt; v != nil {
+		builder.WriteString("auto_disable_expires_at=")
+		builder.WriteString(v.Format(time.ANSIC))
+	}
+	builder.WriteString(", ")
 	if v := _m.Remark; v != nil {
 		builder.WriteString("remark=")
 		builder.WriteString(*v)
 	}
+	builder.WriteString(", ")
+	builder.WriteString("endpoints=")
+	builder.WriteString(fmt.Sprintf("%v", _m.Endpoints))
 	builder.WriteByte(')')
 	return builder.String()
 }

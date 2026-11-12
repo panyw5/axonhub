@@ -72,6 +72,20 @@ func (_c *RequestCreate) SetNillableAPIKeyID(v *int) *RequestCreate {
 	return _c
 }
 
+// SetUserID sets the "user_id" field.
+func (_c *RequestCreate) SetUserID(v int) *RequestCreate {
+	_c.mutation.SetUserID(v)
+	return _c
+}
+
+// SetNillableUserID sets the "user_id" field if the given value is not nil.
+func (_c *RequestCreate) SetNillableUserID(v *int) *RequestCreate {
+	if v != nil {
+		_c.SetUserID(*v)
+	}
+	return _c
+}
+
 // SetProjectID sets the "project_id" field.
 func (_c *RequestCreate) SetProjectID(v int) *RequestCreate {
 	_c.mutation.SetProjectID(v)
@@ -134,6 +148,20 @@ func (_c *RequestCreate) SetModelID(v string) *RequestCreate {
 	return _c
 }
 
+// SetReasoningEffort sets the "reasoning_effort" field.
+func (_c *RequestCreate) SetReasoningEffort(v string) *RequestCreate {
+	_c.mutation.SetReasoningEffort(v)
+	return _c
+}
+
+// SetNillableReasoningEffort sets the "reasoning_effort" field if the given value is not nil.
+func (_c *RequestCreate) SetNillableReasoningEffort(v *string) *RequestCreate {
+	if v != nil {
+		_c.SetReasoningEffort(*v)
+	}
+	return _c
+}
+
 // SetFormat sets the "format" field.
 func (_c *RequestCreate) SetFormat(v string) *RequestCreate {
 	_c.mutation.SetFormat(v)
@@ -157,6 +185,12 @@ func (_c *RequestCreate) SetRequestHeaders(v objects.JSONRawMessage) *RequestCre
 // SetRequestBody sets the "request_body" field.
 func (_c *RequestCreate) SetRequestBody(v objects.JSONRawMessage) *RequestCreate {
 	_c.mutation.SetRequestBody(v)
+	return _c
+}
+
+// SetResponseHeaders sets the "response_headers" field.
+func (_c *RequestCreate) SetResponseHeaders(v objects.JSONRawMessage) *RequestCreate {
+	_c.mutation.SetResponseHeaders(v)
 	return _c
 }
 
@@ -234,6 +268,20 @@ func (_c *RequestCreate) SetNillableClientIP(v *string) *RequestCreate {
 	return _c
 }
 
+// SetUserAgent sets the "user_agent" field.
+func (_c *RequestCreate) SetUserAgent(v string) *RequestCreate {
+	_c.mutation.SetUserAgent(v)
+	return _c
+}
+
+// SetNillableUserAgent sets the "user_agent" field if the given value is not nil.
+func (_c *RequestCreate) SetNillableUserAgent(v *string) *RequestCreate {
+	if v != nil {
+		_c.SetUserAgent(*v)
+	}
+	return _c
+}
+
 // SetMetricsLatencyMs sets the "metrics_latency_ms" field.
 func (_c *RequestCreate) SetMetricsLatencyMs(v int64) *RequestCreate {
 	_c.mutation.SetMetricsLatencyMs(v)
@@ -258,6 +306,76 @@ func (_c *RequestCreate) SetMetricsFirstTokenLatencyMs(v int64) *RequestCreate {
 func (_c *RequestCreate) SetNillableMetricsFirstTokenLatencyMs(v *int64) *RequestCreate {
 	if v != nil {
 		_c.SetMetricsFirstTokenLatencyMs(*v)
+	}
+	return _c
+}
+
+// SetMetricsReasoningDurationMs sets the "metrics_reasoning_duration_ms" field.
+func (_c *RequestCreate) SetMetricsReasoningDurationMs(v int64) *RequestCreate {
+	_c.mutation.SetMetricsReasoningDurationMs(v)
+	return _c
+}
+
+// SetNillableMetricsReasoningDurationMs sets the "metrics_reasoning_duration_ms" field if the given value is not nil.
+func (_c *RequestCreate) SetNillableMetricsReasoningDurationMs(v *int64) *RequestCreate {
+	if v != nil {
+		_c.SetMetricsReasoningDurationMs(*v)
+	}
+	return _c
+}
+
+// SetContentSaved sets the "content_saved" field.
+func (_c *RequestCreate) SetContentSaved(v bool) *RequestCreate {
+	_c.mutation.SetContentSaved(v)
+	return _c
+}
+
+// SetNillableContentSaved sets the "content_saved" field if the given value is not nil.
+func (_c *RequestCreate) SetNillableContentSaved(v *bool) *RequestCreate {
+	if v != nil {
+		_c.SetContentSaved(*v)
+	}
+	return _c
+}
+
+// SetContentStorageID sets the "content_storage_id" field.
+func (_c *RequestCreate) SetContentStorageID(v int) *RequestCreate {
+	_c.mutation.SetContentStorageID(v)
+	return _c
+}
+
+// SetNillableContentStorageID sets the "content_storage_id" field if the given value is not nil.
+func (_c *RequestCreate) SetNillableContentStorageID(v *int) *RequestCreate {
+	if v != nil {
+		_c.SetContentStorageID(*v)
+	}
+	return _c
+}
+
+// SetContentStorageKey sets the "content_storage_key" field.
+func (_c *RequestCreate) SetContentStorageKey(v string) *RequestCreate {
+	_c.mutation.SetContentStorageKey(v)
+	return _c
+}
+
+// SetNillableContentStorageKey sets the "content_storage_key" field if the given value is not nil.
+func (_c *RequestCreate) SetNillableContentStorageKey(v *string) *RequestCreate {
+	if v != nil {
+		_c.SetContentStorageKey(*v)
+	}
+	return _c
+}
+
+// SetContentSavedAt sets the "content_saved_at" field.
+func (_c *RequestCreate) SetContentSavedAt(v time.Time) *RequestCreate {
+	_c.mutation.SetContentSavedAt(v)
+	return _c
+}
+
+// SetNillableContentSavedAt sets the "content_saved_at" field if the given value is not nil.
+func (_c *RequestCreate) SetNillableContentSavedAt(v *time.Time) *RequestCreate {
+	if v != nil {
+		_c.SetContentSavedAt(*v)
 	}
 	return _c
 }
@@ -388,17 +506,19 @@ func (_c *RequestCreate) defaults() error {
 		v := request.DefaultClientIP
 		_c.mutation.SetClientIP(v)
 	}
+	if _, ok := _c.mutation.UserAgent(); !ok {
+		v := request.DefaultUserAgent
+		_c.mutation.SetUserAgent(v)
+	}
+	if _, ok := _c.mutation.ContentSaved(); !ok {
+		v := request.DefaultContentSaved
+		_c.mutation.SetContentSaved(v)
+	}
 	return nil
 }
 
 // check runs all checks and user-defined validators on the builder.
 func (_c *RequestCreate) check() error {
-	if _, ok := _c.mutation.CreatedAt(); !ok {
-		return &ValidationError{Name: "created_at", err: errors.New(`ent: missing required field "Request.created_at"`)}
-	}
-	if _, ok := _c.mutation.UpdatedAt(); !ok {
-		return &ValidationError{Name: "updated_at", err: errors.New(`ent: missing required field "Request.updated_at"`)}
-	}
 	if _, ok := _c.mutation.ProjectID(); !ok {
 		return &ValidationError{Name: "project_id", err: errors.New(`ent: missing required field "Request.project_id"`)}
 	}
@@ -419,6 +539,11 @@ func (_c *RequestCreate) check() error {
 	if _, ok := _c.mutation.RequestBody(); !ok {
 		return &ValidationError{Name: "request_body", err: errors.New(`ent: missing required field "Request.request_body"`)}
 	}
+	if v, ok := _c.mutation.ExternalID(); ok {
+		if err := request.ExternalIDValidator(v); err != nil {
+			return &ValidationError{Name: "external_id", err: fmt.Errorf(`ent: validator failed for field "Request.external_id": %w`, err)}
+		}
+	}
 	if _, ok := _c.mutation.Status(); !ok {
 		return &ValidationError{Name: "status", err: errors.New(`ent: missing required field "Request.status"`)}
 	}
@@ -432,6 +557,12 @@ func (_c *RequestCreate) check() error {
 	}
 	if _, ok := _c.mutation.ClientIP(); !ok {
 		return &ValidationError{Name: "client_ip", err: errors.New(`ent: missing required field "Request.client_ip"`)}
+	}
+	if _, ok := _c.mutation.UserAgent(); !ok {
+		return &ValidationError{Name: "user_agent", err: errors.New(`ent: missing required field "Request.user_agent"`)}
+	}
+	if _, ok := _c.mutation.ContentSaved(); !ok {
+		return &ValidationError{Name: "content_saved", err: errors.New(`ent: missing required field "Request.content_saved"`)}
 	}
 	if len(_c.mutation.ProjectIDs()) == 0 {
 		return &ValidationError{Name: "project", err: errors.New(`ent: missing required edge "Request.project"`)}
@@ -471,6 +602,10 @@ func (_c *RequestCreate) createSpec() (*Request, *sqlgraph.CreateSpec) {
 		_spec.SetField(request.FieldUpdatedAt, field.TypeTime, value)
 		_node.UpdatedAt = value
 	}
+	if value, ok := _c.mutation.UserID(); ok {
+		_spec.SetField(request.FieldUserID, field.TypeInt, value)
+		_node.UserID = &value
+	}
 	if value, ok := _c.mutation.Source(); ok {
 		_spec.SetField(request.FieldSource, field.TypeEnum, value)
 		_node.Source = value
@@ -478,6 +613,10 @@ func (_c *RequestCreate) createSpec() (*Request, *sqlgraph.CreateSpec) {
 	if value, ok := _c.mutation.ModelID(); ok {
 		_spec.SetField(request.FieldModelID, field.TypeString, value)
 		_node.ModelID = value
+	}
+	if value, ok := _c.mutation.ReasoningEffort(); ok {
+		_spec.SetField(request.FieldReasoningEffort, field.TypeString, value)
+		_node.ReasoningEffort = value
 	}
 	if value, ok := _c.mutation.Format(); ok {
 		_spec.SetField(request.FieldFormat, field.TypeString, value)
@@ -490,6 +629,10 @@ func (_c *RequestCreate) createSpec() (*Request, *sqlgraph.CreateSpec) {
 	if value, ok := _c.mutation.RequestBody(); ok {
 		_spec.SetField(request.FieldRequestBody, field.TypeJSON, value)
 		_node.RequestBody = value
+	}
+	if value, ok := _c.mutation.ResponseHeaders(); ok {
+		_spec.SetField(request.FieldResponseHeaders, field.TypeJSON, value)
+		_node.ResponseHeaders = value
 	}
 	if value, ok := _c.mutation.ResponseBody(); ok {
 		_spec.SetField(request.FieldResponseBody, field.TypeJSON, value)
@@ -515,6 +658,10 @@ func (_c *RequestCreate) createSpec() (*Request, *sqlgraph.CreateSpec) {
 		_spec.SetField(request.FieldClientIP, field.TypeString, value)
 		_node.ClientIP = value
 	}
+	if value, ok := _c.mutation.UserAgent(); ok {
+		_spec.SetField(request.FieldUserAgent, field.TypeString, value)
+		_node.UserAgent = value
+	}
 	if value, ok := _c.mutation.MetricsLatencyMs(); ok {
 		_spec.SetField(request.FieldMetricsLatencyMs, field.TypeInt64, value)
 		_node.MetricsLatencyMs = &value
@@ -522,6 +669,26 @@ func (_c *RequestCreate) createSpec() (*Request, *sqlgraph.CreateSpec) {
 	if value, ok := _c.mutation.MetricsFirstTokenLatencyMs(); ok {
 		_spec.SetField(request.FieldMetricsFirstTokenLatencyMs, field.TypeInt64, value)
 		_node.MetricsFirstTokenLatencyMs = &value
+	}
+	if value, ok := _c.mutation.MetricsReasoningDurationMs(); ok {
+		_spec.SetField(request.FieldMetricsReasoningDurationMs, field.TypeInt64, value)
+		_node.MetricsReasoningDurationMs = &value
+	}
+	if value, ok := _c.mutation.ContentSaved(); ok {
+		_spec.SetField(request.FieldContentSaved, field.TypeBool, value)
+		_node.ContentSaved = value
+	}
+	if value, ok := _c.mutation.ContentStorageID(); ok {
+		_spec.SetField(request.FieldContentStorageID, field.TypeInt, value)
+		_node.ContentStorageID = &value
+	}
+	if value, ok := _c.mutation.ContentStorageKey(); ok {
+		_spec.SetField(request.FieldContentStorageKey, field.TypeString, value)
+		_node.ContentStorageKey = &value
+	}
+	if value, ok := _c.mutation.ContentSavedAt(); ok {
+		_spec.SetField(request.FieldContentSavedAt, field.TypeTime, value)
+		_node.ContentSavedAt = &value
 	}
 	if nodes := _c.mutation.APIKeyIDs(); len(nodes) > 0 {
 		edge := &sqlgraph.EdgeSpec{
@@ -722,6 +889,24 @@ func (u *RequestUpsert) ClearRequestHeaders() *RequestUpsert {
 	return u
 }
 
+// SetResponseHeaders sets the "response_headers" field.
+func (u *RequestUpsert) SetResponseHeaders(v objects.JSONRawMessage) *RequestUpsert {
+	u.Set(request.FieldResponseHeaders, v)
+	return u
+}
+
+// UpdateResponseHeaders sets the "response_headers" field to the value that was provided on create.
+func (u *RequestUpsert) UpdateResponseHeaders() *RequestUpsert {
+	u.SetExcluded(request.FieldResponseHeaders)
+	return u
+}
+
+// ClearResponseHeaders clears the value of the "response_headers" field.
+func (u *RequestUpsert) ClearResponseHeaders() *RequestUpsert {
+	u.SetNull(request.FieldResponseHeaders)
+	return u
+}
+
 // SetResponseBody sets the "response_body" field.
 func (u *RequestUpsert) SetResponseBody(v objects.JSONRawMessage) *RequestUpsert {
 	u.Set(request.FieldResponseBody, v)
@@ -854,6 +1039,102 @@ func (u *RequestUpsert) ClearMetricsFirstTokenLatencyMs() *RequestUpsert {
 	return u
 }
 
+// SetMetricsReasoningDurationMs sets the "metrics_reasoning_duration_ms" field.
+func (u *RequestUpsert) SetMetricsReasoningDurationMs(v int64) *RequestUpsert {
+	u.Set(request.FieldMetricsReasoningDurationMs, v)
+	return u
+}
+
+// UpdateMetricsReasoningDurationMs sets the "metrics_reasoning_duration_ms" field to the value that was provided on create.
+func (u *RequestUpsert) UpdateMetricsReasoningDurationMs() *RequestUpsert {
+	u.SetExcluded(request.FieldMetricsReasoningDurationMs)
+	return u
+}
+
+// AddMetricsReasoningDurationMs adds v to the "metrics_reasoning_duration_ms" field.
+func (u *RequestUpsert) AddMetricsReasoningDurationMs(v int64) *RequestUpsert {
+	u.Add(request.FieldMetricsReasoningDurationMs, v)
+	return u
+}
+
+// ClearMetricsReasoningDurationMs clears the value of the "metrics_reasoning_duration_ms" field.
+func (u *RequestUpsert) ClearMetricsReasoningDurationMs() *RequestUpsert {
+	u.SetNull(request.FieldMetricsReasoningDurationMs)
+	return u
+}
+
+// SetContentSaved sets the "content_saved" field.
+func (u *RequestUpsert) SetContentSaved(v bool) *RequestUpsert {
+	u.Set(request.FieldContentSaved, v)
+	return u
+}
+
+// UpdateContentSaved sets the "content_saved" field to the value that was provided on create.
+func (u *RequestUpsert) UpdateContentSaved() *RequestUpsert {
+	u.SetExcluded(request.FieldContentSaved)
+	return u
+}
+
+// SetContentStorageID sets the "content_storage_id" field.
+func (u *RequestUpsert) SetContentStorageID(v int) *RequestUpsert {
+	u.Set(request.FieldContentStorageID, v)
+	return u
+}
+
+// UpdateContentStorageID sets the "content_storage_id" field to the value that was provided on create.
+func (u *RequestUpsert) UpdateContentStorageID() *RequestUpsert {
+	u.SetExcluded(request.FieldContentStorageID)
+	return u
+}
+
+// AddContentStorageID adds v to the "content_storage_id" field.
+func (u *RequestUpsert) AddContentStorageID(v int) *RequestUpsert {
+	u.Add(request.FieldContentStorageID, v)
+	return u
+}
+
+// ClearContentStorageID clears the value of the "content_storage_id" field.
+func (u *RequestUpsert) ClearContentStorageID() *RequestUpsert {
+	u.SetNull(request.FieldContentStorageID)
+	return u
+}
+
+// SetContentStorageKey sets the "content_storage_key" field.
+func (u *RequestUpsert) SetContentStorageKey(v string) *RequestUpsert {
+	u.Set(request.FieldContentStorageKey, v)
+	return u
+}
+
+// UpdateContentStorageKey sets the "content_storage_key" field to the value that was provided on create.
+func (u *RequestUpsert) UpdateContentStorageKey() *RequestUpsert {
+	u.SetExcluded(request.FieldContentStorageKey)
+	return u
+}
+
+// ClearContentStorageKey clears the value of the "content_storage_key" field.
+func (u *RequestUpsert) ClearContentStorageKey() *RequestUpsert {
+	u.SetNull(request.FieldContentStorageKey)
+	return u
+}
+
+// SetContentSavedAt sets the "content_saved_at" field.
+func (u *RequestUpsert) SetContentSavedAt(v time.Time) *RequestUpsert {
+	u.Set(request.FieldContentSavedAt, v)
+	return u
+}
+
+// UpdateContentSavedAt sets the "content_saved_at" field to the value that was provided on create.
+func (u *RequestUpsert) UpdateContentSavedAt() *RequestUpsert {
+	u.SetExcluded(request.FieldContentSavedAt)
+	return u
+}
+
+// ClearContentSavedAt clears the value of the "content_saved_at" field.
+func (u *RequestUpsert) ClearContentSavedAt() *RequestUpsert {
+	u.SetNull(request.FieldContentSavedAt)
+	return u
+}
+
 // UpdateNewValues updates the mutable fields using the new values that were set on create.
 // Using this option is equivalent to using:
 //
@@ -871,6 +1152,9 @@ func (u *RequestUpsertOne) UpdateNewValues() *RequestUpsertOne {
 		if _, exists := u.create.mutation.APIKeyID(); exists {
 			s.SetIgnore(request.FieldAPIKeyID)
 		}
+		if _, exists := u.create.mutation.UserID(); exists {
+			s.SetIgnore(request.FieldUserID)
+		}
 		if _, exists := u.create.mutation.ProjectID(); exists {
 			s.SetIgnore(request.FieldProjectID)
 		}
@@ -886,6 +1170,9 @@ func (u *RequestUpsertOne) UpdateNewValues() *RequestUpsertOne {
 		if _, exists := u.create.mutation.ModelID(); exists {
 			s.SetIgnore(request.FieldModelID)
 		}
+		if _, exists := u.create.mutation.ReasoningEffort(); exists {
+			s.SetIgnore(request.FieldReasoningEffort)
+		}
 		if _, exists := u.create.mutation.Format(); exists {
 			s.SetIgnore(request.FieldFormat)
 		}
@@ -897,6 +1184,9 @@ func (u *RequestUpsertOne) UpdateNewValues() *RequestUpsertOne {
 		}
 		if _, exists := u.create.mutation.ClientIP(); exists {
 			s.SetIgnore(request.FieldClientIP)
+		}
+		if _, exists := u.create.mutation.UserAgent(); exists {
+			s.SetIgnore(request.FieldUserAgent)
 		}
 	}))
 	return u
@@ -961,6 +1251,27 @@ func (u *RequestUpsertOne) UpdateRequestHeaders() *RequestUpsertOne {
 func (u *RequestUpsertOne) ClearRequestHeaders() *RequestUpsertOne {
 	return u.Update(func(s *RequestUpsert) {
 		s.ClearRequestHeaders()
+	})
+}
+
+// SetResponseHeaders sets the "response_headers" field.
+func (u *RequestUpsertOne) SetResponseHeaders(v objects.JSONRawMessage) *RequestUpsertOne {
+	return u.Update(func(s *RequestUpsert) {
+		s.SetResponseHeaders(v)
+	})
+}
+
+// UpdateResponseHeaders sets the "response_headers" field to the value that was provided on create.
+func (u *RequestUpsertOne) UpdateResponseHeaders() *RequestUpsertOne {
+	return u.Update(func(s *RequestUpsert) {
+		s.UpdateResponseHeaders()
+	})
+}
+
+// ClearResponseHeaders clears the value of the "response_headers" field.
+func (u *RequestUpsertOne) ClearResponseHeaders() *RequestUpsertOne {
+	return u.Update(func(s *RequestUpsert) {
+		s.ClearResponseHeaders()
 	})
 }
 
@@ -1115,6 +1426,118 @@ func (u *RequestUpsertOne) UpdateMetricsFirstTokenLatencyMs() *RequestUpsertOne 
 func (u *RequestUpsertOne) ClearMetricsFirstTokenLatencyMs() *RequestUpsertOne {
 	return u.Update(func(s *RequestUpsert) {
 		s.ClearMetricsFirstTokenLatencyMs()
+	})
+}
+
+// SetMetricsReasoningDurationMs sets the "metrics_reasoning_duration_ms" field.
+func (u *RequestUpsertOne) SetMetricsReasoningDurationMs(v int64) *RequestUpsertOne {
+	return u.Update(func(s *RequestUpsert) {
+		s.SetMetricsReasoningDurationMs(v)
+	})
+}
+
+// AddMetricsReasoningDurationMs adds v to the "metrics_reasoning_duration_ms" field.
+func (u *RequestUpsertOne) AddMetricsReasoningDurationMs(v int64) *RequestUpsertOne {
+	return u.Update(func(s *RequestUpsert) {
+		s.AddMetricsReasoningDurationMs(v)
+	})
+}
+
+// UpdateMetricsReasoningDurationMs sets the "metrics_reasoning_duration_ms" field to the value that was provided on create.
+func (u *RequestUpsertOne) UpdateMetricsReasoningDurationMs() *RequestUpsertOne {
+	return u.Update(func(s *RequestUpsert) {
+		s.UpdateMetricsReasoningDurationMs()
+	})
+}
+
+// ClearMetricsReasoningDurationMs clears the value of the "metrics_reasoning_duration_ms" field.
+func (u *RequestUpsertOne) ClearMetricsReasoningDurationMs() *RequestUpsertOne {
+	return u.Update(func(s *RequestUpsert) {
+		s.ClearMetricsReasoningDurationMs()
+	})
+}
+
+// SetContentSaved sets the "content_saved" field.
+func (u *RequestUpsertOne) SetContentSaved(v bool) *RequestUpsertOne {
+	return u.Update(func(s *RequestUpsert) {
+		s.SetContentSaved(v)
+	})
+}
+
+// UpdateContentSaved sets the "content_saved" field to the value that was provided on create.
+func (u *RequestUpsertOne) UpdateContentSaved() *RequestUpsertOne {
+	return u.Update(func(s *RequestUpsert) {
+		s.UpdateContentSaved()
+	})
+}
+
+// SetContentStorageID sets the "content_storage_id" field.
+func (u *RequestUpsertOne) SetContentStorageID(v int) *RequestUpsertOne {
+	return u.Update(func(s *RequestUpsert) {
+		s.SetContentStorageID(v)
+	})
+}
+
+// AddContentStorageID adds v to the "content_storage_id" field.
+func (u *RequestUpsertOne) AddContentStorageID(v int) *RequestUpsertOne {
+	return u.Update(func(s *RequestUpsert) {
+		s.AddContentStorageID(v)
+	})
+}
+
+// UpdateContentStorageID sets the "content_storage_id" field to the value that was provided on create.
+func (u *RequestUpsertOne) UpdateContentStorageID() *RequestUpsertOne {
+	return u.Update(func(s *RequestUpsert) {
+		s.UpdateContentStorageID()
+	})
+}
+
+// ClearContentStorageID clears the value of the "content_storage_id" field.
+func (u *RequestUpsertOne) ClearContentStorageID() *RequestUpsertOne {
+	return u.Update(func(s *RequestUpsert) {
+		s.ClearContentStorageID()
+	})
+}
+
+// SetContentStorageKey sets the "content_storage_key" field.
+func (u *RequestUpsertOne) SetContentStorageKey(v string) *RequestUpsertOne {
+	return u.Update(func(s *RequestUpsert) {
+		s.SetContentStorageKey(v)
+	})
+}
+
+// UpdateContentStorageKey sets the "content_storage_key" field to the value that was provided on create.
+func (u *RequestUpsertOne) UpdateContentStorageKey() *RequestUpsertOne {
+	return u.Update(func(s *RequestUpsert) {
+		s.UpdateContentStorageKey()
+	})
+}
+
+// ClearContentStorageKey clears the value of the "content_storage_key" field.
+func (u *RequestUpsertOne) ClearContentStorageKey() *RequestUpsertOne {
+	return u.Update(func(s *RequestUpsert) {
+		s.ClearContentStorageKey()
+	})
+}
+
+// SetContentSavedAt sets the "content_saved_at" field.
+func (u *RequestUpsertOne) SetContentSavedAt(v time.Time) *RequestUpsertOne {
+	return u.Update(func(s *RequestUpsert) {
+		s.SetContentSavedAt(v)
+	})
+}
+
+// UpdateContentSavedAt sets the "content_saved_at" field to the value that was provided on create.
+func (u *RequestUpsertOne) UpdateContentSavedAt() *RequestUpsertOne {
+	return u.Update(func(s *RequestUpsert) {
+		s.UpdateContentSavedAt()
+	})
+}
+
+// ClearContentSavedAt clears the value of the "content_saved_at" field.
+func (u *RequestUpsertOne) ClearContentSavedAt() *RequestUpsertOne {
+	return u.Update(func(s *RequestUpsert) {
+		s.ClearContentSavedAt()
 	})
 }
 
@@ -1300,6 +1723,9 @@ func (u *RequestUpsertBulk) UpdateNewValues() *RequestUpsertBulk {
 			if _, exists := b.mutation.APIKeyID(); exists {
 				s.SetIgnore(request.FieldAPIKeyID)
 			}
+			if _, exists := b.mutation.UserID(); exists {
+				s.SetIgnore(request.FieldUserID)
+			}
 			if _, exists := b.mutation.ProjectID(); exists {
 				s.SetIgnore(request.FieldProjectID)
 			}
@@ -1315,6 +1741,9 @@ func (u *RequestUpsertBulk) UpdateNewValues() *RequestUpsertBulk {
 			if _, exists := b.mutation.ModelID(); exists {
 				s.SetIgnore(request.FieldModelID)
 			}
+			if _, exists := b.mutation.ReasoningEffort(); exists {
+				s.SetIgnore(request.FieldReasoningEffort)
+			}
 			if _, exists := b.mutation.Format(); exists {
 				s.SetIgnore(request.FieldFormat)
 			}
@@ -1326,6 +1755,9 @@ func (u *RequestUpsertBulk) UpdateNewValues() *RequestUpsertBulk {
 			}
 			if _, exists := b.mutation.ClientIP(); exists {
 				s.SetIgnore(request.FieldClientIP)
+			}
+			if _, exists := b.mutation.UserAgent(); exists {
+				s.SetIgnore(request.FieldUserAgent)
 			}
 		}
 	}))
@@ -1391,6 +1823,27 @@ func (u *RequestUpsertBulk) UpdateRequestHeaders() *RequestUpsertBulk {
 func (u *RequestUpsertBulk) ClearRequestHeaders() *RequestUpsertBulk {
 	return u.Update(func(s *RequestUpsert) {
 		s.ClearRequestHeaders()
+	})
+}
+
+// SetResponseHeaders sets the "response_headers" field.
+func (u *RequestUpsertBulk) SetResponseHeaders(v objects.JSONRawMessage) *RequestUpsertBulk {
+	return u.Update(func(s *RequestUpsert) {
+		s.SetResponseHeaders(v)
+	})
+}
+
+// UpdateResponseHeaders sets the "response_headers" field to the value that was provided on create.
+func (u *RequestUpsertBulk) UpdateResponseHeaders() *RequestUpsertBulk {
+	return u.Update(func(s *RequestUpsert) {
+		s.UpdateResponseHeaders()
+	})
+}
+
+// ClearResponseHeaders clears the value of the "response_headers" field.
+func (u *RequestUpsertBulk) ClearResponseHeaders() *RequestUpsertBulk {
+	return u.Update(func(s *RequestUpsert) {
+		s.ClearResponseHeaders()
 	})
 }
 
@@ -1545,6 +1998,118 @@ func (u *RequestUpsertBulk) UpdateMetricsFirstTokenLatencyMs() *RequestUpsertBul
 func (u *RequestUpsertBulk) ClearMetricsFirstTokenLatencyMs() *RequestUpsertBulk {
 	return u.Update(func(s *RequestUpsert) {
 		s.ClearMetricsFirstTokenLatencyMs()
+	})
+}
+
+// SetMetricsReasoningDurationMs sets the "metrics_reasoning_duration_ms" field.
+func (u *RequestUpsertBulk) SetMetricsReasoningDurationMs(v int64) *RequestUpsertBulk {
+	return u.Update(func(s *RequestUpsert) {
+		s.SetMetricsReasoningDurationMs(v)
+	})
+}
+
+// AddMetricsReasoningDurationMs adds v to the "metrics_reasoning_duration_ms" field.
+func (u *RequestUpsertBulk) AddMetricsReasoningDurationMs(v int64) *RequestUpsertBulk {
+	return u.Update(func(s *RequestUpsert) {
+		s.AddMetricsReasoningDurationMs(v)
+	})
+}
+
+// UpdateMetricsReasoningDurationMs sets the "metrics_reasoning_duration_ms" field to the value that was provided on create.
+func (u *RequestUpsertBulk) UpdateMetricsReasoningDurationMs() *RequestUpsertBulk {
+	return u.Update(func(s *RequestUpsert) {
+		s.UpdateMetricsReasoningDurationMs()
+	})
+}
+
+// ClearMetricsReasoningDurationMs clears the value of the "metrics_reasoning_duration_ms" field.
+func (u *RequestUpsertBulk) ClearMetricsReasoningDurationMs() *RequestUpsertBulk {
+	return u.Update(func(s *RequestUpsert) {
+		s.ClearMetricsReasoningDurationMs()
+	})
+}
+
+// SetContentSaved sets the "content_saved" field.
+func (u *RequestUpsertBulk) SetContentSaved(v bool) *RequestUpsertBulk {
+	return u.Update(func(s *RequestUpsert) {
+		s.SetContentSaved(v)
+	})
+}
+
+// UpdateContentSaved sets the "content_saved" field to the value that was provided on create.
+func (u *RequestUpsertBulk) UpdateContentSaved() *RequestUpsertBulk {
+	return u.Update(func(s *RequestUpsert) {
+		s.UpdateContentSaved()
+	})
+}
+
+// SetContentStorageID sets the "content_storage_id" field.
+func (u *RequestUpsertBulk) SetContentStorageID(v int) *RequestUpsertBulk {
+	return u.Update(func(s *RequestUpsert) {
+		s.SetContentStorageID(v)
+	})
+}
+
+// AddContentStorageID adds v to the "content_storage_id" field.
+func (u *RequestUpsertBulk) AddContentStorageID(v int) *RequestUpsertBulk {
+	return u.Update(func(s *RequestUpsert) {
+		s.AddContentStorageID(v)
+	})
+}
+
+// UpdateContentStorageID sets the "content_storage_id" field to the value that was provided on create.
+func (u *RequestUpsertBulk) UpdateContentStorageID() *RequestUpsertBulk {
+	return u.Update(func(s *RequestUpsert) {
+		s.UpdateContentStorageID()
+	})
+}
+
+// ClearContentStorageID clears the value of the "content_storage_id" field.
+func (u *RequestUpsertBulk) ClearContentStorageID() *RequestUpsertBulk {
+	return u.Update(func(s *RequestUpsert) {
+		s.ClearContentStorageID()
+	})
+}
+
+// SetContentStorageKey sets the "content_storage_key" field.
+func (u *RequestUpsertBulk) SetContentStorageKey(v string) *RequestUpsertBulk {
+	return u.Update(func(s *RequestUpsert) {
+		s.SetContentStorageKey(v)
+	})
+}
+
+// UpdateContentStorageKey sets the "content_storage_key" field to the value that was provided on create.
+func (u *RequestUpsertBulk) UpdateContentStorageKey() *RequestUpsertBulk {
+	return u.Update(func(s *RequestUpsert) {
+		s.UpdateContentStorageKey()
+	})
+}
+
+// ClearContentStorageKey clears the value of the "content_storage_key" field.
+func (u *RequestUpsertBulk) ClearContentStorageKey() *RequestUpsertBulk {
+	return u.Update(func(s *RequestUpsert) {
+		s.ClearContentStorageKey()
+	})
+}
+
+// SetContentSavedAt sets the "content_saved_at" field.
+func (u *RequestUpsertBulk) SetContentSavedAt(v time.Time) *RequestUpsertBulk {
+	return u.Update(func(s *RequestUpsert) {
+		s.SetContentSavedAt(v)
+	})
+}
+
+// UpdateContentSavedAt sets the "content_saved_at" field to the value that was provided on create.
+func (u *RequestUpsertBulk) UpdateContentSavedAt() *RequestUpsertBulk {
+	return u.Update(func(s *RequestUpsert) {
+		s.UpdateContentSavedAt()
+	})
+}
+
+// ClearContentSavedAt clears the value of the "content_saved_at" field.
+func (u *RequestUpsertBulk) ClearContentSavedAt() *RequestUpsertBulk {
+	return u.Update(func(s *RequestUpsert) {
+		s.ClearContentSavedAt()
 	})
 }
 

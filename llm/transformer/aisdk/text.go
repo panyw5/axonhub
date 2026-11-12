@@ -5,11 +5,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"strings"
 
-	"github.com/looplj/axonhub/internal/log"
-	"github.com/looplj/axonhub/internal/pkg/xerrors"
 	"github.com/looplj/axonhub/llm"
 	"github.com/looplj/axonhub/llm/httpclient"
 	"github.com/looplj/axonhub/llm/streams"
@@ -24,10 +23,6 @@ func NewTextTransformer() *TextTransformer {
 	return &TextTransformer{}
 }
 
-func (t *TextTransformer) APIFormat() llm.APIFormat {
-	return llm.APIFormatAiSDKText
-}
-
 // TransformRequest transforms AI SDK request to LLM request.
 func (t *TextTransformer) TransformRequest(
 	ctx context.Context,
@@ -40,7 +35,7 @@ func (t *TextTransformer) TransformRequest(
 		return nil, fmt.Errorf("%w: failed to parse AI SDK request: %w", transformer.ErrInvalidRequest, err)
 	}
 
-	return convertToLLMRequest(&aiSDKReq)
+	return convertToLLMRequestWithAPIFormat(&aiSDKReq, nil, llm.APIFormatAiSDKText)
 }
 
 // TransformResponse transforms LLM response to AI SDK response.
@@ -95,7 +90,7 @@ func (t *TextTransformer) TransformStreamChunk(
 
 	// Process each choice
 	for _, choice := range chunk.Choices {
-		log.Debug(ctx, "Processing choice for ai text", log.Any("choice", choice))
+		slog.DebugContext(ctx, "Processing choice for ai text", slog.Any("choice", choice))
 
 		// Handle text content - Format: 0:"text"\n
 		if choice.Delta != nil && choice.Delta.Content.Content != nil &&
@@ -195,7 +190,7 @@ func (t *TextTransformer) TransformError(ctx context.Context, rawErr error) *htt
 		}
 	}
 
-	if httpErr, ok := xerrors.As[*httpclient.Error](rawErr); ok {
+	if httpErr, ok := errors.AsType[*httpclient.Error](rawErr); ok {
 		return httpErr
 	}
 
@@ -208,7 +203,7 @@ func (t *TextTransformer) TransformError(ctx context.Context, rawErr error) *htt
 		}
 	}
 
-	if llmErr, ok := xerrors.As[*llm.ResponseError](rawErr); ok {
+	if llmErr, ok := errors.AsType[*llm.ResponseError](rawErr); ok {
 		return &httpclient.Error{
 			StatusCode: llmErr.StatusCode,
 			Status:     http.StatusText(llmErr.StatusCode),

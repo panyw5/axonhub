@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -13,11 +14,12 @@ import (
 	"time"
 
 	"cloud.google.com/go/storage"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/aws/retry"
 	"github.com/samber/lo"
 	"github.com/spf13/afero"
 	"github.com/spf13/afero/gcsfs"
 	"github.com/studio-b12/gowebdav"
-	"github.com/zhenzou/executors"
 	"go.uber.org/fx"
 	"golang.org/x/oauth2/google"
 
@@ -30,10 +32,11 @@ import (
 
 	"github.com/looplj/axonhub/internal/ent"
 	"github.com/looplj/axonhub/internal/ent/datastorage"
-	"github.com/looplj/axonhub/internal/ent/privacy"
 	"github.com/looplj/axonhub/internal/log"
 	"github.com/looplj/axonhub/internal/objects"
 	"github.com/looplj/axonhub/internal/pkg/xcache"
+	"github.com/looplj/axonhub/internal/pkg/xerrors"
+	"github.com/looplj/axonhub/internal/server/scheduler"
 )
 
 // DataStorageService handles data storage operations.
@@ -42,12 +45,14 @@ type DataStorageService struct {
 
 	SystemService *SystemService
 	Cache         xcache.Cache[ent.DataStorage]
-	Executors     executors.ScheduledExecutor
 
 	// fsCache caches afero filesystem instances by data storage ID
-	fsCache      map[int]afero.Fs
-	fsCacheMu    sync.RWMutex
-	latestUpdate time.Time
+	fsCache map[int]afero.Fs
+	// objectStoreCache caches native object-store clients (S3) by data storage ID.
+	// Guarded by fsCacheMu and invalidated in lockstep with fsCache.
+	objectStoreCache map[int]ObjectStore
+	fsCacheMu        sync.RWMutex
+	latestUpdate     time.Time
 }
 
 // DataStorageServiceParams holds the dependencies for DataStorageService.
@@ -56,7 +61,6 @@ type DataStorageServiceParams struct {
 
 	SystemService *SystemService
 	CacheConfig   xcache.Config
-	Executor      executors.ScheduledExecutor
 	Client        *ent.Client
 }
 
@@ -66,35 +70,26 @@ func NewDataStorageService(params DataStorageServiceParams) *DataStorageService 
 		AbstractService: &AbstractService{
 			db: params.Client,
 		},
-		SystemService: params.SystemService,
-		Cache:         xcache.NewFromConfig[ent.DataStorage](params.CacheConfig),
-		Executors:     params.Executor,
-		fsCache:       make(map[int]afero.Fs),
+		SystemService:    params.SystemService,
+		Cache:            xcache.NewFromConfig[ent.DataStorage](params.CacheConfig),
+		fsCache:          make(map[int]afero.Fs),
+		objectStoreCache: make(map[int]ObjectStore),
 	}
-
-	if err := svc.refreshFileSystems(context.Background()); err != nil {
-		log.Error(context.Background(), "failed to preload data storage filesystems", log.Cause(err))
-	}
-
-	if _, err := svc.Executors.ScheduleFuncAtCronRate(
-		svc.refreshFileSystemsPeriodic,
-		executors.CRONRule{Expr: "*/1 * * * *"},
-	); err != nil {
-		log.Error(context.Background(), "failed to schedule data storage filesystem refresh", log.Cause(err))
-	}
+	svc.reloadFileSystemsPeriodically(context.Background())
 
 	return svc
 }
 
-func (s *DataStorageService) refreshFileSystemsPeriodic(ctx context.Context) {
-	if err := s.refreshFileSystems(ctx); err != nil {
-		log.Error(ctx, "failed to refresh data storage filesystems", log.Cause(err))
-	}
+func (s *DataStorageService) RegisterScheduledTasks(ctx context.Context, sched *scheduler.Scheduler) error {
+	return sched.Register(ctx, scheduler.TaskSpec{
+		Name:        "datastorage-fs-reload",
+		Description: "Refresh data storage filesystem cache every minute",
+		CronExpr:    "*/1 * * * *",
+		Timezone:    "UTC",
+	}, s.reloadFileSystemsPeriodically)
 }
 
 func (s *DataStorageService) refreshFileSystems(ctx context.Context) error {
-	ctx = privacy.DecisionContext(ctx, privacy.Allow)
-
 	latestUpdatedStorage, err := s.entFromContext(ctx).DataStorage.Query().
 		Order(ent.Desc(datastorage.FieldUpdatedAt)).
 		First(ctx)
@@ -144,6 +139,8 @@ func (s *DataStorageService) refreshFileSystems(ctx context.Context) error {
 
 	s.fsCacheMu.Lock()
 	s.fsCache = newCache
+	// Drop cached native object-store clients so changed configs are rebuilt lazily.
+	s.objectStoreCache = make(map[int]ObjectStore)
 	s.fsCacheMu.Unlock()
 
 	log.Info(ctx, "refreshed data storage filesystems", log.Int("count", len(newCache)))
@@ -188,7 +185,7 @@ func (s *DataStorageService) buildFileSystem(ctx context.Context, ds *ent.DataSt
 			return nil, fmt.Errorf("webdav settings not configured")
 		}
 
-		fs, err := s.createWebDAVFs(ctx, ds.Settings.WebDAV)
+		fs, err := s.createWebDAVFs(ctx, ds, ds.Settings.WebDAV)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create webdav filesystem: %w", err)
 		}
@@ -201,6 +198,18 @@ func (s *DataStorageService) buildFileSystem(ctx context.Context, ds *ent.DataSt
 
 // CreateDataStorage creates a new data storage record and refreshes relevant caches.
 func (s *DataStorageService) CreateDataStorage(ctx context.Context, input *ent.CreateDataStorageInput) (*ent.DataStorage, error) {
+	// Check for duplicate data storage name
+	exists, err := ent.FromContext(ctx).DataStorage.Query().
+		Where(datastorage.Name(input.Name)).
+		Exist(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to check data storage name uniqueness: %w", err)
+	}
+
+	if exists {
+		return nil, xerrors.DuplicateNameError("data storage", input.Name)
+	}
+
 	dataStorage, err := ent.FromContext(ctx).DataStorage.Create().
 		SetName(input.Name).
 		SetSettings(input.Settings).
@@ -225,6 +234,23 @@ func (s *DataStorageService) UpdateDataStorage(ctx context.Context, id int, inpu
 	existing, err := ent.FromContext(ctx).DataStorage.Get(ctx, id)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get data storage: %w", err)
+	}
+
+	// Check for duplicate name if being updated
+	if input.Name != nil && *input.Name != existing.Name {
+		exists, err := ent.FromContext(ctx).DataStorage.Query().
+			Where(
+				datastorage.Name(*input.Name),
+				datastorage.IDNEQ(id),
+			).
+			Exist(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("failed to check data storage name uniqueness: %w", err)
+		}
+
+		if exists {
+			return nil, xerrors.DuplicateNameError("data storage", *input.Name)
+		}
 	}
 
 	// Build updated settings by merging with existing settings
@@ -268,10 +294,7 @@ func (s *DataStorageService) GetDataStorageByID(ctx context.Context, id int) (*e
 		return &cached, nil
 	}
 
-	ctx = privacy.DecisionContext(ctx, privacy.Allow)
-	client := ent.FromContext(ctx)
-
-	ds, err := client.DataStorage.Get(ctx, id)
+	ds, err := ent.FromContext(ctx).DataStorage.Get(ctx, id)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get data storage by ID %d: %w", id, err)
 	}
@@ -294,10 +317,7 @@ func (s *DataStorageService) GetPrimaryDataStorage(ctx context.Context) (*ent.Da
 		return &cached, nil
 	}
 
-	ctx = privacy.DecisionContext(ctx, privacy.Allow)
-	client := ent.FromContext(ctx)
-
-	ds, err := client.DataStorage.Query().
+	ds, err := ent.FromContext(ctx).DataStorage.Query().
 		Where(datastorage.Primary(true)).
 		First(ctx)
 	if err != nil {
@@ -356,6 +376,7 @@ func (s *DataStorageService) InvalidateAllDataStorageCache(ctx context.Context) 
 	// Also clear filesystem cache
 	s.fsCacheMu.Lock()
 	s.fsCache = make(map[int]afero.Fs)
+	s.objectStoreCache = make(map[int]ObjectStore)
 	s.fsCacheMu.Unlock()
 
 	s.latestUpdate = time.Time{}
@@ -367,41 +388,58 @@ func (s *DataStorageService) InvalidateAllDataStorageCache(ctx context.Context) 
 func (s *DataStorageService) InvalidateFsCache(id int) error {
 	s.fsCacheMu.Lock()
 	delete(s.fsCache, id)
+	delete(s.objectStoreCache, id)
 	s.fsCacheMu.Unlock()
 
 	return nil
 }
 
-// createS3Fs creates an S3 filesystem using the afero-s3 adapter.
-func (s *DataStorageService) createS3Fs(ctx context.Context, s3Config *objects.S3) (afero.Fs, error) {
+// newS3Client builds an aws-sdk-go-v2 S3 client from the given config. It uses
+// an adaptive retryer (client-side rate limiting + backoff/jitter) so throttling
+// (HTTP 503 SlowDown) does not trigger a retry storm that multiplies Class A
+// operations under load. The client is shared by createS3Fs (the afero adapter
+// used by GetFileSystem) and the native s3ObjectStore (byte Save/Load/Delete).
+func newS3Client(ctx context.Context, s3Config *objects.S3) (*awss3.Client, error) {
 	credProvider := awscredentials.NewStaticCredentialsProvider(
 		s3Config.AccessKey,
 		s3Config.SecretKey,
 		"",
 	)
 
-	loadOptions := []func(*awsconfig.LoadOptions) error{
+	awsCfg, err := awsconfig.LoadDefaultConfig(ctx,
 		awsconfig.WithRegion(s3Config.Region),
 		awsconfig.WithCredentialsProvider(credProvider),
-	}
-
-	awsCfg, err := awsconfig.LoadDefaultConfig(ctx, loadOptions...)
+		awsconfig.WithRetryer(func() aws.Retryer {
+			return retry.AddWithMaxAttempts(retry.NewAdaptiveMode(), 3)
+		}),
+	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to load AWS config: %w", err)
 	}
 
-	client := awss3.NewFromConfig(awsCfg, func(o *awss3.Options) {
+	return awss3.NewFromConfig(awsCfg, func(o *awss3.Options) {
 		if s3Config.Endpoint != "" {
 			o.BaseEndpoint = lo.ToPtr(s3Config.Endpoint)
 		}
 		// Enable Path Style access for S3 compatible storage services (e.g., MinIO, Ceph RGW)
 		o.UsePathStyle = s3Config.PathStyle
-	})
+	}), nil
+}
 
-	baseFs := s3fs.NewFsFromClient(s3Config.BucketName, client)
-	cachedFs := afero.NewCacheOnReadFs(baseFs, afero.NewMemMapFs(), 5*time.Minute)
+// createS3Fs creates an S3 filesystem using the afero-s3 adapter.
+func (s *DataStorageService) createS3Fs(ctx context.Context, s3Config *objects.S3) (afero.Fs, error) {
+	client, err := newS3Client(ctx, s3Config)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create s3 client: %w", err)
+	}
 
-	return cachedFs, nil
+	// NOTE: do NOT wrap baseFs in afero.NewCacheOnReadFs(..., afero.NewMemMapFs(), ...).
+	// That in-memory layer is never evicted (afero's cacheTime only re-checks
+	// freshness on read), so it retained a copy of every request/response body
+	// ever written and caused recurring OOMs. Request/response bodies are
+	// write-once and read rarely (admin request-detail view), so reads go
+	// directly to the object store instead of through an in-memory cache.
+	return s3fs.NewFsFromClient(s3Config.BucketName, client), nil
 }
 
 // createGcsFs creates a GCS filesystem using the afero gcsfs adapter.
@@ -424,31 +462,40 @@ func (s *DataStorageService) createGcsFs(ctx context.Context, gcsConfig *objects
 		return nil, fmt.Errorf("failed to create GCS filesystem: %w", err)
 	}
 
-	basePathFs := afero.NewBasePathFs(fs, gcsConfig.BucketName)
-
-	cachedFs := afero.NewCacheOnReadFs(basePathFs, afero.NewMemMapFs(), 5*time.Minute)
-
-	return cachedFs, nil
+	// NOTE: do NOT wrap in afero.NewCacheOnReadFs(..., afero.NewMemMapFs(), ...).
+	// The in-memory layer is never evicted and leaks every body forever (see
+	// createS3Fs). Reads go directly to the object store.
+	return afero.NewBasePathFs(fs, gcsConfig.BucketName), nil
 }
 
 // createWebDAVFs creates a WebDAV filesystem using the afero-webdav adapter.
-func (s *DataStorageService) createWebDAVFs(_ context.Context, cfg *objects.WebDAV) (afero.Fs, error) {
-	var fs afero.Fs
-
+func (s *DataStorageService) createWebDAVFs(_ context.Context, ds *ent.DataStorage, cfg *objects.WebDAV) (afero.Fs, error) {
+	client := gowebdav.NewClient(cfg.URL, cfg.Username, cfg.Password)
+	client.SetTimeout(time.Minute * 10)
 	if cfg.InsecureSkipTLS {
-		client := gowebdav.NewClient(cfg.URL, cfg.Username, cfg.Password)
 		//nolint:gosec // InsecureSkipVerify is configurable by the user.
 		client.SetTransport(&http.Transport{
 			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
 		})
-
-		fs = webdavfs.NewFsFromClient(client)
-	} else {
-		fs = webdavfs.NewFs(cfg.URL, cfg.Username, cfg.Password)
 	}
 
-	if cfg.Path != "" && cfg.Path != "/" {
-		return afero.NewBasePathFs(fs, cfg.Path), nil
+	fs := webdavfs.NewFsFromClient(client)
+
+	path := ""
+	if cfg.Path != "" {
+		path = cfg.Path
+	} else if ds.Settings.Directory != nil {
+		path = *ds.Settings.Directory
+	}
+
+	// Normalize WebDAV path for Synology/NAS compatibility:
+	// BasePathFs and the underlying webdav client may concatenate paths such that it results in "/path/to/file",
+	// which some WEBDAV servers reject with 405. By trimming the leading slash from the base path,
+	// we ensure the final path sent is relative/normalized according to server expectations.
+	path = strings.TrimPrefix(path, "/")
+
+	if path != "" {
+		return afero.NewBasePathFs(fs, path), nil
 	}
 
 	return fs, nil
@@ -480,72 +527,122 @@ func (s *DataStorageService) GetFileSystem(ctx context.Context, ds *ent.DataStor
 	return fs, nil
 }
 
-// GetFileSystemByID returns an afero.Fs for the given data storage ID.
-// It first checks the cache, then fetches the data storage from the database if not found.
-func (s *DataStorageService) GetFileSystemByID(ctx context.Context, dataStorageID int) (afero.Fs, error) {
-	s.fsCacheMu.RLock()
-	fs, ok := s.fsCache[dataStorageID]
-	s.fsCacheMu.RUnlock()
-
-	if ok {
-		return fs, nil
-	}
-
-	ctx = privacy.DecisionContext(ctx, privacy.Allow)
-
-	ds, err := s.entFromContext(ctx).DataStorage.Get(ctx, dataStorageID)
-	if err != nil {
-		return nil, fmt.Errorf("data storage not found: %w", err)
-	}
-
-	return s.buildFileSystem(ctx, ds)
-}
-
 // SaveData saves data to the specified data storage.
-// For file system storage, it writes the data to a file and returns the file path.
-func (s *DataStorageService) SaveData(ctx context.Context, ds *ent.DataStorage, key string, data []byte) (string, error) {
+func (s *DataStorageService) SaveData(ctx context.Context, ds *ent.DataStorage, key string, data []byte) error {
 	switch ds.Type {
 	case datastorage.TypeDatabase:
-		// For database storage, we just return the data as a string
-		// The caller will store it in the database
-		return string(data), nil
+		return nil
 	case datastorage.TypeFs, datastorage.TypeS3, datastorage.TypeGcs, datastorage.TypeWebdav:
+		// Object-store backends (S3) write in a single PutObject via a native
+		// client; other backends fall back to the afero filesystem path below.
+		if store, ok, err := s.objectStoreFor(ctx, ds); err != nil {
+			return err
+		} else if ok {
+			return store.PutObject(ctx, normalizeObjectKey(key), data)
+		}
+
 		// For file-based storage, write to file system
 		fs, err := s.GetFileSystem(ctx, ds)
 		if err != nil {
-			return "", fmt.Errorf("failed to get file system: %w", err)
+			return fmt.Errorf("failed to get file system: %w", err)
 		}
 
 		if ds.Type == datastorage.TypeFs {
 			key = filepath.FromSlash(key)
-
 			err = fs.MkdirAll(filepath.Dir(key), 0o777)
 			if err != nil {
-				return "", fmt.Errorf("failed to create directory: %w, key: %s", err, key)
+				return fmt.Errorf("failed to create directory: %w, key: %s", err, key)
 			}
-		} else {
-			// For S3 with PathStyle enabled, remove leading slash from key
-			// to avoid InvalidArgument error from S3 compatible storage services
-			if isS3PathStyle(ds) {
-				key = strings.TrimPrefix(key, "/")
-			}
+		} else if ds.Type == datastorage.TypeWebdav {
+			// For WebDAV, remove leading slash to avoid 405 error on some servers (e.g., Synology)
+			key = strings.TrimPrefix(key, "/")
 
-			f, err := fs.Create(key)
+			err = s.mkdirAll(fs, filepath.Dir(key))
 			if err != nil {
-				return "", fmt.Errorf("failed to create file: %w, key: %s", err, key)
+				return fmt.Errorf("failed to create directory: %w, key: %s", err, key)
+			}
+		}
+
+		// For S3 with PathStyle enabled, remove leading slash from key
+		// to avoid InvalidArgument error from S3 compatible storage services
+		if isS3PathStyle(ds) {
+			key = strings.TrimPrefix(key, "/")
+		}
+
+		// Write data to file. afero.WriteFile creates the object in a single
+		// write. We deliberately do NOT pre-create it with fs.Create()+Close():
+		// on object stores (afero-s3) that issued two extra empty PutObject
+		// (Class A) calls per save with no benefit.
+		if err := afero.WriteFile(fs, key, data, 0o777); err != nil {
+			return fmt.Errorf("failed to write file: %w, key: %s", err, key)
+		}
+
+		return nil
+	default:
+		return fmt.Errorf("unsupported storage type: %s", ds.Type)
+	}
+}
+
+// SaveDataFromReader streams data from a reader to the specified data storage.
+// It returns the storage key and the number of bytes written.
+// Database storage is not supported because it requires the full data as a string.
+func (s *DataStorageService) SaveDataFromReader(ctx context.Context, ds *ent.DataStorage, key string, r io.Reader) (string, int64, error) {
+	switch ds.Type {
+	case datastorage.TypeDatabase:
+		return "", 0, fmt.Errorf("database storage does not support streaming writes")
+	case datastorage.TypeFs, datastorage.TypeS3, datastorage.TypeGcs, datastorage.TypeWebdav:
+		// Object-store backends (S3) stream via a native uploader with a tuned
+		// part size; other backends fall back to the afero filesystem path below.
+		if store, ok, err := s.objectStoreFor(ctx, ds); err != nil {
+			return "", 0, err
+		} else if ok {
+			nk := normalizeObjectKey(key)
+
+			n, err := store.PutObjectStream(ctx, nk, r, -1)
+			if err != nil {
+				return "", 0, err
 			}
 
-			_ = f.Close()
+			return nk, n, nil
 		}
 
-		// Write data to file
-		if err := afero.WriteFile(fs, key, data, 0o777); err != nil {
-			return "", fmt.Errorf("failed to write file: %w, key: %s", err, key)
+		fs, err := s.GetFileSystem(ctx, ds)
+		if err != nil {
+			return "", 0, fmt.Errorf("failed to get file system: %w", err)
 		}
 
-		return key, nil
+		if ds.Type == datastorage.TypeFs {
+			key = filepath.FromSlash(key)
+			if err := fs.MkdirAll(filepath.Dir(key), 0o777); err != nil {
+				return "", 0, fmt.Errorf("failed to create directory: %w, key: %s", err, key)
+			}
+		} else if ds.Type == datastorage.TypeWebdav {
+			// For WebDAV, remove leading slash to avoid 405 error on some servers (e.g., Synology)
+			key = strings.TrimPrefix(key, "/")
+			if err := s.mkdirAll(fs, filepath.Dir(key)); err != nil {
+				return "", 0, fmt.Errorf("failed to create directory: %w, key: %s", err, key)
+			}
+		} else if isS3PathStyle(ds) {
+			key = strings.TrimPrefix(key, "/")
+		}
+
+		// Open for writing without pre-creating the object. On object stores,
+		// fs.Create() issues a redundant empty PutObject (Class A) before the
+		// real upload; OpenFile only sets up the write stream.
+		f, err := fs.OpenFile(key, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o777)
+		if err != nil {
+			return "", 0, fmt.Errorf("failed to create file: %w, key: %s", err, key)
+		}
+		defer f.Close()
+
+		n, err := io.Copy(f, r)
+		if err != nil {
+			return "", 0, fmt.Errorf("failed to write file: %w, key: %s", err, key)
+		}
+
+		return key, n, nil
 	default:
-		return "", fmt.Errorf("unsupported storage type: %s", ds.Type)
+		return "", 0, fmt.Errorf("unsupported storage type: %s", ds.Type)
 	}
 }
 
@@ -558,6 +655,14 @@ func (s *DataStorageService) DeleteData(ctx context.Context, ds *ent.DataStorage
 	case datastorage.TypeDatabase:
 		return nil
 	case datastorage.TypeFs, datastorage.TypeS3, datastorage.TypeGcs, datastorage.TypeWebdav:
+		// Object-store backends (S3) delete with a single idempotent DeleteObject
+		// (no pre-Stat / ListObjectsV2); other backends fall back to afero below.
+		if store, ok, err := s.objectStoreFor(ctx, ds); err != nil {
+			return err
+		} else if ok {
+			return store.DeleteObject(ctx, normalizeObjectKey(key))
+		}
+
 		fs, err := s.GetFileSystem(ctx, ds)
 		if err != nil {
 			return fmt.Errorf("failed to get file system: %w", err)
@@ -594,6 +699,14 @@ func (s *DataStorageService) LoadData(ctx context.Context, ds *ent.DataStorage, 
 		// For database storage, the key is the data itself
 		return []byte(key), nil
 	case datastorage.TypeFs, datastorage.TypeS3, datastorage.TypeGcs, datastorage.TypeWebdav:
+		// Object-store backends (S3) read with a single GetObject; a missing key
+		// returns os.ErrNotExist (no ListObjectsV2). Others fall back to afero.
+		if store, ok, err := s.objectStoreFor(ctx, ds); err != nil {
+			return nil, err
+		} else if ok {
+			return store.GetObject(ctx, normalizeObjectKey(key))
+		}
+
 		// For file-based storage, read from file system
 		fs, err := s.GetFileSystem(ctx, ds)
 		if err != nil {
@@ -752,4 +865,39 @@ func isWebDAVProvided(webdav *objects.WebDAV) bool {
 	}
 
 	return webdav.URL != "" || webdav.Username != "" || webdav.Password != "" || webdav.Path != ""
+}
+
+func (s *DataStorageService) mkdirAll(fs afero.Fs, dir string) error {
+	if dir == "." || dir == "/" || dir == "" {
+		return nil
+	}
+
+	// Normalize path separators to / for consistent splitting
+	dir = filepath.ToSlash(dir)
+	dir = strings.Trim(dir, "/")
+	parts := strings.Split(dir, "/")
+
+	var current string
+	for _, part := range parts {
+		if current == "" {
+			current = part
+		} else {
+			current = current + "/" + part
+		}
+
+		err := fs.Mkdir(current, 0o777)
+		if err != nil {
+			// Ignore "already exists" errors. WebDAV servers might return 405 or 409
+			// if the directory already exists. We check existence only as a fallback.
+			//nolint:staticcheck // bypass SA4006 false positive on older staticcheck versions
+			isDir, errDir := afero.DirExists(fs, current)
+			if errDir == nil && isDir {
+				continue
+			}
+			// If Mkdir failed and we can't confirm it exists, we might still want to continue
+			// as some WebDAV implementations are quirky.
+		}
+	}
+
+	return nil
 }

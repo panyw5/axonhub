@@ -244,7 +244,7 @@ func TestOutboundTransformer_TransformStream(t *testing.T) {
 	inputStream := streams.SliceStream(events)
 
 	// Transform the stream
-	outputStream, err := transformer.TransformStream(context.Background(), inputStream)
+	outputStream, err := transformer.TransformStream(context.Background(), nil, inputStream)
 	require.NoError(t, err)
 	require.NotNil(t, outputStream)
 
@@ -262,6 +262,58 @@ func TestOutboundTransformer_TransformStream(t *testing.T) {
 	require.Equal(t, "Hello", *results[0].Choices[0].Delta.Content.Content)
 	require.NotNil(t, results[1].Choices[0].Delta)
 	require.Equal(t, ", world!", *results[1].Choices[0].Delta.Content.Content)
+}
+
+func TestOutboundTransformer_TransformStream_AllowsMissingResponseID(t *testing.T) {
+	transformer := &OutboundTransformer{
+		config: Config{
+			BaseURL:    DefaultBaseURL,
+			APIVersion: DefaultAPIVersion,
+		},
+	}
+
+	events := []*httpclient.StreamEvent{
+		{
+			Data: mustMarshal(&GenerateContentResponse{
+				ModelVersion: "gemini-2.5-flash",
+				Candidates: []*Candidate{{
+					Index: 0,
+					Content: &Content{
+						Role:  "model",
+						Parts: []*Part{{Text: "第一段"}},
+					},
+				}},
+			}),
+		},
+		{
+			Data: mustMarshal(&GenerateContentResponse{
+				ModelVersion: "gemini-2.5-flash",
+				Candidates: []*Candidate{{
+					Index: 0,
+					Content: &Content{
+						Role:  "model",
+						Parts: []*Part{{Text: "第二段"}},
+					},
+					FinishReason: "STOP",
+				}},
+			}),
+		},
+	}
+
+	stream, err := transformer.TransformStream(context.Background(), nil, streams.SliceStream(events))
+	require.NoError(t, err)
+
+	var responses []*llm.Response
+	for stream.Next() {
+		if response := stream.Current(); response != nil && response.Object != "[DONE]" {
+			responses = append(responses, response)
+		}
+	}
+
+	require.NoError(t, stream.Err())
+	require.Len(t, responses, 2)
+	require.NotEmpty(t, responses[0].ID)
+	require.Equal(t, responses[0].ID, responses[1].ID)
 }
 
 func TestOutboundTransformer_TransformStream_ToolCallIndexAccumulation(t *testing.T) {
@@ -328,7 +380,7 @@ func TestOutboundTransformer_TransformStream_ToolCallIndexAccumulation(t *testin
 	inputStream := streams.SliceStream(events)
 
 	// Transform the stream
-	outputStream, err := transformer.TransformStream(context.Background(), inputStream)
+	outputStream, err := transformer.TransformStream(context.Background(), nil, inputStream)
 	require.NoError(t, err)
 	require.NotNil(t, outputStream)
 
@@ -416,7 +468,7 @@ func TestOutboundTransformer_TransformStream_MultipleToolCallsInSingleEvent(t *t
 	inputStream := streams.SliceStream(events)
 
 	// Transform the stream
-	outputStream, err := transformer.TransformStream(context.Background(), inputStream)
+	outputStream, err := transformer.TransformStream(context.Background(), nil, inputStream)
 	require.NoError(t, err)
 	require.NotNil(t, outputStream)
 
@@ -697,7 +749,7 @@ func TestOutboundTransformer_AggregateStreamChunks(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			data, meta, err := transformer.AggregateStreamChunks(context.Background(), tt.chunks)
+			data, meta, err := transformer.AggregateStreamChunks(context.Background(), nil, tt.chunks)
 
 			if tt.expectedErr {
 				require.Error(t, err)
@@ -867,7 +919,7 @@ func TestOutboundTransformer_StreamTransformation_WithTestData(t *testing.T) {
 			mockStream := streams.SliceStream(geminiEvents)
 
 			// Transform the stream (Gemini -> LLM)
-			transformedStream, err := transformer.TransformStream(t.Context(), mockStream)
+			transformedStream, err := transformer.TransformStream(t.Context(), nil, mockStream)
 			require.NoError(t, err)
 
 			// Collect all transformed responses
@@ -883,7 +935,7 @@ func TestOutboundTransformer_StreamTransformation_WithTestData(t *testing.T) {
 			require.NoError(t, transformedStream.Err())
 
 			// Test aggregation
-			aggregatedBytes, meta, err := transformer.AggregateStreamChunks(t.Context(), geminiEvents)
+			aggregatedBytes, meta, err := transformer.AggregateStreamChunks(t.Context(), nil, geminiEvents)
 			require.NoError(t, err)
 			require.NotEmpty(t, meta.ID)
 

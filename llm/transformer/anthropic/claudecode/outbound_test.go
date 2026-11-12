@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"strings"
 	"testing"
 
+	"github.com/samber/lo"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/tidwall/gjson"
@@ -28,8 +30,8 @@ func TestClaudeCodeTransformer_TransformRequest(t *testing.T) {
 
 		req := &llm.Request{
 			Model:     "claude-sonnet-4-5",
-			Messages:  []llm.Message{{Role: "user", Content: llm.MessageContent{Content: strPtr("Hello")}}},
-			MaxTokens: int64Ptr(1024),
+			Messages:  []llm.Message{{Role: "user", Content: llm.MessageContent{Content: lo.ToPtr("Hello")}}},
+			MaxTokens: lo.ToPtr(int64(1024)),
 		}
 
 		httpReq, err := transformer.TransformRequest(ctx, req)
@@ -41,14 +43,13 @@ func TestClaudeCodeTransformer_TransformRequest(t *testing.T) {
 	})
 
 	t.Run("injects Claude Code system message with cache_control", func(t *testing.T) {
-
 		transformer, err := NewOutboundTransformer(Params{TokenProvider: newMockTokenProvider("test-api-key")})
 		require.NoError(t, err)
 
 		req := &llm.Request{
 			Model:     "claude-sonnet-4-5",
-			Messages:  []llm.Message{{Role: "user", Content: llm.MessageContent{Content: strPtr("Hello")}}},
-			MaxTokens: int64Ptr(1024),
+			Messages:  []llm.Message{{Role: "user", Content: llm.MessageContent{Content: lo.ToPtr("Hello")}}},
+			MaxTokens: lo.ToPtr(int64(1024)),
 		}
 
 		httpReq, err := transformer.TransformRequest(ctx, req)
@@ -66,21 +67,20 @@ func TestClaudeCodeTransformer_TransformRequest(t *testing.T) {
 	})
 
 	t.Run("sets all Claude Code headers", func(t *testing.T) {
-
 		transformer, err := NewOutboundTransformer(Params{TokenProvider: newMockTokenProvider("test-api-key")})
 		require.NoError(t, err)
 
 		req := &llm.Request{
 			Model:     "claude-sonnet-4-5",
-			Messages:  []llm.Message{{Role: "user", Content: llm.MessageContent{Content: strPtr("Hello")}}},
-			MaxTokens: int64Ptr(1024),
+			Messages:  []llm.Message{{Role: "user", Content: llm.MessageContent{Content: lo.ToPtr("Hello")}}},
+			MaxTokens: lo.ToPtr(int64(1024)),
 		}
 
 		httpReq, err := transformer.TransformRequest(ctx, req)
 		require.NoError(t, err)
 
 		// Verify all Claude Code headers
-		assert.Contains(t, httpReq.Headers.Get("Anthropic-Beta"), "claude-code-20250219")
+		assert.Contains(t, httpReq.Headers.Get("Anthropic-Beta"), "interleaved-thinking-2025-05-14")
 		assert.Equal(t, "2023-06-01", httpReq.Headers.Get("Anthropic-Version"))
 		assert.Equal(t, "true", httpReq.Headers.Get("Anthropic-Dangerous-Direct-Browser-Access"))
 		assert.Equal(t, "cli", httpReq.Headers.Get("X-App"))
@@ -89,14 +89,13 @@ func TestClaudeCodeTransformer_TransformRequest(t *testing.T) {
 	})
 
 	t.Run("adds beta=true query parameter", func(t *testing.T) {
-
 		transformer, err := NewOutboundTransformer(Params{TokenProvider: newMockTokenProvider("test-api-key")})
 		require.NoError(t, err)
 
 		req := &llm.Request{
 			Model:     "claude-sonnet-4-5",
-			Messages:  []llm.Message{{Role: "user", Content: llm.MessageContent{Content: strPtr("Hello")}}},
-			MaxTokens: int64Ptr(1024),
+			Messages:  []llm.Message{{Role: "user", Content: llm.MessageContent{Content: lo.ToPtr("Hello")}}},
+			MaxTokens: lo.ToPtr(int64(1024)),
 		}
 
 		httpReq, err := transformer.TransformRequest(ctx, req)
@@ -106,14 +105,16 @@ func TestClaudeCodeTransformer_TransformRequest(t *testing.T) {
 	})
 
 	t.Run("applies tool prefix for OAuth tokens from non-CLI clients", func(t *testing.T) {
-
-		transformer, err := NewOutboundTransformer(Params{TokenProvider: newMockTokenProvider("sk-ant-oat01-test-oauth-token")})
+		transformer, err := NewOutboundTransformer(Params{
+			TokenProvider: newMockTokenProvider("sk-ant-oat01-test-oauth-token"),
+			IsOfficial:    true,
+		})
 		require.NoError(t, err)
 
 		req := &llm.Request{
 			Model:     "claude-sonnet-4-5",
-			Messages:  []llm.Message{{Role: "user", Content: llm.MessageContent{Content: strPtr("Hello")}}},
-			MaxTokens: int64Ptr(1024),
+			Messages:  []llm.Message{{Role: "user", Content: llm.MessageContent{Content: lo.ToPtr("Hello")}}},
+			MaxTokens: lo.ToPtr(int64(1024)),
 			Tools: []llm.Tool{
 				{
 					Type:     "function",
@@ -134,14 +135,13 @@ func TestClaudeCodeTransformer_TransformRequest(t *testing.T) {
 	})
 
 	t.Run("does not apply tool prefix for Claude CLI clients", func(t *testing.T) {
-
 		transformer, err := NewOutboundTransformer(Params{TokenProvider: newMockTokenProvider("sk-ant-oat01-test-oauth-token")})
 		require.NoError(t, err)
 
 		req := &llm.Request{
 			Model:     "claude-sonnet-4-5",
-			Messages:  []llm.Message{{Role: "user", Content: llm.MessageContent{Content: strPtr("Hello")}}},
-			MaxTokens: int64Ptr(1024),
+			Messages:  []llm.Message{{Role: "user", Content: llm.MessageContent{Content: lo.ToPtr("Hello")}}},
+			MaxTokens: lo.ToPtr(int64(1024)),
 			Tools: []llm.Tool{
 				{
 					Type:     "function",
@@ -165,14 +165,13 @@ func TestClaudeCodeTransformer_TransformRequest(t *testing.T) {
 	})
 
 	t.Run("injects fake user ID", func(t *testing.T) {
-
 		transformer, err := NewOutboundTransformer(Params{TokenProvider: newMockTokenProvider("test-api-key")})
 		require.NoError(t, err)
 
 		req := &llm.Request{
 			Model:     "claude-sonnet-4-5",
-			Messages:  []llm.Message{{Role: "user", Content: llm.MessageContent{Content: strPtr("Hello")}}},
-			MaxTokens: int64Ptr(1024),
+			Messages:  []llm.Message{{Role: "user", Content: llm.MessageContent{Content: lo.ToPtr("Hello")}}},
+			MaxTokens: lo.ToPtr(int64(1024)),
 		}
 
 		httpReq, err := transformer.TransformRequest(ctx, req)
@@ -181,19 +180,86 @@ func TestClaudeCodeTransformer_TransformRequest(t *testing.T) {
 		// Should have generated user ID
 		userID := gjson.GetBytes(httpReq.Body, "metadata.user_id").String()
 		assert.NotEmpty(t, userID)
-		assert.True(t, isValidUserID(userID))
+		assert.NotNil(t, ParseUserID(userID))
+	})
+
+	t.Run("preserves billing message when middleware is not applied", func(t *testing.T) {
+		transformer, err := NewOutboundTransformer(Params{
+			TokenProvider: newMockTokenProvider("test-api-key"),
+			IsOfficial:    false,
+		})
+		require.NoError(t, err)
+
+		billingMsg := "x-anthropic-billing-header: cc_version=2.1.37.fbe; cc_entrypoint=cli; cch=38a80;"
+		req := &llm.Request{
+			Model: "claude-sonnet-4-5",
+			Messages: []llm.Message{
+				{Role: "system", Content: llm.MessageContent{Content: &billingMsg}},
+				{Role: "user", Content: llm.MessageContent{Content: lo.ToPtr("Hello")}},
+			},
+			MaxTokens: lo.ToPtr(int64(1024)),
+		}
+
+		httpReq, err := transformer.TransformRequest(ctx, req)
+		require.NoError(t, err)
+
+		system := gjson.GetBytes(httpReq.Body, "system")
+		require.True(t, system.Exists())
+
+		foundBilling := false
+		for _, item := range system.Array() {
+			if strings.Contains(item.Get("text").String(), "x-anthropic-billing-header") {
+				foundBilling = true
+				assert.Contains(t, item.Get("text").String(), "cch=38a80;")
+			}
+		}
+		assert.True(t, foundBilling)
+	})
+
+	t.Run("preserves billing cch when official", func(t *testing.T) {
+		transformer, err := NewOutboundTransformer(Params{
+			TokenProvider: newMockTokenProvider("test-api-key"),
+			IsOfficial:    true,
+		})
+		require.NoError(t, err)
+
+		billingMsg := "x-anthropic-billing-header: cc_version=2.1.42.c31; cc_entrypoint=cli; cch=38a80;"
+		req := &llm.Request{
+			Model: "claude-sonnet-4-5",
+			Messages: []llm.Message{
+				{Role: "system", Content: llm.MessageContent{Content: &billingMsg}},
+				{Role: "user", Content: llm.MessageContent{Content: lo.ToPtr("Hello")}},
+			},
+			MaxTokens: lo.ToPtr(int64(1024)),
+		}
+
+		httpReq, err := transformer.TransformRequest(ctx, req)
+		require.NoError(t, err)
+
+		system := gjson.GetBytes(httpReq.Body, "system")
+		require.True(t, system.Exists())
+
+		foundCCH := false
+
+		for _, item := range system.Array() {
+			if strings.Contains(item.Get("text").String(), "x-anthropic-billing-header") &&
+				strings.Contains(item.Get("text").String(), "cch=38a80;") {
+				foundCCH = true
+			}
+		}
+
+		assert.True(t, foundCCH, "official channels should preserve the original billing cch")
 	})
 
 	t.Run("disables thinking when tool_choice forces tool use", func(t *testing.T) {
-
 		transformer, err := NewOutboundTransformer(Params{TokenProvider: newMockTokenProvider("test-api-key")})
 		require.NoError(t, err)
 
 		toolChoiceAny := "any"
 		req := &llm.Request{
 			Model:     "claude-sonnet-4-5",
-			Messages:  []llm.Message{{Role: "user", Content: llm.MessageContent{Content: strPtr("Hello")}}},
-			MaxTokens: int64Ptr(1024),
+			Messages:  []llm.Message{{Role: "user", Content: llm.MessageContent{Content: lo.ToPtr("Hello")}}},
+			MaxTokens: lo.ToPtr(int64(1024)),
 			Tools: []llm.Tool{
 				{
 					Type:     "function",
@@ -220,11 +286,34 @@ func TestClaudeCodeTransformer_TransformRequest(t *testing.T) {
 	})
 }
 
+func TestRemoveBillingSystemMessages(t *testing.T) {
+	billing := "  X-Anthropic-Billing-Header: cc_version=2.1.42;"
+	keep := "keep"
+	userBilling := "x-anthropic-billing-header: user text"
+	req := &llm.Request{Messages: []llm.Message{
+		{Role: "system", Content: llm.MessageContent{Content: &billing}},
+		{Role: "user", Content: llm.MessageContent{Content: &userBilling}},
+		{Role: "system", Content: llm.MessageContent{MultipleContent: []llm.MessageContentPart{
+			{Type: "text", Text: &billing},
+			{Type: "text", Text: &keep},
+		}}},
+	}}
+
+	result := RemoveBillingSystemMessages(req)
+
+	require.NotSame(t, req, result)
+	require.Len(t, result.Messages, 2)
+	require.Equal(t, "user", result.Messages[0].Role)
+	require.Len(t, result.Messages[1].Content.MultipleContent, 1)
+	require.Equal(t, keep, *result.Messages[1].Content.MultipleContent[0].Text)
+	require.Len(t, req.Messages, 3, "the shared inbound request must not be mutated")
+	require.Len(t, req.Messages[2].Content.MultipleContent, 2)
+}
+
 func TestClaudeCodeTransformer_TransformResponse(t *testing.T) {
 	ctx := context.Background()
 
 	t.Run("strips tool prefix when it was applied", func(t *testing.T) {
-
 		transformer, err := NewOutboundTransformer(Params{TokenProvider: newMockTokenProvider("test-api-key")})
 		require.NoError(t, err)
 
@@ -267,7 +356,6 @@ func TestClaudeCodeTransformer_TransformResponse(t *testing.T) {
 	})
 
 	t.Run("does not strip when prefix was not applied", func(t *testing.T) {
-
 		transformer, err := NewOutboundTransformer(Params{TokenProvider: newMockTokenProvider("test-api-key")})
 		require.NoError(t, err)
 
@@ -335,11 +423,12 @@ func TestClaudeCodeTransformer_TransformStream(t *testing.T) {
 		mockStream := newMockHTTPStream(events)
 
 		// Transform the stream
-		llmStream, err := transformer.TransformStream(ctx, mockStream)
+		llmStream, err := transformer.TransformStream(ctx, nil, mockStream)
 		require.NoError(t, err)
 
 		// Read from the stream and verify prefix is stripped
 		responses := []*llm.Response{}
+
 		for llmStream.Next() {
 			resp := llmStream.Current()
 			if resp != nil {
@@ -351,13 +440,16 @@ func TestClaudeCodeTransformer_TransformStream(t *testing.T) {
 
 		// Verify we got responses and tool names are stripped
 		require.NotEmpty(t, responses)
+
 		foundToolCall := false
+
 		for _, resp := range responses {
 			for _, choice := range resp.Choices {
 				if choice.Delta != nil && len(choice.Delta.ToolCalls) > 0 {
 					for _, toolCall := range choice.Delta.ToolCalls {
 						if toolCall.Function.Name != "" {
 							foundToolCall = true
+
 							assert.Equal(t, "bash", toolCall.Function.Name, "tool prefix should be stripped")
 							assert.NotContains(t, toolCall.Function.Name, "proxy_", "proxy_ prefix should be removed")
 						}
@@ -365,6 +457,7 @@ func TestClaudeCodeTransformer_TransformStream(t *testing.T) {
 				}
 			}
 		}
+
 		assert.True(t, foundToolCall, "should have found at least one tool call")
 	})
 
@@ -387,33 +480,23 @@ func TestClaudeCodeTransformer_TransformStream(t *testing.T) {
 		}
 
 		mockStream := newMockHTTPStream(events)
-		llmStream, err := transformer.TransformStream(ctx, mockStream)
+		llmStream, err := transformer.TransformStream(ctx, nil, mockStream)
 		require.NoError(t, err)
 
 		// Should not error
 		for llmStream.Next() {
 			_ = llmStream.Current()
 		}
+
 		require.NoError(t, llmStream.Err())
 	})
 }
 
 func TestClaudeCodeTransformer_APIFormat(t *testing.T) {
-
 	transformer, err := NewOutboundTransformer(Params{TokenProvider: newMockTokenProvider("test-api-key")})
 	require.NoError(t, err)
 
 	assert.Equal(t, llm.APIFormatAnthropicMessage, transformer.APIFormat())
-}
-
-// Helper functions
-
-func strPtr(s string) *string {
-	return &s
-}
-
-func int64Ptr(i int64) *int64 {
-	return &i
 }
 
 func mustMarshal(v any) []byte {
@@ -443,7 +526,7 @@ func (t *fakeOutbound) TransformResponse(_ context.Context, _ *httpclient.Respon
 	return nil, nil
 }
 
-func (t *fakeOutbound) TransformStream(_ context.Context, _ streams.Stream[*httpclient.StreamEvent]) (streams.Stream[*llm.Response], error) {
+func (t *fakeOutbound) TransformStream(_ context.Context, _ *httpclient.Request, _ streams.Stream[*httpclient.StreamEvent]) (streams.Stream[*llm.Response], error) {
 	return nil, nil
 }
 
@@ -451,13 +534,13 @@ func (t *fakeOutbound) TransformError(_ context.Context, _ *httpclient.Error) *l
 	return nil
 }
 
-func (t *fakeOutbound) AggregateStreamChunks(_ context.Context, _ []*httpclient.StreamEvent) ([]byte, llm.ResponseMeta, error) {
+func (t *fakeOutbound) AggregateStreamChunks(_ context.Context, _ *httpclient.Request, _ []*httpclient.StreamEvent) ([]byte, llm.ResponseMeta, error) {
 	return nil, llm.ResponseMeta{}, nil
 }
 
 var _ llmtransformer.Outbound = (*fakeOutbound)(nil)
 
-// mockTokenProvider is a test implementation of oauth.TokenGetter
+// mockTokenProvider is a test implementation of oauth.TokenGetter.
 type mockTokenProvider struct {
 	accessToken string
 }
@@ -474,7 +557,7 @@ func newMockTokenProvider(token string) *mockTokenProvider {
 	return &mockTokenProvider{accessToken: token}
 }
 
-// mockHTTPStream is a simple mock implementation of streams.Stream[*httpclient.StreamEvent]
+// mockHTTPStream is a simple mock implementation of streams.Stream[*httpclient.StreamEvent].
 type mockHTTPStream struct {
 	events  []*httpclient.StreamEvent
 	index   int
@@ -493,7 +576,9 @@ func (m *mockHTTPStream) Next() bool {
 	if m.index >= len(m.events) {
 		return false
 	}
+
 	m.current = m.events[m.index]
+
 	return true
 }
 
@@ -508,4 +593,3 @@ func (m *mockHTTPStream) Err() error {
 func (m *mockHTTPStream) Close() error {
 	return nil
 }
-

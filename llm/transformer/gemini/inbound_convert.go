@@ -7,10 +7,10 @@ import (
 	"github.com/google/jsonschema-go/jsonschema"
 	"github.com/samber/lo"
 
-	"github.com/looplj/axonhub/internal/pkg/xjson"
-	"github.com/looplj/axonhub/internal/pkg/xmap"
-	"github.com/looplj/axonhub/internal/pkg/xurl"
 	"github.com/looplj/axonhub/llm"
+	"github.com/looplj/axonhub/llm/internal/pkg/xjson"
+	"github.com/looplj/axonhub/llm/internal/pkg/xmap"
+	"github.com/looplj/axonhub/llm/internal/pkg/xurl"
 	geminioai "github.com/looplj/axonhub/llm/transformer/gemini/openai"
 )
 
@@ -95,12 +95,11 @@ func convertGeminiToLLMRequest(geminiReq *GenerateContentRequest) (*llm.Request,
 			chatReq.Modalities = convertGeminiModalitiesToLLM(gc.ResponseModalities)
 		}
 
-		// Convert ResponseSchema to ResponseFormat json_schema
-		if len(gc.ResponseSchema) > 0 {
-			chatReq.ResponseFormat = &llm.ResponseFormat{
-				Type:       "json_schema",
-				JSONSchema: gc.ResponseSchema,
-			}
+		// Convert ResponseSchema/ResponseJsonSchema to ResponseFormat json_schema
+		if len(gc.ResponseJsonSchema) > 0 {
+			chatReq.ResponseFormat = geminiJSONSchemaResponseFormat(gc.ResponseJsonSchema)
+		} else if len(gc.ResponseSchema) > 0 {
+			chatReq.ResponseFormat = geminiJSONSchemaResponseFormat(gc.ResponseSchema)
 		} else if gc.ResponseMIMEType == "application/json" {
 			// If only ResponseMIMEType is set to JSON, use json_object
 			chatReq.ResponseFormat = &llm.ResponseFormat{
@@ -126,14 +125,11 @@ func convertGeminiToLLMRequest(geminiReq *GenerateContentRequest) (*llm.Request,
 
 	// Convert contents to messages
 	for i, content := range geminiReq.Contents {
-		msg, err := convertGeminiContentToLLMMessage(content, geminiReq.Contents[:i])
+		converted, err := convertGeminiContentToLLMMessages(content, geminiReq.Contents[:i])
 		if err != nil {
 			return nil, err
 		}
-
-		if msg != nil {
-			messages = append(messages, *msg)
-		}
+		messages = append(messages, converted...)
 	}
 
 	chatReq.Messages = messages
@@ -229,7 +225,103 @@ func convertGeminiToLLMRequest(geminiReq *GenerateContentRequest) (*llm.Request,
 		chatReq.ToolChoice = convertGeminiFunctionCallingConfigToToolChoice(fcc)
 	}
 
+	// Convert safety settings to TransformerMetadata
+	if len(geminiReq.SafetySettings) > 0 {
+		if chatReq.TransformerMetadata == nil {
+			chatReq.TransformerMetadata = make(map[string]any)
+		}
+
+		chatReq.TransformerMetadata[TransformerMetadataKeySafetySettings] = geminiReq.SafetySettings
+	}
+
+	// Convert image config to TransformerMetadata
+	if geminiReq.GenerationConfig != nil && geminiReq.GenerationConfig.ImageConfig != nil {
+		if chatReq.TransformerMetadata == nil {
+			chatReq.TransformerMetadata = make(map[string]any)
+		}
+
+		chatReq.TransformerMetadata[TransformerMetadataKeyImageConfig] = geminiReq.GenerationConfig.ImageConfig
+	}
+
 	return chatReq, nil
+}
+
+func convertGeminiContentToLLMMessages(content *Content, previousContents []*Content) ([]llm.Message, error) {
+	if content == nil {
+		return nil, nil
+	}
+
+	hasFunctionResponse := false
+	for _, part := range content.Parts {
+		if part != nil && part.FunctionResponse != nil {
+			hasFunctionResponse = true
+			break
+		}
+	}
+	if !hasFunctionResponse || len(content.Parts) == 1 {
+		msg, err := convertGeminiContentToLLMMessage(content, previousContents)
+		if err != nil || msg == nil {
+			return nil, err
+		}
+		return []llm.Message{*msg}, nil
+	}
+
+	messages := make([]llm.Message, 0, len(content.Parts))
+	regularParts := make([]*Part, 0, len(content.Parts))
+	flushRegularParts := func() error {
+		if len(regularParts) == 0 {
+			return nil
+		}
+		msg, err := convertGeminiContentToLLMMessage(&Content{Role: content.Role, Parts: regularParts}, previousContents)
+		if err != nil {
+			return err
+		}
+		if msg != nil {
+			messages = append(messages, *msg)
+		}
+		regularParts = nil
+		return nil
+	}
+
+	for _, part := range content.Parts {
+		if part == nil {
+			continue
+		}
+		if part.FunctionResponse == nil {
+			regularParts = append(regularParts, part)
+			continue
+		}
+		if err := flushRegularParts(); err != nil {
+			return nil, err
+		}
+		msg, err := convertGeminiContentToLLMMessage(&Content{Role: content.Role, Parts: []*Part{part}}, previousContents)
+		if err != nil {
+			return nil, err
+		}
+		if msg != nil {
+			messages = append(messages, *msg)
+		}
+	}
+	if err := flushRegularParts(); err != nil {
+		return nil, err
+	}
+
+	return messages, nil
+}
+
+func geminiJSONSchemaResponseFormat(schema json.RawMessage) *llm.ResponseFormat {
+	wrapper, _ := json.Marshal(struct {
+		Name   string          `json:"name"`
+		Schema json.RawMessage `json:"schema"`
+	}{
+		Name:   "gemini_response",
+		Schema: schema,
+	})
+
+	return &llm.ResponseFormat{
+		Type:       "json_schema",
+		JSONSchema: wrapper,
+	}
 }
 
 func convertGeminiThinkingConfigToGeminiOpenAIExtraBody(thinkingConfig *ThinkingConfig) (json.RawMessage, error) {
@@ -308,19 +400,40 @@ func convertGeminiContentToLLMMessage(content *Content, previousContents []*Cont
 						MIMEType: part.InlineData.MIMEType,
 					},
 				})
+			} else if isVideoMIMEType(part.InlineData.MIMEType) {
+				textParts = append(textParts, llm.MessageContentPart{
+					Type: "video_url",
+					VideoURL: &llm.VideoURL{
+						URL:      dataURL,
+						MIMEType: part.InlineData.MIMEType,
+					},
+				})
+			} else if isAudioMIMEType(part.InlineData.MIMEType) {
+				textParts = append(textParts, llm.MessageContentPart{
+					Type: "input_audio",
+					InputAudio: &llm.InputAudio{
+						Format:   audioMIMETypeToFormat(part.InlineData.MIMEType),
+						Data:     part.InlineData.Data,
+						MIMEType: part.InlineData.MIMEType,
+					},
+				})
 			} else {
 				// Image type
 				textParts = append(textParts, llm.MessageContentPart{
 					Type: "image_url",
 					ImageURL: &llm.ImageURL{
-						URL: dataURL,
+						URL:      dataURL,
+						MIMEType: part.InlineData.MIMEType,
 					},
 				})
 			}
 
 		case part.FileData != nil:
 			// Convert file data based on MIME type or URL extension
-			mimeType := part.FileData.MIMEType
+			mimeType := mediaMIMEType(part.FileData.MIMEType, part.FileData.FileURI, func(mediaType string) bool {
+				return isDocumentMIMEType(mediaType) || isVideoMIMEType(mediaType) ||
+					isAudioMIMEType(mediaType) || strings.HasPrefix(mediaType, "image/")
+			})
 			if isDocumentMIMEType(mimeType) {
 				// Document type (PDF, Word, etc.)
 				textParts = append(textParts, llm.MessageContentPart{
@@ -330,18 +443,40 @@ func convertGeminiContentToLLMMessage(content *Content, previousContents []*Cont
 						MIMEType: mimeType,
 					},
 				})
+			} else if isVideoMIMEType(mimeType) {
+				textParts = append(textParts, llm.MessageContentPart{
+					Type: "video_url",
+					VideoURL: &llm.VideoURL{
+						URL:      part.FileData.FileURI,
+						MIMEType: mimeType,
+					},
+				})
+			} else if isAudioMIMEType(mimeType) {
+				textParts = append(textParts, llm.MessageContentPart{
+					Type: "input_audio",
+					InputAudio: &llm.InputAudio{
+						Format:   audioMIMETypeToFormat(mimeType),
+						URL:      part.FileData.FileURI,
+						MIMEType: mimeType,
+					},
+				})
 			} else {
 				// Image type
 				textParts = append(textParts, llm.MessageContentPart{
 					Type: "image_url",
 					ImageURL: &llm.ImageURL{
-						URL: part.FileData.FileURI,
+						URL:      part.FileData.FileURI,
+						MIMEType: mimeType,
 					},
 				})
 			}
 
 		case part.FunctionCall != nil:
-			argsJSON, _ := json.Marshal(part.FunctionCall.Args)
+			argsJSON := []byte("{}")
+			if part.FunctionCall.Args != nil {
+				argsJSON, _ = json.Marshal(part.FunctionCall.Args)
+			}
+
 			tc := llm.ToolCall{
 				ID:   part.FunctionCall.ID,
 				Type: "function",
@@ -350,7 +485,7 @@ func convertGeminiContentToLLMMessage(content *Content, previousContents []*Cont
 					Arguments: string(argsJSON),
 				},
 			}
-
+			setInboundToolCallThoughtSignature(&tc, part.ThoughtSignature)
 			toolCalls = append(toolCalls, tc)
 
 		case part.FunctionResponse != nil:
@@ -396,6 +531,34 @@ func convertGeminiContentToLLMMessage(content *Content, previousContents []*Cont
 	}
 
 	return msg, nil
+}
+
+func citationMetadataFromLLMAnnotations(annotations []llm.Annotation) *CitationMetadata {
+	citations := make([]*Citation, 0, len(annotations))
+	for _, ann := range annotations {
+		if ann.URLCitation == nil || ann.URLCitation.URL == "" {
+			continue
+		}
+
+		citation := &Citation{
+			URI:   ann.URLCitation.URL,
+			Title: ann.URLCitation.Title,
+		}
+		if ann.StartIndex != nil {
+			citation.StartIndex = *ann.StartIndex
+		}
+		if ann.EndIndex != nil {
+			citation.EndIndex = *ann.EndIndex
+		}
+
+		citations = append(citations, citation)
+	}
+
+	if len(citations) == 0 {
+		return nil
+	}
+
+	return &CitationMetadata{Citations: citations}
 }
 
 // convertLLMToGeminiResponse converts unified Response to Gemini GenerateContentResponse.
@@ -489,7 +652,15 @@ func convertLLMChoiceToGeminiCandidate(choice *llm.Choice, isStream bool) *Candi
 				case "image_url":
 					// Handle image_url type
 					if part.ImageURL != nil && part.ImageURL.URL != "" {
-						geminiPart := convertImageURLToGeminiPart(part.ImageURL.URL)
+						geminiPart := convertImageURLToGeminiPart(part.ImageURL)
+						if geminiPart != nil {
+							parts = append(parts, geminiPart)
+							lastPart = geminiPart
+						}
+					}
+				case "video_url":
+					if part.VideoURL != nil && part.VideoURL.URL != "" {
+						geminiPart := convertVideoURLToGeminiPart(part.VideoURL)
 						if geminiPart != nil {
 							parts = append(parts, geminiPart)
 							lastPart = geminiPart
@@ -508,6 +679,8 @@ func convertLLMChoiceToGeminiCandidate(choice *llm.Choice, isStream bool) *Candi
 			}
 		}
 
+		hasToolCallThoughtSignature := false
+
 		for _, toolCall := range msg.ToolCalls {
 			var args map[string]any
 			if toolCall.Function.Arguments != "" {
@@ -521,6 +694,10 @@ func convertLLMChoiceToGeminiCandidate(choice *llm.Choice, isStream bool) *Candi
 					Args: args,
 				},
 			}
+			if signature := getInboundGeminiToolCallThoughtSignature(toolCall); signature != nil {
+				part.ThoughtSignature = *signature
+				hasToolCallThoughtSignature = true
+			}
 
 			parts = append(parts, part)
 
@@ -530,21 +707,22 @@ func convertLLMChoiceToGeminiCandidate(choice *llm.Choice, isStream bool) *Candi
 			}
 		}
 
-		msgThoughtSignature := msg.ReasoningSignature
-		if len(msg.ToolCalls) > 0 && msgThoughtSignature == nil {
-			msgThoughtSignature = lo.ToPtr("context_engineering_is_the_way_to_go")
-		}
-
-		if msgThoughtSignature != nil && lastPart != nil {
+		if !hasToolCallThoughtSignature && msg.ReasoningSignature != nil {
 			if firstFunctionCallPart != nil {
-				firstFunctionCallPart.ThoughtSignature = *msgThoughtSignature
-			} else {
-				lastPart.ThoughtSignature = *msgThoughtSignature
+				firstFunctionCallPart.ThoughtSignature = *msg.ReasoningSignature
+			} else if lastPart != nil {
+				lastPart.ThoughtSignature = *msg.ReasoningSignature
 			}
 		}
 
 		content.Parts = parts
 		candidate.Content = content
+	}
+
+	if gm := xmap.GetPtr[GroundingMetadata](choice.TransformerMetadata, TransformerMetadataKeyGroundingMetadata); gm != nil {
+		candidate.GroundingMetadata = gm
+	} else if msg != nil && len(msg.Annotations) > 0 {
+		candidate.CitationMetadata = citationMetadataFromLLMAnnotations(msg.Annotations)
 	}
 
 	// Convert finish reason

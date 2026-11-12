@@ -2,15 +2,15 @@ package gemini
 
 import (
 	"encoding/json"
+	"fmt"
 	"strings"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/samber/lo"
 
-	"github.com/looplj/axonhub/internal/pkg/xjson"
-	"github.com/looplj/axonhub/internal/pkg/xurl"
 	"github.com/looplj/axonhub/llm"
+	"github.com/looplj/axonhub/llm/internal/pkg/xurl"
 	geminioai "github.com/looplj/axonhub/llm/transformer/gemini/openai"
 	"github.com/looplj/axonhub/llm/transformer/shared"
 )
@@ -20,8 +20,6 @@ func convertLLMToGeminiRequest(chatReq *llm.Request) *GenerateContentRequest {
 	return convertLLMToGeminiRequestWithConfig(chatReq, nil)
 }
 
-// convertLLMToGeminiRequestWithConfig converts unified Request to Gemini GenerateContentRequest with config.
-//
 //nolint:maintidx // Checked.
 func convertLLMToGeminiRequestWithConfig(chatReq *llm.Request, config *Config) *GenerateContentRequest {
 	req := &GenerateContentRequest{}
@@ -157,6 +155,9 @@ func convertLLMToGeminiRequestWithConfig(chatReq *llm.Request, config *Config) *
 			switch strings.ToLower(chatReq.ReasoningEffort) {
 			case "none", "low", "medium", "high":
 				thinkingConfig.ThinkingLevel = chatReq.ReasoningEffort
+			case "xhigh":
+				// "xhigh" comes from Anthropic "max"; Gemini's highest level is "high".
+				thinkingConfig.ThinkingLevel = "high"
 			default:
 				// For non-standard effort values, convert to budget
 				thinkingBudget := reasoningEffortToThinkingBudgetWithConfig(chatReq.ReasoningEffort, config)
@@ -177,7 +178,7 @@ func convertLLMToGeminiRequestWithConfig(chatReq *llm.Request, config *Config) *
 	// Convert ResponseFormat to ResponseSchema and ResponseMIMEType
 	if chatReq.ResponseFormat != nil {
 		if chatReq.ResponseFormat.Type == "json_schema" && len(chatReq.ResponseFormat.JSONSchema) > 0 {
-			gc.ResponseSchema = chatReq.ResponseFormat.JSONSchema
+			gc.ResponseJsonSchema = extractJSONSchema(chatReq.ResponseFormat.JSONSchema)
 			gc.ResponseMIMEType = "application/json"
 			hasGenerationConfig = true
 		} else if chatReq.ResponseFormat.Type == "json_object" {
@@ -213,9 +214,12 @@ func convertLLMToGeminiRequestWithConfig(chatReq *llm.Request, config *Config) *
 
 		case "tool":
 			// Tool response - need to find the corresponding function call
-			content := convertLLMToolResultToGeminiContent(&msg, contents)
-			if content != nil {
-				contents = append(contents, content)
+			// Group consecutive tool messages into a single Content entry
+			toolContent := convertLLMToolResultToGeminiContent(&msg, contents)
+			if isPreviousContentToolResponse(contents) {
+				contents[len(contents)-1].Parts = append(contents[len(contents)-1].Parts, toolContent.Parts...)
+			} else {
+				contents = append(contents, toolContent)
 			}
 
 		default:
@@ -257,10 +261,11 @@ func convertLLMToGeminiRequestWithConfig(chatReq *llm.Request, config *Config) *
 					tools = append(tools, functionTool)
 				}
 
-			case llm.ToolTypeGoogleSearch:
-				if tool.Google != nil && tool.Google.Search != nil {
-					tools = append(tools, &Tool{GoogleSearch: &GoogleSearch{}})
+			case llm.ToolTypeGoogleSearch, llm.ToolTypeWebSearch:
+				if tool.Type == llm.ToolTypeGoogleSearch && (tool.Google == nil || tool.Google.Search == nil) {
+					break
 				}
+				tools = append(tools, &Tool{GoogleSearch: &GoogleSearch{}})
 
 			case llm.ToolTypeGoogleCodeExecution:
 				if tool.Google != nil && tool.Google.CodeExecution != nil {
@@ -288,18 +293,41 @@ func convertLLMToGeminiRequestWithConfig(chatReq *llm.Request, config *Config) *
 		req.ToolConfig = convertLLMToolChoiceToGeminiToolConfig(chatReq.ToolChoice)
 	}
 
+	if hasStrictFunctionTool(chatReq.Tools) {
+		if req.ToolConfig == nil {
+			req.ToolConfig = &ToolConfig{
+				FunctionCallingConfig: &FunctionCallingConfig{Mode: "VALIDATED"},
+			}
+		} else if req.ToolConfig.FunctionCallingConfig.Mode == "AUTO" {
+			req.ToolConfig.FunctionCallingConfig.Mode = "VALIDATED"
+		}
+	}
+
+	// Convert safety settings from TransformerMetadata
+	if safetySettings := extractSafetySettingsFromMetadata(chatReq.TransformerMetadata); len(safetySettings) > 0 {
+		req.SafetySettings = safetySettings
+	}
+
+	// Convert image config from TransformerMetadata
+	if imageConfig := extractImageConfigFromMetadata(chatReq.TransformerMetadata); imageConfig != nil {
+		if req.GenerationConfig == nil {
+			req.GenerationConfig = &GenerationConfig{}
+		}
+
+		req.GenerationConfig.ImageConfig = imageConfig
+	}
+
 	return req
 }
 
-// Handle both parameter formats
-// Priority: if ParametersJsonSchema is present, use it; otherwise use Parameters.
-func cleanSchema(schema json.RawMessage) json.RawMessage {
-	cleaned, err := xjson.CleanSchema(schema, "$schema", "additionalProperties", "")
-	if err != nil {
-		return schema // ignore error and use original
+func hasStrictFunctionTool(tools []llm.Tool) bool {
+	for _, tool := range tools {
+		if tool.Type == llm.ToolTypeFunction && tool.Function.Strict != nil && *tool.Function.Strict {
+			return true
+		}
 	}
 
-	return cleaned
+	return false
 }
 
 // convertLLMMessageToGeminiContent converts an LLM Message to Gemini Content.
@@ -319,11 +347,12 @@ func convertLLMMessageToGeminiContent(msg *llm.Message) *Content {
 		lastPart              *Part
 	)
 
-	// Add reasoning content (thinking) first if present
+	// Add reasoning content (thinking) first if present.
+	reasoningContent := msg.ReasoningContent
 
-	if msg.ReasoningContent != nil && *msg.ReasoningContent != "" {
+	if reasoningContent != nil && *reasoningContent != "" {
 		p := &Part{
-			Text:    *msg.ReasoningContent,
+			Text:    *reasoningContent,
 			Thought: true,
 		}
 		parts = append(parts, p)
@@ -347,7 +376,15 @@ func convertLLMMessageToGeminiContent(msg *llm.Message) *Content {
 			case "image_url":
 				// Handle image_url type
 				if part.ImageURL != nil && part.ImageURL.URL != "" {
-					geminiPart := convertImageURLToGeminiPart(part.ImageURL.URL)
+					geminiPart := convertImageURLToGeminiPart(part.ImageURL)
+					if geminiPart != nil {
+						parts = append(parts, geminiPart)
+						lastPart = geminiPart
+					}
+				}
+			case "video_url":
+				if part.VideoURL != nil && part.VideoURL.URL != "" {
+					geminiPart := convertVideoURLToGeminiPart(part.VideoURL)
 					if geminiPart != nil {
 						parts = append(parts, geminiPart)
 						lastPart = geminiPart
@@ -357,6 +394,14 @@ func convertLLMMessageToGeminiContent(msg *llm.Message) *Content {
 				// Handle document type (PDF, Word, etc.)
 				if part.Document != nil && part.Document.URL != "" {
 					geminiPart := convertDocumentURLToGeminiPart(part.Document)
+					if geminiPart != nil {
+						parts = append(parts, geminiPart)
+						lastPart = geminiPart
+					}
+				}
+			case "input_audio":
+				if part.InputAudio != nil && (part.InputAudio.Data != "" || part.InputAudio.URL != "") {
+					geminiPart := convertAudioToGeminiPart(part.InputAudio)
 					if geminiPart != nil {
 						parts = append(parts, geminiPart)
 						lastPart = geminiPart
@@ -377,6 +422,8 @@ func convertLLMMessageToGeminiContent(msg *llm.Message) *Content {
 	//         Gemini 3 Pro will have the signature on the last part if the model generates a thought.
 	//         Gemini 2.5 won't have a signature in any part.
 
+	hasToolCallThoughtSignature := false
+
 	// Add tool calls
 	for _, toolCall := range msg.ToolCalls {
 		var args map[string]any
@@ -391,6 +438,10 @@ func convertLLMMessageToGeminiContent(msg *llm.Message) *Content {
 				Args: args,
 			},
 		}
+		if signature := getOutbountGeminiToolCallThoughtSignature(toolCall); signature != nil {
+			part.ThoughtSignature = *signature
+			hasToolCallThoughtSignature = true
+		}
 
 		parts = append(parts, part)
 
@@ -400,21 +451,24 @@ func convertLLMMessageToGeminiContent(msg *llm.Message) *Content {
 		}
 	}
 
-	// https://ai.google.dev/gemini-api/docs/gemini-3#migrating_from_other_models
-	// If there are tool calls but no thought signature, use a default one.
-	// This field is not compatible with OpenAI sdk, so we use the default value.
-	// We try the best to support this fields to keep this fields in the chat conversions, so we use the ReasoningSignature to hold the field,
-	// And this field will be preserved during claude code trace, will not degrade the gemini model performance.
-	msgThoughtSignature := shared.DecodeGeminiThoughtSignature(msg.ReasoningSignature)
-	if len(msg.ToolCalls) > 0 && msgThoughtSignature == nil {
-		msgThoughtSignature = lo.ToPtr("context_engineering_is_the_way_to_go")
-	}
+	if !hasToolCallThoughtSignature {
+		// https://ai.google.dev/gemini-api/docs/gemini-3#migrating_from_other_models
+		// If there are tool calls but no thought signature, use a default one.
+		// This field is not compatible with OpenAI sdk, so we use the default value.
+		// We try the best to support this fields to keep this fields in the chat conversions, so we use the ReasoningSignature to hold the field,
+		// And this field will be preserved during claude code trace, will not degrade the gemini model performance.
+		msgThoughtSignature := shared.DecodeGeminiThoughtSignature(msg.ReasoningSignature)
 
-	if msgThoughtSignature != nil && lastPart != nil {
-		if firstFunctionCallPart != nil {
-			firstFunctionCallPart.ThoughtSignature = *msgThoughtSignature
-		} else {
-			lastPart.ThoughtSignature = *msgThoughtSignature
+		if (len(msg.ToolCalls) > 0 || msg.ReasoningContent != nil) && msgThoughtSignature == nil {
+			msgThoughtSignature = lo.ToPtr(ContextEngineeringThoughtSignature)
+		}
+
+		if msgThoughtSignature != nil && (firstFunctionCallPart != nil || lastPart != nil) {
+			if firstFunctionCallPart != nil {
+				firstFunctionCallPart.ThoughtSignature = *msgThoughtSignature
+			} else {
+				lastPart.ThoughtSignature = *msgThoughtSignature
+			}
 		}
 	}
 
@@ -442,15 +496,18 @@ func convertLLMToolResultToGeminiContent(msg *llm.Message, contents []*Content) 
 		responseData = map[string]any{"result": lo.FromPtrOr(msg.Content.Content, "")}
 	}
 
-	fp := &FunctionResponse{
-		ID:       lo.FromPtr(msg.ToolCallID),
-		Name:     lo.FromPtr(msg.ToolCallName),
-		Response: responseData,
+	toolCallID := lo.FromPtr(msg.ToolCallID)
+
+	// Anthropic's tool result doesn't have name, so we need to find it by tool call id.
+	toolCallName := lo.FromPtr(msg.ToolCallName)
+	if toolCallName == "" {
+		toolCallName = findToolNameByToolCallID(contents, toolCallID)
 	}
 
-	// Anthropic‘s tool result doesn't have name, so we need to find it by tool call id.
-	if fp.Name == "" && fp.ID != "" {
-		fp.Name = findToolNameByToolCallID(contents, fp.ID)
+	fp := &FunctionResponse{
+		ID:       toolCallID,
+		Name:     toolCallName,
+		Response: responseData,
 	}
 
 	content.Parts = []*Part{
@@ -472,6 +529,21 @@ func findToolNameByToolCallID(contents []*Content, id string) string {
 	return ""
 }
 
+// isPreviousContentToolResponse checks if the last content entry is a tool response
+// (user role with functionResponse parts) for grouping consecutive tool messages.
+func isPreviousContentToolResponse(contents []*Content) bool {
+	if len(contents) == 0 {
+		return false
+	}
+
+	lastContent := contents[len(contents)-1]
+	if lastContent.Role != "user" || len(lastContent.Parts) == 0 {
+		return false
+	}
+
+	return lastContent.Parts[0].FunctionResponse != nil
+}
+
 // convertGeminiToLLMResponse converts Gemini GenerateContentResponse to unified Response.
 // When isStream is true, it sets Delta instead of Message in choices.
 func convertGeminiToLLMResponse(geminiResp *GenerateContentResponse, isStream bool) *llm.Response {
@@ -481,6 +553,86 @@ func convertGeminiToLLMResponse(geminiResp *GenerateContentResponse, isStream bo
 
 // TransformerMetadataKeyGroundingMetadata is the key for storing GroundingMetadata in TransformerMetadata.
 const TransformerMetadataKeyGroundingMetadata = "gemini_grounding_metadata"
+
+func deriveGeminiAnnotations(candidate *Candidate) []llm.Annotation {
+	if candidate == nil {
+		return nil
+	}
+
+	if candidate.CitationMetadata != nil && len(candidate.CitationMetadata.Citations) > 0 {
+		annotations := make([]llm.Annotation, 0, len(candidate.CitationMetadata.Citations))
+		for _, citation := range candidate.CitationMetadata.Citations {
+			if citation == nil {
+				continue
+			}
+
+			annotations = append(annotations, llm.Annotation{
+				Type:       "url_citation",
+				StartIndex: lo.ToPtr(citation.StartIndex),
+				EndIndex:   lo.ToPtr(citation.EndIndex),
+				URLCitation: &llm.URLCitation{
+					URL:   citation.URI,
+					Title: citation.Title,
+				},
+			})
+		}
+
+		if len(annotations) > 0 {
+			return annotations
+		}
+	}
+
+	if candidate.GroundingMetadata == nil {
+		return nil
+	}
+
+	annotations := make([]llm.Annotation, 0)
+	for _, support := range candidate.GroundingMetadata.GroundingSupports {
+		if support == nil || support.Segment == nil {
+			continue
+		}
+
+		for _, idx := range support.GroundingChunkIndices {
+			if idx < 0 || int(idx) >= len(candidate.GroundingMetadata.GroundingChunks) {
+				continue
+			}
+
+			chunk := candidate.GroundingMetadata.GroundingChunks[idx]
+			if chunk == nil {
+				continue
+			}
+
+			url := ""
+			title := ""
+			switch {
+			case chunk.Web != nil:
+				url = chunk.Web.URI
+				title = chunk.Web.Title
+			case chunk.RetrievedContext != nil:
+				url = chunk.RetrievedContext.URI
+				title = chunk.RetrievedContext.Title
+			default:
+				continue
+			}
+
+			annotations = append(annotations, llm.Annotation{
+				Type:       "url_citation",
+				StartIndex: lo.ToPtr(int64(support.Segment.StartIndex)),
+				EndIndex:   lo.ToPtr(int64(support.Segment.EndIndex)),
+				URLCitation: &llm.URLCitation{
+					URL:   url,
+					Title: title,
+				},
+			})
+		}
+	}
+
+	if len(annotations) == 0 {
+		return nil
+	}
+
+	return annotations
+}
 
 // convertGeminiToLLMResponseWithState converts Gemini response with tool call index tracking.
 // Returns the response and the next tool call index to use.
@@ -604,9 +756,10 @@ func convertGeminiCandidateToLLMChoiceWithState(candidate *Candidate, isStream b
 				}
 				// Gemini may response empty tool call ID.
 				if tc.ID == "" {
-					tc.ID = uuid.NewString()
+					tc.ID = fmt.Sprintf("tc_%s", uuid.NewString())
 				}
 
+				setOutboundToolCallThoughtSignature(&tc, part.ThoughtSignature)
 				toolCalls = append(toolCalls, tc)
 				nextToolCallIndex++
 			}
@@ -643,6 +796,10 @@ func convertGeminiCandidateToLLMChoiceWithState(candidate *Candidate, isStream b
 			msg.ReasoningContent = &reasoningContent
 		}
 
+		if annotations := deriveGeminiAnnotations(candidate); len(annotations) > 0 {
+			msg.Annotations = annotations
+		}
+
 		// Set Delta for streaming, Message for non-streaming
 		if isStream {
 			choice.Delta = msg
@@ -655,4 +812,18 @@ func convertGeminiCandidateToLLMChoiceWithState(candidate *Candidate, isStream b
 	choice.FinishReason = convertGeminiFinishReasonToLLM(candidate.FinishReason, hasToolCall)
 
 	return choice, nextToolCallIndex
+}
+
+// extractJSONSchema extracts the inner "schema" field from an OpenAI json_schema object.
+// OpenAI format: {"name": "...", "schema": {...}, "strict": ...}
+// Gemini expects the schema content directly without the wrapper.
+func extractJSONSchema(raw json.RawMessage) json.RawMessage {
+	var wrapper struct {
+		Schema json.RawMessage `json:"schema,omitempty"`
+	}
+	if err := json.Unmarshal(raw, &wrapper); err == nil && len(wrapper.Schema) > 0 {
+		return wrapper.Schema
+	}
+
+	return raw
 }

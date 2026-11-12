@@ -5,12 +5,18 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"time"
 
 	"github.com/andreazorzetto/yh/highlight"
 	"github.com/hokaccha/go-prettyjson"
 	"go.uber.org/fx"
 	"go.uber.org/fx/fxevent"
 	"gopkg.in/yaml.v3"
+
+	_ "time/tzdata"
 
 	sdk "go.opentelemetry.io/otel/sdk/metric"
 
@@ -20,11 +26,17 @@ import (
 	"github.com/looplj/axonhub/internal/log"
 	"github.com/looplj/axonhub/internal/metrics"
 	"github.com/looplj/axonhub/internal/server"
+	"github.com/looplj/axonhub/internal/server/biz"
+	"github.com/looplj/axonhub/internal/server/middleware"
+	"github.com/looplj/axonhub/llm/transformer/antigravity"
 )
 
 func main() {
 	if len(os.Args) > 1 {
 		switch os.Args[1] {
+		case "reload":
+			handleReload()
+			return
 		case "config":
 			handleConfigCommand()
 			return
@@ -33,6 +45,7 @@ func main() {
 			return
 		case "help", "--help", "-h":
 			showHelp()
+			return
 		case "build-info":
 			showBuildInfo()
 			return
@@ -54,12 +67,38 @@ func (l *logger) LogEvent(event fxevent.Event) {
 
 func startServer() {
 	server.Run(
+		fx.StartTimeout(60*time.Second),
+		fx.StopTimeout(30*time.Second),
 		fx.WithLogger(func() fxevent.Logger {
 			return &logger{}
 		}),
-		fx.Provide(conf.Load),
+		conf.Module,
 		fx.Provide(metrics.NewProvider),
-		fx.Invoke(func(lc fx.Lifecycle, server *server.Server, provider *sdk.MeterProvider, ent *ent.Client) {
+		fx.Invoke(func(lc fx.Lifecycle, cfg server.Config) {
+			lc.Append(fx.Hook{
+				OnStart: func(ctx context.Context) error {
+					if cfg.PidFile == "" {
+						return nil
+					}
+					pidFile := expandHome(cfg.PidFile)
+					if err := writePidFile(pidFile); err != nil {
+						return fmt.Errorf("write PID file %s: %w", pidFile, err)
+					}
+					return nil
+				},
+				OnStop: func(ctx context.Context) error {
+					if cfg.PidFile == "" {
+						return nil
+					}
+					pidFile := expandHome(cfg.PidFile)
+					if err := os.Remove(pidFile); err != nil && !os.IsNotExist(err) {
+						return fmt.Errorf("remove PID file %s: %w", pidFile, err)
+					}
+					return nil
+				},
+			})
+		}),
+		fx.Invoke(func(lc fx.Lifecycle, server *server.Server, provider *sdk.MeterProvider, ent *ent.Client, requestSvc *biz.RequestService) {
 			lc.Append(fx.Hook{
 				OnStart: func(ctx context.Context) error {
 					if provider != nil {
@@ -78,6 +117,16 @@ func startServer() {
 			})
 			lc.Append(fx.Hook{
 				OnStart: func(ctx context.Context) error {
+					// Run cleanup asynchronously with timeout to avoid blocking startup
+					go func() {
+						cleanupCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second) //nolint:gosec // intentional detached context
+						defer cancel()
+
+						if err := requestSvc.ClearStaleProcessingOnStartup(cleanupCtx); err != nil {
+							log.Warn(context.Background(), "failed to cancel stale processing records on startup", log.Cause(err))
+						}
+					}()
+
 					go func() {
 						err := server.Run()
 						if err != nil {
@@ -85,6 +134,7 @@ func startServer() {
 							os.Exit(1)
 						}
 					}()
+					go antigravity.InitVersion(context.Background()) //nolint:gosec // intentional detached context
 
 					return nil
 				},
@@ -103,7 +153,44 @@ func startServer() {
 				},
 			})
 		}),
+		// Register this hook after the server hook so Fx stops the signal loop
+		// before closing the HTTP server and database connections.
+		fx.Invoke(func(lc fx.Lifecycle, loader *conf.Loader, ipAccessControl *middleware.IPAccessControlConfig) {
+			registerConfigReload(lc, loader, ipAccessControl)
+		}),
 	)
+}
+
+func handleReload() {
+	cfg, err := conf.Load()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Reload failed: load config: %v\n", err)
+		os.Exit(1)
+	}
+	if cfg.APIServer.PidFile == "" {
+		fmt.Fprintf(os.Stderr, "Reload failed: pid_file not configured\n")
+		os.Exit(1)
+	}
+	pidFile := expandHome(cfg.APIServer.PidFile)
+	if err := reloadRunningServer(pidFile); err != nil {
+		fmt.Fprintf(os.Stderr, "Reload failed: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Println("Config reload signal sent successfully")
+}
+
+func writePidFile(path string) error {
+	return os.WriteFile(path, []byte(strconv.Itoa(os.Getpid())+"\n"), 0o600)
+}
+
+func expandHome(path string) string {
+	if strings.HasPrefix(path, "~/") {
+		home, err := os.UserHomeDir()
+		if err == nil {
+			return filepath.Join(home, path[2:])
+		}
+	}
+	return path
 }
 
 func handleConfigCommand() {
@@ -266,6 +353,7 @@ func showHelp() {
 	fmt.Println("")
 	fmt.Println("Usage:")
 	fmt.Println("  axonhub                    Start the server (default)")
+	fmt.Println("  axonhub reload             Send SIGHUP to reload configuration")
 	fmt.Println("  axonhub config preview     Preview configuration")
 	fmt.Println("  axonhub config validate    Validate configuration")
 	fmt.Println("  axonhub config get <key>   Get a specific config value")

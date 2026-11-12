@@ -2,12 +2,16 @@
 package responses
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
+	"strconv"
+	"strings"
 
-	"github.com/looplj/axonhub/internal/pkg/xjson"
 	"github.com/looplj/axonhub/llm"
+	"github.com/looplj/axonhub/llm/internal/pkg/xjson"
 	"github.com/looplj/axonhub/llm/transformer"
 )
 
@@ -22,7 +26,7 @@ type ImageGeneration struct {
 }
 
 type Tool struct {
-	// Any of "function", "image_generation" nil.
+	// Any of "function", "image_generation", "custom", "web_search", "namespace".
 	Type        string `json:"type,omitempty"`
 	Name        string `json:"name,omitempty"`
 	Description string `json:"description,omitempty"`
@@ -32,10 +36,24 @@ type Tool struct {
 	// This field is from variant [FunctionTool].
 	Strict *bool `json:"strict,omitempty"`
 
+	// Tools holds sub-tools when Type is "namespace".
+	Tools []Tool `json:"tools,omitempty"`
+
+	// This field is for custom tool format definition.
+	Format *CustomToolFormat `json:"format,omitempty"`
+
+	// These fields are for web search.
+	Filters      *WebSearchFilters      `json:"filters,omitempty"`
+	UserLocation *WebSearchUserLocation `json:"user_location,omitempty"`
+
+	// This field is for ImageGeneration
+	Action string `json:"action,omitempty"`
 	// This field is for ImageGeneration
 	Background string `json:"background,omitempty"`
 	// This field is for ImageGeneration
 	InputFidelity string `json:"input_fidelity,omitempty"`
+	// This field is for ImageGeneration
+	InputImageMask map[string]any `json:"input_image_mask,omitempty"`
 	// This field is for ImageGeneration
 	Model string `json:"model,omitempty"`
 	// This field is for ImageGeneration
@@ -52,19 +70,41 @@ type Tool struct {
 	Size string `json:"size,omitempty"`
 }
 
+type WebSearchFilters struct {
+	AllowedDomains []string `json:"allowed_domains,omitempty"`
+}
+
+type WebSearchUserLocation struct {
+	Type     string `json:"type,omitempty"`
+	City     string `json:"city,omitempty"`
+	Country  string `json:"country,omitempty"`
+	Region   string `json:"region,omitempty"`
+	Timezone string `json:"timezone,omitempty"`
+}
+
+// CustomToolFormat represents the format definition for a custom tool.
+type CustomToolFormat struct {
+	// Type is the format type, e.g. "grammar".
+	Type string `json:"type"`
+	// Syntax is the grammar syntax, e.g. "lark".
+	Syntax string `json:"syntax,omitempty"`
+	// Definition is the grammar definition string.
+	Definition string `json:"definition,omitempty"`
+}
+
 // Request is a struct for OpenAI Responses API creation.
 // Reference: github.com/openai/openai-go/v2/responses.ResponseNewParams.
 type Request struct {
 	Model string `json:"model"`
 
 	// A system (or developer) message inserted into the model's context.
-	Instructions string `json:"instructions,omitempty"`
+	Instructions string `json:"instructions"`
 
 	Temperature *float64 `json:"temperature,omitempty"`
 
 	// Input can be a string prompt or an array of input items.
-	Input Input `json:"input"`
-	// Tools includes the function/image_generation tools.
+	Input Input `json:"input,omitzero"`
+	// Tools includes the function/image_generation/web_search/custom tools.
 	Tools []Tool `json:"tools,omitzero"`
 	// Parallel tool calls preference.
 	ParallelToolCalls *bool `json:"parallel_tool_calls,omitempty"`
@@ -130,6 +170,9 @@ type Prompt struct {
 
 // Reasoning represents configuration options for reasoning models.
 type Reasoning struct {
+	// The reasoning context scope requested by internal Responses features.
+	// Responses Lite requires "all_turns" when this field is emitted.
+	Context string `json:"context,omitempty"`
 	// The effort level for reasoning. Any of "low", "medium", "high".
 	Effort string `json:"effort,omitempty"`
 	// Whether to generate a summary of the reasoning. Any of "auto", "concise", "detailed".
@@ -183,29 +226,18 @@ func (t *ToolChoice) UnmarshalJSON(data []byte) error {
 }
 
 func (t *ToolChoice) MarshalJSON() ([]byte, error) {
-	if t.Mode != nil && *t.Mode == "auto" {
-		return json.Marshal("auto")
+	if t.Mode != nil && t.Type == nil && t.Name == nil && len(t.Tools) == 0 {
+		return json.Marshal(*t.Mode)
 	}
 
-	// For other cases, marshal as object
-	type Alias ToolChoice
-
-	return json.Marshal(&struct {
-		Mode  *string      `json:"mode,omitempty"`
-		Type  *string      `json:"type,omitempty"`
-		Name  *string      `json:"name,omitempty"`
-		Tools []ToolOption `json:"tools,omitempty"`
-	}{
-		Mode:  t.Mode,
-		Type:  t.Type,
-		Name:  t.Name,
-		Tools: t.Tools,
-	})
+	return json.Marshal((*ToolChoiceAlias)(t))
 }
 
 // ResponseToolChoice represents tool_choice in responses, which can be a string or object.
 type ResponseToolChoice struct {
 	// String value when tool_choice is a simple string like "auto", "none", "required".
+	// StringValue and ObjectValue are mutually exclusive representations of tool_choice.
+	// If both are populated, StringValue takes precedence during marshaling.
 	StringValue string
 	// Object value when tool_choice is an object.
 	ObjectValue *ToolChoice
@@ -216,13 +248,17 @@ func (r *ResponseToolChoice) UnmarshalJSON(data []byte) error {
 	var str string
 	if err := json.Unmarshal(data, &str); err == nil {
 		r.StringValue = str
+		r.ObjectValue = nil
+
 		return nil
 	}
 
 	// Try to unmarshal as object
 	var obj ToolChoice
 	if err := json.Unmarshal(data, &obj); err == nil {
+		r.StringValue = ""
 		r.ObjectValue = &obj
+
 		return nil
 	}
 
@@ -290,11 +326,17 @@ type TextFormat struct {
 	Type string `json:"type,omitempty"`
 	// The name of the schema (for json_schema type).
 	Name string `json:"name,omitempty"`
+	// The description of the schema (for json_schema type).
+	Description string `json:"description,omitempty"`
 	// The JSON schema (for json_schema type).
 	Schema json.RawMessage `json:"schema,omitempty"`
+	// Whether to enforce strict schema adherence (for json_schema type).
+	Strict *bool `json:"strict,omitempty"`
 }
 
 type Input struct {
+	// Text and Items are mutually exclusive representations of the same input payload.
+	// If both are populated, Text takes precedence during marshaling.
 	Text  *string
 	Items []Item
 }
@@ -303,12 +345,16 @@ func (i *Input) UnmarshalJSON(data []byte) error {
 	var text string
 	if err := json.Unmarshal(data, &text); err == nil {
 		i.Text = &text
+		i.Items = nil
+
 		return nil
 	}
 
 	var items []Item
 	if err := json.Unmarshal(data, &items); err == nil {
+		i.Text = nil
 		i.Items = items
+
 		return nil
 	}
 
@@ -323,7 +369,145 @@ func (i Input) MarshalJSON() ([]byte, error) {
 	return json.Marshal(i.Items)
 }
 
-type Annotation struct{}
+type Annotation struct {
+	// Type is the type of annotation, e.g., "url_citation".
+	Type string `json:"type,omitempty"`
+	// StartIndex is the start offset of the annotated span in the output text.
+	StartIndex *int64 `json:"start_index,omitempty"`
+	// EndIndex is the end offset of the annotated span in the output text.
+	EndIndex *int64 `json:"end_index,omitempty"`
+	// URLCitation contains URL citation details when Type is "url_citation".
+	URLCitation *URLCitation `json:"url_citation,omitempty"`
+}
+
+func (a *Annotation) UnmarshalJSON(data []byte) error {
+	type rawAnnotation Annotation
+
+	var raw struct {
+		rawAnnotation
+
+		URL   *string `json:"url,omitempty"`
+		Title *string `json:"title,omitempty"`
+	}
+
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+
+	*a = Annotation(raw.rawAnnotation)
+	if a.URLCitation == nil && (raw.URL != nil || raw.Title != nil) {
+		a.URLCitation = &URLCitation{}
+		if raw.URL != nil {
+			a.URLCitation.URL = *raw.URL
+		}
+		if raw.Title != nil {
+			a.URLCitation.Title = *raw.Title
+		}
+	}
+
+	return nil
+}
+
+// URLCitation represents a URL-based citation.
+type URLCitation struct {
+	// URL is the citation URL.
+	URL string `json:"url,omitempty"`
+	// Title is the title of the cited source.
+	Title string `json:"title,omitempty"`
+}
+
+const responsesWebSearchCallsTransformerMetadataKey = "openai_responses_web_search_calls"
+const responsesReasoningItemTransformerMetadataKey = "openai_responses_reasoning_item"
+const responsesTerminalDetailsTransformerMetadataKey = "openai_responses_terminal_details"
+
+// Preserve details that cannot be represented by a Chat Completions finish_reason.
+type responsesTerminalDetails struct {
+	Error             *Error                     `json:"error,omitempty"`
+	IncompleteDetails *ResponseIncompleteDetails `json:"incomplete_details,omitempty"`
+}
+
+type responsesReasoningItemMetadata struct {
+	ID   string `json:"id,omitempty"`
+	Done bool   `json:"done,omitempty"`
+}
+
+type WebSearchSource struct {
+	Type  string `json:"type,omitempty"`
+	URL   string `json:"url,omitempty"`
+	Title string `json:"title,omitempty"`
+}
+
+type WebSearchAction struct {
+	Type    string            `json:"type,omitempty"`
+	Query   string            `json:"query,omitempty"`
+	Queries []string          `json:"queries,omitempty"`
+	Sources []WebSearchSource `json:"sources,omitempty"`
+}
+
+// ItemAction is the polymorphic "action" field of an output item.
+// ImageGenerationAction and WebSearch are mutually exclusive;
+// if both are set, ImageGenerationAction takes precedence during marshaling.
+type ItemAction struct {
+	// ImageGenerationAction holds the bare-string action for image_generation_call items
+	// (e.g. "generate", "edit").
+	ImageGenerationAction string
+	// WebSearch holds the structured action for web_search_call items.
+	WebSearch *WebSearchAction
+}
+
+// NewImageGenerationAction creates an ItemAction with a bare-string action value.
+func NewImageGenerationAction(action string) *ItemAction {
+	return &ItemAction{ImageGenerationAction: action}
+}
+
+// NewWebSearchAction creates an ItemAction with a structured WebSearchAction value.
+func NewWebSearchAction(action *WebSearchAction) *ItemAction {
+	return &ItemAction{WebSearch: action}
+}
+
+// IsImageGeneration reports whether this action represents an image_generation_call string action.
+func (a *ItemAction) IsImageGeneration() bool {
+	return a != nil && a.ImageGenerationAction != ""
+}
+
+// IsWebSearch reports whether this action represents a web_search_call structured action.
+func (a *ItemAction) IsWebSearch() bool {
+	return a != nil && a.WebSearch != nil
+}
+
+func (a *ItemAction) UnmarshalJSON(data []byte) error {
+	// Try string form first (image_generation_call).
+	var str string
+	if err := json.Unmarshal(data, &str); err == nil {
+		a.ImageGenerationAction = str
+		a.WebSearch = nil
+
+		return nil
+	}
+
+	// Then object form (web_search_call).
+	var obj WebSearchAction
+	if err := json.Unmarshal(data, &obj); err == nil {
+		a.ImageGenerationAction = ""
+		a.WebSearch = &obj
+
+		return nil
+	}
+
+	return fmt.Errorf("action must be a string or object")
+}
+
+func (a ItemAction) MarshalJSON() ([]byte, error) {
+	if a.ImageGenerationAction != "" {
+		return json.Marshal(a.ImageGenerationAction)
+	}
+
+	if a.WebSearch != nil {
+		return json.Marshal(a.WebSearch)
+	}
+
+	return []byte("null"), nil
+}
 
 // Item is a unified structure for both input and output items in the Responses API.
 // This follows the openai-go pattern where input and output items share the same structure.
@@ -332,8 +516,8 @@ type Item struct {
 	// The ID of the item, generated by the server.
 	ID string `json:"id,omitempty"`
 
-	// Any of "message", "input_text", "input_image", "input_audio", "output_text",
-	// "function_call", "function_call_output", "image_generation_call", "reasoning".
+	// Any of "message", "input_text", "input_image", "input_audio", "output_text", "compaction", "compaction_summary",
+	// "function_call", "function_call_output", "custom_tool_call", "custom_tool_call_output", "image_generation_call", "reasoning", "reasoning_text".
 	Type string `json:"type,omitempty"`
 
 	// The annotations of the text output.
@@ -356,6 +540,11 @@ type Item struct {
 
 	// The detail of the image. high, low, or auto, for input_image type.
 	Detail *string `json:"detail,omitempty"`
+	// File fields for input_file content.
+	FileData *string `json:"file_data,omitempty"`
+	FileID   *string `json:"file_id,omitempty"`
+	FileURL  *string `json:"file_url,omitempty"`
+	Filename *string `json:"filename,omitempty"`
 
 	// Text for output_text/input_text type.
 	Text *string `json:"text,omitempty"`
@@ -377,18 +566,62 @@ type Item struct {
 	// Function call fields
 	CallID    string `json:"call_id,omitempty"`
 	Name      string `json:"name,omitempty"`
+	Namespace string `json:"namespace,omitempty"`
 	Arguments string `json:"arguments,omitempty"`
 
-	// Output for function_call_output type.
+	// Custom tool call fields (for type="custom_tool_call")
+	// Input is the freeform input text generated by the model for custom tool calls.
+	Input *string `json:"input,omitempty"`
+
+	// Output for function_call_output/custom_tool_call_output type.
 	Output *Input `json:"output,omitempty"`
 
 	// Reasoning fields (for type="reasoning")
 	// Reasoning summary content - array of summary text items.
 	Summary []ReasoningSummary `json:"summary,omitempty"`
 	// Reasoning text content - array of reasoning text items.
-	ReasoningContent []ReasoningContent `json:"reasoning_content,omitempty"`
+	ReasoningContent *PolymorphicReasoningContent `json:"reasoning_content,omitempty"`
 	// The encrypted content of the reasoning item.
 	EncryptedContent *string `json:"encrypted_content,omitempty"`
+
+	// Action is the polymorphic "action" field: web_search_call uses an object,
+	// image_generation_call uses a bare string. See ItemAction.
+	Action *ItemAction `json:"action,omitempty"`
+
+	// Compaction fields (for type="compaction")
+	// The identifier of the actor that created the item.
+	CreatedBy *string `json:"created_by,omitempty"`
+}
+
+func (item *Item) UnmarshalJSON(data []byte) error {
+	type itemAlias Item
+	raw := struct {
+		itemAlias
+		Arguments json.RawMessage `json:"arguments"`
+	}{}
+
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+
+	*item = Item(raw.itemAlias)
+	if len(raw.Arguments) == 0 || bytes.Equal(raw.Arguments, []byte("null")) {
+		return nil
+	}
+
+	var arguments string
+	if err := json.Unmarshal(raw.Arguments, &arguments); err == nil {
+		item.Arguments = arguments
+		return nil
+	}
+
+	var compacted bytes.Buffer
+	if err := json.Compact(&compacted, raw.Arguments); err != nil {
+		return err
+	}
+	item.Arguments = compacted.String()
+
+	return nil
 }
 
 // MarshalJSON omits summary for non-reasoning items and forces an empty array for reasoning items.
@@ -398,12 +631,49 @@ func (item Item) MarshalJSON() ([]byte, error) {
 	if item.Type == "function_call" {
 		type functionCallItem struct {
 			itemAlias
+
 			Arguments string `json:"arguments"`
 		}
 
 		return json.Marshal(functionCallItem{
 			itemAlias: itemAlias(item),
 			Arguments: item.Arguments,
+		})
+	}
+
+	if item.Type == "custom_tool_call" {
+		type customToolCallItem struct {
+			itemAlias
+
+			InputStr string `json:"input"`
+		}
+
+		inputStr := ""
+		if item.Input != nil {
+			inputStr = *item.Input
+		}
+
+		return json.Marshal(customToolCallItem{
+			itemAlias: itemAlias(item),
+			InputStr:  inputStr,
+		})
+	}
+
+	if item.Type == "compaction" {
+		type compactionItem struct {
+			itemAlias
+
+			EncryptedContent string `json:"encrypted_content"`
+		}
+
+		encContent := ""
+		if item.EncryptedContent != nil {
+			encContent = *item.EncryptedContent
+		}
+
+		return json.Marshal(compactionItem{
+			itemAlias:        itemAlias(item),
+			EncryptedContent: encContent,
 		})
 	}
 
@@ -415,6 +685,7 @@ func (item Item) MarshalJSON() ([]byte, error) {
 	// Ensure reasoning items always include summary, even if empty.
 	type reasoningItem struct {
 		itemAlias
+
 		Summary []ReasoningSummary `json:"summary"`
 	}
 
@@ -459,8 +730,9 @@ func (item Item) GetContentItems() []ContentItem {
 		}
 
 		result = append(result, ContentItem{
-			Type: ci.Type,
-			Text: text,
+			Type:        ci.Type,
+			Text:        text,
+			Annotations: append([]Annotation(nil), ci.Annotations...),
 		})
 	}
 
@@ -477,8 +749,9 @@ func (item *Item) SetContentItems(items []ContentItem) {
 	contentItems := make([]Item, 0, len(items))
 	for _, ci := range items {
 		contentItems = append(contentItems, Item{
-			Type: ci.Type,
-			Text: &ci.Text,
+			Type:        ci.Type,
+			Text:        &ci.Text,
+			Annotations: append([]Annotation(nil), ci.Annotations...),
 		})
 	}
 
@@ -491,6 +764,40 @@ type ReasoningSummary struct {
 	Text string `json:"text"`
 	// The type of the object. Always "summary_text".
 	Type string `json:"type"`
+}
+
+// PolymorphicReasoningContent handles reasoning_content fields that differ by item type:
+// - reasoning items use an array of {"type":"reasoning_text","text":"..."} objects.
+// - function_call items from Chat-compatible upstreams use a plain string.
+// The Input type (above) provides the same string-or-array pattern.
+type PolymorphicReasoningContent struct {
+	Text  *string
+	Items []ReasoningContent
+}
+
+func (p *PolymorphicReasoningContent) UnmarshalJSON(data []byte) error {
+	var text string
+	if err := json.Unmarshal(data, &text); err == nil {
+		p.Text = &text
+		p.Items = nil
+		return nil
+	}
+
+	var items []ReasoningContent
+	if err := json.Unmarshal(data, &items); err == nil {
+		p.Text = nil
+		p.Items = items
+		return nil
+	}
+
+	return fmt.Errorf("invalid reasoning_content: %w", transformer.ErrInvalidRequest)
+}
+
+func (p PolymorphicReasoningContent) MarshalJSON() ([]byte, error) {
+	if p.Text != nil {
+		return json.Marshal(p.Text)
+	}
+	return json.Marshal(p.Items)
 }
 
 // ReasoningContent represents reasoning text from the model.
@@ -593,13 +900,170 @@ type Response struct {
 	User *string `json:"user,omitempty"`
 }
 
+// UnmarshalJSON implements json.Unmarshaler for Response so that created_at
+// accepts both integer (1786360449) and float-encoded integral (1786360449.0)
+// unix timestamps. Some Responses-compatible providers serialize integer
+// timestamps as JSON floats (e.g. Python's 1786360449.0); the value is always
+// kept as int64 internally. Every other field uses the default decoding.
+func (r *Response) UnmarshalJSON(data []byte) error {
+	type alias Response
+
+	var raw struct {
+		CreatedAt json.RawMessage `json:"created_at"`
+		*alias
+	}
+	raw.alias = (*alias)(r)
+
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+
+	if xjson.IsNull(raw.CreatedAt) {
+		return nil
+	}
+
+	// created_at must be a JSON number. Reject string forms such as
+	// "1786360449" so the previous int64 field behavior is preserved.
+	if c := raw.CreatedAt[0]; c != '-' && (c < '0' || c > '9') {
+		return fmt.Errorf("invalid responses api created_at: must be a JSON number, got %q", string(raw.CreatedAt))
+	}
+
+	createdAt, err := parseCreatedAtSeconds(string(raw.CreatedAt))
+	if err != nil {
+		return fmt.Errorf("invalid responses api created_at: %w", err)
+	}
+	r.CreatedAt = createdAt
+
+	return nil
+}
+
+// parseCreatedAtSeconds converts a JSON created_at number lexeme to an int64
+// unix timestamp. The integer form (1786360449) is parsed directly; float
+// forms such as 1786360449.0 are validated with pure lexeme arithmetic so
+// that non-integral values (1786360449.5), int64 overflow, and excessive
+// exponents (1e1000000) are rejected without materializing arbitrary
+// precision numbers. Non-normalized scientific notation such as
+// 170000000000000000000000000000e-20 (exactly 1700000000) is accepted.
+func parseCreatedAtSeconds(raw string) (int64, error) {
+	// Integer form: ParseInt handles int64 range checks directly.
+	if v, err := strconv.ParseInt(raw, 10, 64); err == nil {
+		return v, nil
+	}
+
+	// Float form: split into sign / integer / fraction / exponent. The JSON
+	// lexeme is guaranteed valid by the caller, so these checks are defensive.
+	sign := ""
+	body := raw
+	if len(body) > 0 && (body[0] == '-' || body[0] == '+') {
+		sign, body = string(body[0]), body[1:]
+	}
+
+	exp := 0
+	if i := strings.IndexAny(body, "eE"); i >= 0 {
+		e, err := strconv.Atoi(body[i+1:])
+		if err != nil {
+			return 0, fmt.Errorf("invalid created_at value %q", raw)
+		}
+		exp = e
+		body = body[:i]
+	}
+
+	frac := ""
+	if i := strings.IndexByte(body, '.'); i >= 0 {
+		body, frac = body[:i], body[i+1:]
+	}
+
+	if body == "" || !isDecimalDigits(body) || !isDecimalDigits(frac) {
+		return 0, fmt.Errorf("invalid created_at value %q", raw)
+	}
+
+	// digits is the sign-free digit sequence; the value equals
+	// digits * 10^(exp - len(frac)).
+	digits := body + frac
+
+	// Leading zeros do not affect the value; all-zero input is exactly zero.
+	sig := strings.TrimLeft(digits, "0")
+	if sig == "" {
+		return 0, nil
+	}
+
+	// trailingZeros bounds how many zeros a negative exponent can cancel
+	// before the value stops being an integer (e.g. 1786360449.5).
+	trailingZeros := 0
+	for i := len(digits) - 1; i >= 0 && digits[i] == '0'; i-- {
+		trailingZeros++
+	}
+
+	// Bound the exponent against the mantissa before computing the scale, so
+	// machine integer arithmetic cannot overflow on values such as
+	// 1e-9223372036854775808. These bounds are exact: a non-zero value with
+	// exp > len(frac)+19 is at least 10^19 and overflows int64, while a
+	// negative exp beyond trailingZeros cannot be canceled into an integer.
+	switch {
+	case exp > len(frac)+19:
+		return 0, fmt.Errorf("created_at %q is out of int64 range", raw)
+	case exp < -trailingZeros:
+		return 0, fmt.Errorf("created_at must be an integer number of seconds, got %q", raw)
+	}
+
+	// scale = len(frac) - exp is now bounded: |scale| <= max(19, len(frac)+trailingZeros).
+	scale := len(frac) - exp
+	switch {
+	case scale < 0:
+		// Pad trailing zeros: a value larger than int64 can be rejected by
+		// digit count alone, before building the padded string.
+		if len(sig)+(-scale) > len(strconv.FormatInt(math.MaxInt64, 10)) {
+			return 0, fmt.Errorf("created_at %q is out of int64 range", raw)
+		}
+		sig += strings.Repeat("0", -scale)
+	case scale > 0:
+		// Strip trailing zeros: an insufficient zero tail means the value is
+		// not an integer (e.g. 1786360449.5).
+		if len(sig) <= scale {
+			return 0, fmt.Errorf("created_at must be an integer number of seconds, got %q", raw)
+		}
+		for _, c := range sig[len(sig)-scale:] {
+			if c != '0' {
+				return 0, fmt.Errorf("created_at must be an integer number of seconds, got %q", raw)
+			}
+		}
+		sig = sig[:len(sig)-scale]
+	}
+
+	v, err := strconv.ParseInt(sign+sig, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("created_at %q is out of int64 range", raw)
+	}
+
+	return v, nil
+}
+
+// isDecimalDigits reports whether s is empty or consists only of ASCII digits.
+func isDecimalDigits(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return true
+}
+
 type ContentItem struct {
-	Type        string   `json:"type"`
-	Text        string   `json:"text,omitempty"`
-	Annotations []string `json:"annotations,omitempty"`
+	Type        string       `json:"type"`
+	Text        string       `json:"text,omitempty"`
+	Annotations []Annotation `json:"annotations,omitempty"`
 }
 
 type Error struct {
-	Code    int    `json:"code"`
+	Type    string `json:"type,omitempty"`
+	Code    string `json:"code,omitempty"`
 	Message string `json:"message"`
+	Param   string `json:"param,omitempty"`
+}
+
+type rawJSONSchema struct {
+	Name        string          `json:"name"`
+	Description string          `json:"description,omitempty"`
+	Schema      json.RawMessage `json:"schema,omitempty"`
+	Strict      *bool           `json:"strict,omitempty"`
 }

@@ -59,6 +59,7 @@ const createModelMappingFormSchema = (supportedModels: string[]) =>
     autoTrimedModelPrefixes: z.array(z.string()).optional(),
     hideOriginalModels: z.boolean().optional(),
     hideMappedModels: z.boolean().optional(),
+    lowercaseModelId: z.boolean().optional(),
   });
 
 const extractAliasFromModelPath = (modelPath: string): string => {
@@ -110,6 +111,7 @@ export function ChannelsModelMappingDialog({ open, onOpenChange, currentRow }: P
       autoTrimedModelPrefixes: currentRow.settings?.autoTrimedModelPrefixes || [],
       hideOriginalModels: currentRow.settings?.hideOriginalModels || false,
       hideMappedModels: currentRow.settings?.hideMappedModels || false,
+      lowercaseModelId: currentRow.settings?.lowercaseModelId || false,
     },
   });
 
@@ -208,6 +210,7 @@ export function ChannelsModelMappingDialog({ open, onOpenChange, currentRow }: P
       autoTrimedModelPrefixes: currentRow.settings?.autoTrimedModelPrefixes || [],
       hideOriginalModels: currentRow.settings?.hideOriginalModels || false,
       hideMappedModels: currentRow.settings?.hideMappedModels || false,
+      lowercaseModelId: currentRow.settings?.lowercaseModelId || false,
     });
     exitInlineEditing();
   }, [currentRow, open, form]);
@@ -290,6 +293,7 @@ export function ChannelsModelMappingDialog({ open, onOpenChange, currentRow }: P
         autoTrimedModelPrefixes: values.autoTrimedModelPrefixes || [],
         hideOriginalModels: values.hideOriginalModels,
         hideMappedModels: values.hideMappedModels,
+        lowercaseModelId: values.lowercaseModelId,
       });
 
       await updateChannel.mutateAsync({
@@ -301,7 +305,7 @@ export function ChannelsModelMappingDialog({ open, onOpenChange, currentRow }: P
       toast.success(t('channels.messages.updateSuccess'));
       onOpenChange(false);
     } catch (_error) {
-      toast.error(t('channels.messages.updateError'));
+      toast.error(t('common.errors.internalServerError'));
     }
   };
 
@@ -436,6 +440,28 @@ export function ChannelsModelMappingDialog({ open, onOpenChange, currentRow }: P
 
               <Card>
                 <CardHeader>
+                  <CardTitle className='text-lg'>{t('channels.dialogs.settings.lowercaseModelId.title')}</CardTitle>
+                  <CardDescription>{t('channels.dialogs.settings.lowercaseModelId.description')}</CardDescription>
+                </CardHeader>
+                <CardContent>
+                  <div className='flex items-start gap-3'>
+                    <Checkbox
+                      id='lowercaseModelId'
+                      checked={form.watch('lowercaseModelId') || false}
+                      onCheckedChange={(checked) => form.setValue('lowercaseModelId', checked === true)}
+                    />
+                    <label
+                      htmlFor='lowercaseModelId'
+                      className='cursor-pointer text-sm leading-none font-medium peer-disabled:cursor-not-allowed peer-disabled:opacity-70'
+                    >
+                      {t('channels.dialogs.settings.lowercaseModelId.label')}
+                    </label>
+                  </div>
+                </CardContent>
+              </Card>
+
+              <Card>
+                <CardHeader>
                   <CardTitle className='text-lg'>{t('channels.dialogs.settings.modelMapping.title')}</CardTitle>
                   <CardDescription>{t('channels.dialogs.settings.modelMapping.description')}</CardDescription>
                 </CardHeader>
@@ -456,13 +482,13 @@ export function ChannelsModelMappingDialog({ open, onOpenChange, currentRow }: P
                     </div>
                   </div>
 
-                  <div className='flex gap-2'>
-                    <div className='flex flex-1 gap-2'>
+                  <div className='grid grid-cols-1 gap-2 md:grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)_auto_auto] md:items-center'>
+                    <div className='flex min-w-0 gap-2'>
                       <Input
                         placeholder={t('channels.dialogs.settings.modelMapping.originalModel')}
                         value={newMapping.from}
                         onChange={(e) => setNewMapping({ ...newMapping, from: e.target.value })}
-                        className='flex-1'
+                        className='min-w-0 flex-1'
                       />
                       {aliasSuggestion && newMapping.to && (
                         <Tooltip>
@@ -492,9 +518,9 @@ export function ChannelsModelMappingDialog({ open, onOpenChange, currentRow }: P
                         </Tooltip>
                       )}
                     </div>
-                    <span className='text-muted-foreground flex items-center'>→</span>
+                    <span className='text-muted-foreground hidden justify-center md:flex'>→</span>
                     <Select value={newMapping.to} onValueChange={(value) => setNewMapping({ ...newMapping, to: value })}>
-                      <SelectTrigger className='flex-1'>
+                      <SelectTrigger className='min-w-0 w-full'>
                         <SelectValue placeholder={t('channels.dialogs.settings.modelMapping.targetModel')} />
                       </SelectTrigger>
                       <SelectContent>
@@ -541,32 +567,33 @@ export function ChannelsModelMappingDialog({ open, onOpenChange, currentRow }: P
                           <div key={index} className='rounded-lg border p-3'>
                             {isEditing ? (
                               <div className='space-y-2'>
-                                <div className='flex flex-wrap items-center gap-3' onKeyDown={handleInlineEditKeyDown}>
-                                  <div className='flex flex-1 items-center gap-2'>
-                                    <Input
-                                      value={editingDraft?.from ?? ''}
-                                      onChange={(e) => handleInlineEditFieldChange('from', e.target.value)}
-                                      autoFocus
-                                      className='flex-1'
-                                    />
-                                    <span className='text-muted-foreground'>→</span>
-                                    <Select
-                                      value={editingDraft?.to ?? undefined}
-                                      onValueChange={(value) => handleInlineEditFieldChange('to', value)}
-                                    >
-                                      <SelectTrigger className='min-w-[180px] flex-1'>
-                                        <SelectValue placeholder={t('channels.dialogs.settings.modelMapping.targetModel')} />
-                                      </SelectTrigger>
-                                      <SelectContent>
-                                        {currentRow.supportedModels.map((model) => (
-                                          <SelectItem key={model} value={model}>
-                                            {model}
-                                          </SelectItem>
-                                        ))}
-                                      </SelectContent>
-                                    </Select>
-                                  </div>
-                                  <div className='flex gap-2'>
+                                <div
+                                  className='grid grid-cols-1 gap-3 md:grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)_auto] md:items-center'
+                                  onKeyDown={handleInlineEditKeyDown}
+                                >
+                                  <Input
+                                    value={editingDraft?.from ?? ''}
+                                    onChange={(e) => handleInlineEditFieldChange('from', e.target.value)}
+                                    autoFocus
+                                    className='min-w-0 w-full'
+                                  />
+                                  <span className='text-muted-foreground hidden justify-center md:flex'>→</span>
+                                  <Select
+                                    value={editingDraft?.to ?? undefined}
+                                    onValueChange={(value) => handleInlineEditFieldChange('to', value)}
+                                  >
+                                    <SelectTrigger className='min-w-0 w-full'>
+                                      <SelectValue placeholder={t('channels.dialogs.settings.modelMapping.targetModel')} />
+                                    </SelectTrigger>
+                                    <SelectContent>
+                                      {currentRow.supportedModels.map((model) => (
+                                        <SelectItem key={model} value={model}>
+                                          {model}
+                                        </SelectItem>
+                                      ))}
+                                    </SelectContent>
+                                  </Select>
+                                  <div className='flex gap-2 md:justify-end'>
                                     <Button
                                       type='button'
                                       size='sm'

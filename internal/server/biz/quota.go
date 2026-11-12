@@ -8,16 +8,17 @@ import (
 	"entgo.io/ent/dialect/sql"
 	"github.com/shopspring/decimal"
 
+	"github.com/looplj/axonhub/internal/authz"
 	"github.com/looplj/axonhub/internal/ent"
-	"github.com/looplj/axonhub/internal/ent/privacy"
 	"github.com/looplj/axonhub/internal/ent/usagelog"
 	"github.com/looplj/axonhub/internal/objects"
 	"github.com/looplj/axonhub/internal/pkg/xtime"
 )
 
 type QuotaWindow struct {
-	Start *time.Time
-	End   *time.Time
+	Start        *time.Time
+	End          *time.Time
+	EndInclusive bool
 }
 
 type QuotaUsage struct {
@@ -51,8 +52,6 @@ func (s *QuotaService) CheckAPIKeyQuota(ctx context.Context, apiKeyID int, quota
 		return QuotaCheckResult{Allowed: true}, nil
 	}
 
-	ctx = privacy.DecisionContext(ctx, privacy.Allow)
-
 	loc := s.system.TimeLocation(ctx)
 
 	window, err := quotaWindow(xtime.UTCNow(), quota.Period, loc)
@@ -61,7 +60,9 @@ func (s *QuotaService) CheckAPIKeyQuota(ctx context.Context, apiKeyID int, quota
 	}
 
 	if quota.Requests != nil {
-		reqCount, err := s.requestCount(ctx, apiKeyID, window)
+		reqCount, err := authz.RunWithSystemBypass(ctx, "quota-request-count", func(bypassCtx context.Context) (int64, error) {
+			return s.requestCount(bypassCtx, apiKeyID, window)
+		})
 		if err != nil {
 			return QuotaCheckResult{}, err
 		}
@@ -82,7 +83,9 @@ func (s *QuotaService) CheckAPIKeyQuota(ctx context.Context, apiKeyID int, quota
 		}, nil
 	}
 
-	usageAgg, err := s.usageAgg(ctx, apiKeyID, window, quota.TotalTokens != nil, quota.Cost != nil)
+	usageAgg, err := authz.RunWithSystemBypass(ctx, "quota-usage-agg", func(bypassCtx context.Context) (usageAggResult, error) {
+		return s.usageAgg(bypassCtx, apiKeyID, window, quota.TotalTokens != nil, quota.Cost != nil)
+	})
 	if err != nil {
 		return QuotaCheckResult{}, err
 	}
@@ -109,12 +112,52 @@ func (s *QuotaService) CheckAPIKeyQuota(ctx context.Context, apiKeyID int, quota
 	}, nil
 }
 
+// ProfileQuotaUsage is the per-profile quota usage of an API key, shared by the
+// admin and OpenAPI GraphQL resolvers so the "iterate profiles → GetQuota" logic
+// lives in one place.
+type ProfileQuotaUsage struct {
+	ProfileName string
+	Quota       *objects.APIKeyQuota
+	Window      QuotaWindow
+	Usage       QuotaUsage
+}
+
+// ProfileQuotaUsages returns the realtime quota usage for every profile on the
+// given API key that has a quota configured. The caller is responsible for
+// loading the key (and thereby applying authorization); this method only reads
+// usage aggregates for the key's id.
+func (s *QuotaService) ProfileQuotaUsages(ctx context.Context, apiKey *ent.APIKey) ([]ProfileQuotaUsage, error) {
+	if apiKey.Profiles == nil || len(apiKey.Profiles.Profiles) == 0 {
+		return nil, nil
+	}
+
+	out := make([]ProfileQuotaUsage, 0, len(apiKey.Profiles.Profiles))
+
+	for _, p := range apiKey.Profiles.Profiles {
+		if p.Quota == nil {
+			continue
+		}
+
+		res, err := s.GetQuota(ctx, apiKey.ID, p.Quota)
+		if err != nil {
+			return nil, err
+		}
+
+		out = append(out, ProfileQuotaUsage{
+			ProfileName: p.Name,
+			Quota:       p.Quota,
+			Window:      res.Window,
+			Usage:       res.Usage,
+		})
+	}
+
+	return out, nil
+}
+
 func (s *QuotaService) GetQuota(ctx context.Context, apiKeyID int, quota *objects.APIKeyQuota) (QuotaResult, error) {
 	if quota == nil {
 		return QuotaResult{}, nil
 	}
-
-	ctx = privacy.DecisionContext(ctx, privacy.Allow)
 
 	loc := s.system.TimeLocation(ctx)
 
@@ -123,12 +166,16 @@ func (s *QuotaService) GetQuota(ctx context.Context, apiKeyID int, quota *object
 		return QuotaResult{}, err
 	}
 
-	reqCount, err := s.requestCount(ctx, apiKeyID, window)
+	reqCount, err := authz.RunWithSystemBypass(ctx, "quota-request-count", func(bypassCtx context.Context) (int64, error) {
+		return s.requestCount(bypassCtx, apiKeyID, window)
+	})
 	if err != nil {
 		return QuotaResult{}, err
 	}
 
-	usageAgg, err := s.usageAgg(ctx, apiKeyID, window, true, true)
+	usageAgg, err := authz.RunWithSystemBypass(ctx, "quota-usage-agg", func(bypassCtx context.Context) (usageAggResult, error) {
+		return s.usageAgg(bypassCtx, apiKeyID, window, true, true)
+	})
 	if err != nil {
 		return QuotaResult{}, err
 	}
@@ -151,7 +198,7 @@ func quotaWindow(now time.Time, period objects.APIKeyQuotaPeriod, loc *time.Loca
 	switch period.Type {
 	case objects.APIKeyQuotaPeriodTypeAllTime:
 		end := now
-		return QuotaWindow{End: &end}, nil
+		return QuotaWindow{End: &end, EndInclusive: true}, nil
 	case objects.APIKeyQuotaPeriodTypePastDuration:
 		if period.PastDuration == nil {
 			return QuotaWindow{}, fmt.Errorf("pastDuration is required")
@@ -177,7 +224,7 @@ func quotaWindow(now time.Time, period objects.APIKeyQuotaPeriod, loc *time.Loca
 		start := now.Add(-d)
 		end := now
 
-		return QuotaWindow{Start: &start, End: &end}, nil
+		return QuotaWindow{Start: &start, End: &end, EndInclusive: true}, nil
 	case objects.APIKeyQuotaPeriodTypeCalendarDuration:
 		if period.CalendarDuration == nil {
 			return QuotaWindow{}, fmt.Errorf("calendarDuration is required")
@@ -216,7 +263,11 @@ func (s *QuotaService) requestCount(ctx context.Context, apiKeyID int, window Qu
 	}
 
 	if window.End != nil {
-		q = q.Where(usagelog.CreatedAtLT(*window.End))
+		if window.EndInclusive {
+			q = q.Where(usagelog.CreatedAtLTE(*window.End))
+		} else {
+			q = q.Where(usagelog.CreatedAtLT(*window.End))
+		}
 	}
 
 	n, err := q.Count(ctx)
@@ -243,7 +294,11 @@ func (s *QuotaService) usageAgg(ctx context.Context, apiKeyID int, window QuotaW
 		}
 
 		if window.End != nil {
-			q = q.Where(usagelog.CreatedAtLT(*window.End))
+			if window.EndInclusive {
+				q = q.Where(usagelog.CreatedAtLTE(*window.End))
+			} else {
+				q = q.Where(usagelog.CreatedAtLT(*window.End))
+			}
 		}
 
 		switch {

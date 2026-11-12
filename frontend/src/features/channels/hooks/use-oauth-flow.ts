@@ -1,6 +1,14 @@
-import { useState, useCallback } from 'react';
-import { toast } from 'sonner';
+import { useState, useCallback, useEffect, useRef } from 'react';
 import { useTranslation } from 'react-i18next';
+import { toast } from 'sonner';
+import { ProxyType } from '../components/channels-proxy-dialog';
+
+export interface ProxyConfig {
+  type: ProxyType;
+  url?: string;
+  username?: string;
+  password?: string;
+}
 
 export interface OAuthStartResult {
   session_id: string;
@@ -10,6 +18,7 @@ export interface OAuthStartResult {
 export interface OAuthExchangeInput {
   session_id: string;
   callback_url: string;
+  proxy?: ProxyConfig;
 }
 
 export interface OAuthExchangeResult {
@@ -28,9 +37,9 @@ export interface OAuthFlowOptions {
   exchangeFn: (input: OAuthExchangeInput, headers?: Record<string, string>) => Promise<OAuthExchangeResult>;
 
   /**
-   * Optional project ID to include in headers
+   * Optional proxy configuration for exchange token request
    */
-  projectId?: string | null;
+  proxyConfig?: ProxyConfig;
 
   /**
    * Callback when credentials are successfully obtained
@@ -62,7 +71,6 @@ export interface OAuthFlowActions {
  * const codexOAuth = useOAuthFlow({
  *   startFn: codexOAuthStart,
  *   exchangeFn: codexOAuthExchange,
- *   projectId: selectedProjectId,
  *   onSuccess: (credentials) => form.setValue('credentials.apiKey', credentials),
  * });
  *
@@ -73,8 +81,15 @@ export interface OAuthFlowActions {
  * ```
  */
 export function useOAuthFlow(options: OAuthFlowOptions): OAuthFlowState & OAuthFlowActions {
-  const { startFn, exchangeFn, projectId, onSuccess } = options;
+  const { startFn, exchangeFn, proxyConfig, onSuccess } = options;
   const { t } = useTranslation();
+  const generation = useRef(0);
+  useEffect(
+    () => () => {
+      generation.current += 1;
+    },
+    []
+  );
 
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [authUrl, setAuthUrl] = useState<string | null>(null);
@@ -83,29 +98,26 @@ export function useOAuthFlow(options: OAuthFlowOptions): OAuthFlowState & OAuthF
   const [isExchanging, setIsExchanging] = useState(false);
 
   const start = useCallback(async () => {
-    if (!projectId) {
-      toast.error(t('channels.dialogs.oauth.errors.projectRequired'));
-      return;
-    }
-
+    const current = ++generation.current;
+    setSessionId(null);
+    setAuthUrl(null);
+    setCallbackUrl('');
+    setIsExchanging(false);
     setIsStarting(true);
     try {
-      const result = await startFn({ 'X-Project-ID': projectId });
+      const result = await startFn();
+      if (current !== generation.current) return;
       setSessionId(result.session_id);
       setAuthUrl(result.auth_url);
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : String(error));
+      if (current === generation.current) toast.error(error instanceof Error ? error.message : String(error));
     } finally {
-      setIsStarting(false);
+      if (current === generation.current) setIsStarting(false);
     }
-  }, [projectId, startFn, t]);
+  }, [startFn]);
 
   const exchange = useCallback(async () => {
-    if (!projectId) {
-      toast.error(t('channels.dialogs.oauth.errors.projectRequired'));
-      return;
-    }
-
+    const current = generation.current;
     if (!sessionId) {
       toast.error(t('channels.dialogs.oauth.errors.sessionMissing'));
       return;
@@ -118,27 +130,41 @@ export function useOAuthFlow(options: OAuthFlowOptions): OAuthFlowState & OAuthF
 
     setIsExchanging(true);
     try {
-      const result = await exchangeFn(
-        {
-          session_id: sessionId,
-          callback_url: callbackUrl.trim(),
-        },
-        { 'X-Project-ID': projectId }
-      );
+      const exchangeInput: OAuthExchangeInput = {
+        session_id: sessionId,
+        callback_url: callbackUrl.trim(),
+      };
+
+      // Add proxy config if provided and type is not disabled/environment
+      if (proxyConfig && proxyConfig.type === ProxyType.URL) {
+        exchangeInput.proxy = {
+          type: proxyConfig.type,
+          url: proxyConfig.url,
+          ...(proxyConfig.username && { username: proxyConfig.username }),
+          ...(proxyConfig.password && { password: proxyConfig.password }),
+        };
+      }
+
+      const result = await exchangeFn(exchangeInput);
+      if (current !== generation.current) return;
 
       if (onSuccess) {
         onSuccess(result.credentials);
       }
+      setCallbackUrl('');
+      setSessionId(null);
+      setAuthUrl(null);
 
       toast.success(t('channels.dialogs.oauth.messages.credentialsImported'));
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : String(error));
+      if (current === generation.current) toast.error(error instanceof Error ? error.message : String(error));
     } finally {
-      setIsExchanging(false);
+      if (current === generation.current) setIsExchanging(false);
     }
-  }, [projectId, sessionId, callbackUrl, exchangeFn, onSuccess, t]);
+  }, [sessionId, callbackUrl, exchangeFn, onSuccess, t, proxyConfig]);
 
   const reset = useCallback(() => {
+    generation.current += 1;
     setSessionId(null);
     setAuthUrl(null);
     setCallbackUrl('');

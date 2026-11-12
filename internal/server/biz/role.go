@@ -8,10 +8,12 @@ import (
 	"github.com/samber/lo"
 	"go.uber.org/fx"
 
+	"github.com/looplj/axonhub/internal/authz"
 	"github.com/looplj/axonhub/internal/ent"
-	"github.com/looplj/axonhub/internal/ent/privacy"
+	"github.com/looplj/axonhub/internal/ent/invitation"
 	"github.com/looplj/axonhub/internal/ent/role"
 	"github.com/looplj/axonhub/internal/ent/userrole"
+	"github.com/looplj/axonhub/internal/pkg/xerrors"
 )
 
 type RoleServiceParams struct {
@@ -50,7 +52,6 @@ func (s *RoleService) CreateRole(ctx context.Context, input ent.CreateRoleInput)
 		return nil, fmt.Errorf("permission denied: %w", err)
 	}
 
-	ctx = privacy.DecisionContext(ctx, privacy.Allow)
 	client := s.entFromContext(ctx)
 
 	var (
@@ -96,7 +97,7 @@ func (s *RoleService) CreateRole(ctx context.Context, input ent.CreateRoleInput)
 	}
 
 	if exists {
-		return nil, fmt.Errorf("role name '%s' already exists", input.Name)
+		return nil, xerrors.DuplicateNameError("role", input.Name)
 	}
 
 	role, err := client.Role.Create().
@@ -121,10 +122,7 @@ func (s *RoleService) UpdateRole(ctx context.Context, id int, input ent.UpdateRo
 
 	// Validate new scopes if being updated
 	if input.Scopes != nil {
-		ctx2 := privacy.DecisionContext(ctx, privacy.Allow)
-		client2 := ent.FromContext(ctx2)
-
-		role, err := client2.Role.Get(ctx2, id)
+		role, err := s.entFromContext(ctx).Role.Get(ctx, id)
 		if err != nil {
 			return nil, fmt.Errorf("failed to get role: %w", err)
 		}
@@ -139,7 +137,6 @@ func (s *RoleService) UpdateRole(ctx context.Context, id int, input ent.UpdateRo
 		}
 	}
 
-	ctx = privacy.DecisionContext(ctx, privacy.Allow)
 	client := s.entFromContext(ctx)
 
 	// If name is being updated, check for duplicates
@@ -157,7 +154,7 @@ func (s *RoleService) UpdateRole(ctx context.Context, id int, input ent.UpdateRo
 			}
 
 			if exists {
-				return nil, fmt.Errorf("role name '%s' already exists", *input.Name)
+				return nil, xerrors.DuplicateNameError("role", *input.Name)
 			}
 		}
 	}
@@ -182,35 +179,35 @@ func (s *RoleService) UpdateRole(ctx context.Context, id int, input ent.UpdateRo
 // DeleteRole deletes a role and all associated user-role relationships.
 // It uses the UserRole entity to delete all relationships through the role_id.
 func (s *RoleService) DeleteRole(ctx context.Context, id int) error {
-	ctx = privacy.DecisionContext(ctx, privacy.Allow)
-	client := s.entFromContext(ctx)
+	err := s.RunInTransaction(ctx, func(ctx context.Context) error {
+		client := s.entFromContext(ctx)
 
-	// First, check if the role exists
-	exists, err := client.Role.Query().
-		Where(role.IDEQ(id)).
-		Exist(ctx)
+		roleEntity, err := client.Role.Query().
+			Where(role.IDEQ(id)).
+			Only(ctx)
+		if err != nil {
+			return fmt.Errorf("failed to check role existence: %w", err)
+		}
+		if roleEntity.Name == "Developer" {
+			return fmt.Errorf("cannot delete the default Developer role")
+		}
+
+		if err := revokeRoleInvitations(ctx, id); err != nil {
+			return err
+		}
+		if _, err := client.UserRole.Delete().Where(userrole.RoleID(id)).Exec(ctx); err != nil {
+			return fmt.Errorf("failed to delete user role relationships: %w", err)
+		}
+		if err := client.Role.DeleteOneID(id).Exec(ctx); err != nil {
+			return fmt.Errorf("failed to delete role: %w", err)
+		}
+
+		return nil
+	})
 	if err != nil {
-		return fmt.Errorf("failed to check role existence: %w", err)
+		return err
 	}
 
-	if !exists {
-		return fmt.Errorf("role not found")
-	}
-
-	// Delete all UserRole relationships for this role
-	_, err = client.UserRole.Delete().
-		Where(userrole.RoleID(id)).
-		Exec(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to delete user role relationships: %w", err)
-	}
-
-	// Now delete the role itself
-	err = client.Role.DeleteOneID(id).Exec(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to delete role: %w", err)
-	}
-	// Invalidate cache for all users with this role BEFORE deleting relationships
 	s.invalidateUserCache(ctx)
 
 	return nil
@@ -218,38 +215,39 @@ func (s *RoleService) DeleteRole(ctx context.Context, id int) error {
 
 // BulkDeleteRoles deletes multiple roles and all associated user-role relationships.
 func (s *RoleService) BulkDeleteRoles(ctx context.Context, ids []int) error {
-	client := s.entFromContext(ctx)
-
 	if len(ids) == 0 {
 		return nil
 	}
 
-	// Verify all roles exist
-	count, err := client.Role.Query().
-		Where(role.IDIn(ids...)).
-		Count(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to query roles: %w", err)
-	}
+	err := s.RunInTransaction(ctx, func(ctx context.Context) error {
+		client := s.entFromContext(ctx)
+		roles, err := client.Role.Query().Where(role.IDIn(ids...)).All(ctx)
+		if err != nil {
+			return fmt.Errorf("failed to query roles: %w", err)
+		}
+		if len(roles) != len(ids) {
+			return fmt.Errorf("expected to find %d roles, but found %d", len(ids), len(roles))
+		}
+		for _, r := range roles {
+			if r.Name == "Developer" {
+				return fmt.Errorf("cannot delete the default Developer role")
+			}
+		}
 
-	if count != len(ids) {
-		return fmt.Errorf("expected to find %d roles, but found %d", len(ids), count)
-	}
+		if err := revokeRoleInvitations(ctx, ids...); err != nil {
+			return err
+		}
+		if _, err := client.UserRole.Delete().Where(userrole.RoleIDIn(ids...)).Exec(ctx); err != nil {
+			return fmt.Errorf("failed to delete user role relationships: %w", err)
+		}
+		if _, err := client.Role.Delete().Where(role.IDIn(ids...)).Exec(ctx); err != nil {
+			return fmt.Errorf("failed to delete roles: %w", err)
+		}
 
-	// Delete all UserRole relationships for these roles
-	_, err = client.UserRole.Delete().
-		Where(userrole.RoleIDIn(ids...)).
-		Exec(ctx)
+		return nil
+	})
 	if err != nil {
-		return fmt.Errorf("failed to delete user role relationships: %w", err)
-	}
-
-	// Now delete all roles
-	_, err = client.Role.Delete().
-		Where(role.IDIn(ids...)).
-		Exec(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to delete roles: %w", err)
+		return err
 	}
 
 	s.invalidateUserCache(ctx)
@@ -257,9 +255,19 @@ func (s *RoleService) BulkDeleteRoles(ctx context.Context, ids []int) error {
 	return nil
 }
 
+func revokeRoleInvitations(ctx context.Context, roleIDs ...int) error {
+	_, err := authz.RunWithSystemBypass(ctx, "revoke-role-invitations", func(ctx context.Context) (int, error) {
+		return ent.FromContext(ctx).Invitation.Delete().Where(invitation.RoleIDIn(roleIDs...)).Exec(ctx)
+	})
+	if err != nil {
+		return fmt.Errorf("failed to revoke role invitations: %w", err)
+	}
+
+	return nil
+}
+
 // RoleNameExists checks if a role name already exists within a specific project.
 func (s *RoleService) RoleNameExists(ctx context.Context, level role.Level, name string, projectID *int) (bool, error) {
-	ctx = privacy.DecisionContext(ctx, privacy.Allow)
 	client := s.entFromContext(ctx)
 
 	if level == role.LevelSystem {

@@ -3,15 +3,15 @@ import { Link } from '@tanstack/react-router';
 import { IconSettings } from '@tabler/icons-react';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
+import { SidebarTrigger, useSidebar } from '@/components/ui/sidebar';
 import { Button } from '@/components/ui/button';
-import { SidebarTrigger } from '@/components/ui/sidebar';
 import { LanguageSwitch } from '@/components/language-switch';
-import { PermissionGuard } from '@/components/permission-guard';
-import { ProfileDropdown } from '@/components/profile-dropdown';
 import { ThemeSwitch } from '@/components/theme-switch';
 import { QuotaBadges } from '@/components/quota-badges';
+import { PermissionGuard } from '@/components/permission-guard';
 import { checkProviderQuotas } from '@/features/system/data/quotas';
 import { useBrandSettings } from '@/features/system/data/system';
+import { BrandLogo } from './brand-logo';
 import { ProjectSwitcher } from './project-switcher';
 import { toast } from 'sonner';
 
@@ -20,6 +20,7 @@ export function AppHeader() {
   const { t } = useTranslation();
   const [isRefreshing, setIsRefreshing] = useState(false);
   const queryClient = useQueryClient();
+  const { isMobile } = useSidebar();
   const displayName = brandSettings?.brandName || 'AxonHub';
 
   const refreshMutation = useMutation({
@@ -27,7 +28,7 @@ export function AppHeader() {
       return checkProviderQuotas();
     },
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['provider-quotas'] });
+      void queryClient.refetchQueries({ queryKey: ['provider-quotas'] });
       toast.success(t('system.providerQuota.refresh.success'));
     },
     onError: (error: any) => {
@@ -53,20 +54,7 @@ export function AppHeader() {
           {/* Logo */}
           <div className='flex items-center gap-2'>
             <div className='flex size-8 shrink-0 items-center justify-center overflow-hidden rounded'>
-              {brandSettings?.brandLogo ? (
-                <img
-                  src={brandSettings.brandLogo}
-                  alt='Brand Logo'
-                  width={24}
-                  height={24}
-                  className='size-8 object-cover'
-                  onError={(e) => {
-                    e.currentTarget.src = '/logo.jpg';
-                  }}
-                />
-              ) : (
-                <img src='/logo.jpg' alt='Default Logo' width={24} height={24} className='size-8 object-cover' />
-              )}
+              <BrandLogo brandLogo={brandSettings?.brandLogo} />
             </div>
             <span className='text-sm leading-none font-semibold'>{displayName}</span>
           </div>
@@ -80,19 +68,25 @@ export function AppHeader() {
 
         {/* 右侧控件 */}
         <div className='flex items-center gap-2 pr-6'>
-          {/* Quota Badges */}
-          <QuotaBadges onRefresh={handleRefresh} isRefreshing={isRefreshing} />
-
-          <PermissionGuard requiredSystemScope='read_system'>
-            <Link to='/system'>
-              <Button variant='ghost' size='icon' className='size-8'>
-                <IconSettings className='h-4 w-4' />
-              </Button>
-            </Link>
+          {/* Quota Badges - only visible to users with channel read permission */}
+          <PermissionGuard requiredSystemScope='read_channels'>
+            <QuotaBadges onRefresh={handleRefresh} isRefreshing={isRefreshing} />
           </PermissionGuard>
-          <LanguageSwitch />
-          <ThemeSwitch />
-          <ProfileDropdown />
+
+          {/* Desktop-only controls - hidden on mobile */}
+          {!isMobile && (
+            <>
+              <PermissionGuard requiredSystemScope='read_settings'>
+                <Link to='/system'>
+                  <Button variant='ghost' size='icon' className='size-8'>
+                    <IconSettings className='h-4 w-4' />
+                  </Button>
+                </Link>
+              </PermissionGuard>
+              <LanguageSwitch />
+              <ThemeSwitch />
+            </>
+          )}
         </div>
       </div>
     </header>

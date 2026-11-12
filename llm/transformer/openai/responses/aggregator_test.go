@@ -8,8 +8,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/looplj/axonhub/internal/pkg/xtest"
 	"github.com/looplj/axonhub/llm/httpclient"
+	"github.com/looplj/axonhub/llm/internal/pkg/xtest"
 )
 
 func TestAggregateStreamChunks(t *testing.T) {
@@ -42,6 +42,75 @@ func TestAggregateStreamChunks(t *testing.T) {
 	}
 }
 
+func TestAggregateStreamChunks_CancelledFallbackUsesCanonicalStatus(t *testing.T) {
+	resultBytes, _, err := AggregateStreamChunks(t.Context(), []*httpclient.StreamEvent{
+		{Type: "response.cancelled", Data: []byte(`{"type":"response.cancelled","response":{"id":"resp_canceled","object":"response","created_at":1700000000,"model":"gpt-5","output":[]}}`)},
+	})
+	require.NoError(t, err)
+
+	var body Response
+	require.NoError(t, json.Unmarshal(resultBytes, &body))
+	require.NotNil(t, body.Status)
+	require.Equal(t, "canceled", *body.Status)
+}
+
+func TestAggregateStreamChunks_CompletedEventPreservesResponseSnapshot(t *testing.T) {
+	tests := []struct {
+		name   string
+		fields string
+		status string
+	}{
+		{"no status", "", "completed"},
+		{"empty status", `,"status":""`, "completed"},
+		{"stale in-progress status", `,"status":"in_progress"`, "completed"},
+		{"completed", `,"status":"completed"`, "completed"},
+		{"incomplete", `,"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"}`, "incomplete"},
+		{"content filter", `,"status":"incomplete","incomplete_details":{"reason":"content_filter"}`, "incomplete"},
+		{"failed", `,"status":"failed","error":{"type":"server_error","code":"provider_error","message":"provider failed"}`, "failed"},
+		{"canceled", `,"status":"canceled"`, "canceled"},
+		{"canceled", `,"status":"canceled"`, "canceled"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			snapshot := `{"id":"resp_terminal","model":"gpt-5","created_at":1700000001,"previous_response_id":"resp_previous","output":[],"usage":{"input_tokens":10,"output_tokens":2,"total_tokens":12}` + tt.fields + `}`
+			body, meta, err := AggregateStreamChunks(t.Context(), []*httpclient.StreamEvent{
+				{Type: "response.completed", Data: []byte(`{"type":"response.completed","response":` + snapshot + `}`)},
+			})
+			require.NoError(t, err)
+			var expected, actual Response
+			require.NoError(t, json.Unmarshal([]byte(snapshot), &expected))
+			require.NoError(t, json.Unmarshal(body, &actual))
+			require.NotNil(t, actual.Status)
+			require.Equal(t, tt.status, *actual.Status)
+			require.Equal(t, expected.ID, actual.ID)
+			require.Equal(t, expected.Model, actual.Model)
+			require.Equal(t, expected.CreatedAt, actual.CreatedAt)
+			require.Equal(t, expected.PreviousResponseID, actual.PreviousResponseID)
+			require.Equal(t, expected.Error, actual.Error)
+			require.Equal(t, expected.IncompleteDetails, actual.IncompleteDetails)
+			require.Equal(t, expected.Usage, actual.Usage)
+			require.Equal(t, expected.ID, meta.ID)
+			require.Equal(t, expected.Usage.ToUsage(), meta.Usage)
+		})
+	}
+}
+
+func TestAggregateStreamChunks_CancelledSnapshotPreservesStatus(t *testing.T) {
+	resultBytes, _, err := AggregateStreamChunks(t.Context(), []*httpclient.StreamEvent{
+		{Type: "response.created", Data: []byte(`{"type":"response.created","response":{"id":"resp_canceled","object":"response","created_at":1700000000,"model":"gpt-5","status":"in_progress","output":[]}}`)},
+		{Type: "response.cancelled", Data: []byte(`{"type":"response.cancelled","response":{"id":"resp_canceled","object":"response","created_at":1700000001,"model":"gpt-5-codex","status":"canceled","output":[]}}`)},
+	})
+	require.NoError(t, err)
+
+	var body Response
+	require.NoError(t, json.Unmarshal(resultBytes, &body))
+	require.Equal(t, "resp_canceled", body.ID)
+	require.Equal(t, "gpt-5-codex", body.Model)
+	require.Equal(t, int64(1700000001), body.CreatedAt)
+	require.NotNil(t, body.Status)
+	require.Equal(t, "canceled", *body.Status)
+}
+
 func TestAggregateStreamChunks_WithTestData(t *testing.T) {
 	tests := []struct {
 		name             string
@@ -55,6 +124,13 @@ func TestAggregateStreamChunks_WithTestData(t *testing.T) {
 			streamFile:       "tool-2.stream.jsonl",
 			expectedFile:     "tool-2.response.json",
 			expectedMetaID:   "resp_020592949fb9ce090069355e9a54788196911d78a6360a88f2",
+			expectedHasUsage: true,
+		},
+		{
+			name:             "custom tool call stream",
+			streamFile:       "custom_tool.stream.jsonl",
+			expectedFile:     "custom_tool.stream.response.json",
+			expectedMetaID:   "resp_custom_tool_stream_001",
 			expectedHasUsage: true,
 		},
 	}
@@ -252,6 +328,327 @@ func TestAggregateStreamChunks_BasicEvents(t *testing.T) {
 	require.Equal(t, int64(5), meta.Usage.CompletionTokens)
 }
 
+func TestAggregateStreamChunks_PreservesAnnotationsFromFinalOutputItem(t *testing.T) {
+	chunks := []*httpclient.StreamEvent{
+		{
+			Type: "response.created",
+			Data: []byte(`{
+				"type": "response.created",
+				"sequence_number": 0,
+				"response": {
+					"id": "resp_annotations_123",
+					"object": "response",
+					"created_at": 1700000000,
+					"model": "gpt-4o-search-preview",
+					"status": "in_progress",
+					"output": []
+				}
+			}`),
+		},
+		{
+			Type: "response.output_item.added",
+			Data: []byte(`{
+				"type": "response.output_item.added",
+				"sequence_number": 1,
+				"output_index": 0,
+				"item": {
+					"id": "msg_annotations_456",
+					"type": "message",
+					"status": "in_progress",
+					"role": "assistant"
+				}
+			}`),
+		},
+		{
+			Type: "response.content_part.added",
+			Data: []byte(`{
+				"type": "response.content_part.added",
+				"sequence_number": 2,
+				"item_id": "msg_annotations_456",
+				"output_index": 0,
+				"content_index": 0,
+				"part": {
+					"type": "output_text",
+					"text": ""
+				}
+			}`),
+		},
+		{
+			Type: "response.output_text.delta",
+			Data: []byte(`{
+				"type": "response.output_text.delta",
+				"sequence_number": 3,
+				"item_id": "msg_annotations_456",
+				"output_index": 0,
+				"content_index": 0,
+				"delta": "Search result"
+			}`),
+		},
+		{
+			Type: "response.output_text.done",
+			Data: []byte(`{
+				"type": "response.output_text.done",
+				"sequence_number": 4,
+				"item_id": "msg_annotations_456",
+				"output_index": 0,
+				"content_index": 0,
+				"text": "Search result"
+			}`),
+		},
+		{
+			Type: "response.output_item.done",
+			Data: []byte(`{
+				"type": "response.output_item.done",
+				"sequence_number": 5,
+				"output_index": 0,
+				"item": {
+					"id": "msg_annotations_456",
+					"type": "message",
+					"status": "completed",
+					"role": "assistant",
+					"content": [
+						{
+							"type": "output_text",
+							"text": "Search result",
+							"annotations": [
+								{
+									"type": "url_citation",
+									"start_index": 0,
+									"end_index": 6,
+									"url_citation": {
+										"url": "https://example.com/result",
+										"title": "Example Result"
+									}
+								}
+							]
+						}
+					]
+				}
+			}`),
+		},
+		{
+			Type: "response.completed",
+			Data: []byte(`{
+				"type": "response.completed",
+				"sequence_number": 6,
+				"response": {
+					"id": "resp_annotations_123",
+					"object": "response",
+					"created_at": 1700000000,
+					"model": "gpt-4o-search-preview",
+					"status": "completed",
+					"output": []
+				}
+			}`),
+		},
+	}
+
+	resultBytes, _, err := AggregateStreamChunks(t.Context(), chunks)
+	require.NoError(t, err)
+
+	var resp Response
+	err = json.Unmarshal(resultBytes, &resp)
+	require.NoError(t, err)
+	require.Len(t, resp.Output, 1)
+
+	contentItems := resp.Output[0].GetContentItems()
+	require.Len(t, contentItems, 1)
+	require.Equal(t, "Search result", contentItems[0].Text)
+	require.Len(t, contentItems[0].Annotations, 1)
+	require.Equal(t, "url_citation", contentItems[0].Annotations[0].Type)
+	require.NotNil(t, contentItems[0].Annotations[0].StartIndex)
+	require.NotNil(t, contentItems[0].Annotations[0].EndIndex)
+	require.Equal(t, int64(0), *contentItems[0].Annotations[0].StartIndex)
+	require.Equal(t, int64(6), *contentItems[0].Annotations[0].EndIndex)
+	require.NotNil(t, contentItems[0].Annotations[0].URLCitation)
+	require.Equal(t, "https://example.com/result", contentItems[0].Annotations[0].URLCitation.URL)
+	require.Equal(t, "Example Result", contentItems[0].Annotations[0].URLCitation.Title)
+}
+
+func TestAggregateStreamChunks_PreservesEarlierAnnotationsWhenFinalItemOmitsThem(t *testing.T) {
+	chunks := []*httpclient.StreamEvent{
+		{
+			Type: "response.created",
+			Data: []byte(`{
+				"type": "response.created",
+				"sequence_number": 0,
+				"response": {
+					"id": "resp_annotations_preserved_123",
+					"object": "response",
+					"created_at": 1700000000,
+					"model": "gpt-4o-search-preview",
+					"status": "in_progress",
+					"output": []
+				}
+			}`),
+		},
+		{
+			Type: "response.output_item.added",
+			Data: []byte(`{
+				"type": "response.output_item.added",
+				"sequence_number": 1,
+				"output_index": 0,
+				"item": {
+					"id": "msg_annotations_preserved_456",
+					"type": "message",
+					"status": "in_progress",
+					"role": "assistant"
+				}
+			}`),
+		},
+		{
+			Type: "response.content_part.added",
+			Data: []byte(`{
+				"type": "response.content_part.added",
+				"sequence_number": 2,
+				"item_id": "msg_annotations_preserved_456",
+				"output_index": 0,
+				"content_index": 0,
+				"part": {
+					"type": "output_text",
+					"text": "",
+					"annotations": [
+						{
+							"type": "url_citation",
+							"start_index": 0,
+							"end_index": 6,
+							"url_citation": {
+								"url": "https://example.com/earlier",
+								"title": "Earlier Result"
+							}
+						}
+					]
+				}
+			}`),
+		},
+		{
+			Type: "response.output_text.delta",
+			Data: []byte(`{
+				"type": "response.output_text.delta",
+				"sequence_number": 3,
+				"item_id": "msg_annotations_preserved_456",
+				"output_index": 0,
+				"content_index": 0,
+				"delta": "Search result"
+			}`),
+		},
+		{
+			Type: "response.output_text.done",
+			Data: []byte(`{
+				"type": "response.output_text.done",
+				"sequence_number": 4,
+				"item_id": "msg_annotations_preserved_456",
+				"output_index": 0,
+				"content_index": 0,
+				"text": "Search result"
+			}`),
+		},
+		{
+			Type: "response.output_item.done",
+			Data: []byte(`{
+				"type": "response.output_item.done",
+				"sequence_number": 5,
+				"output_index": 0,
+				"item": {
+					"id": "msg_annotations_preserved_456",
+					"type": "message",
+					"status": "completed",
+					"role": "assistant",
+					"content": [
+						{
+							"type": "output_text",
+							"text": "Search result"
+						}
+					]
+				}
+			}`),
+		},
+		{
+			Type: "response.completed",
+			Data: []byte(`{
+				"type": "response.completed",
+				"sequence_number": 6,
+				"response": {
+					"id": "resp_annotations_preserved_123",
+					"object": "response",
+					"created_at": 1700000000,
+					"model": "gpt-4o-search-preview",
+					"status": "completed",
+					"output": []
+				}
+			}`),
+		},
+	}
+
+	resultBytes, _, err := AggregateStreamChunks(t.Context(), chunks)
+	require.NoError(t, err)
+
+	var resp Response
+	err = json.Unmarshal(resultBytes, &resp)
+	require.NoError(t, err)
+	require.Len(t, resp.Output, 1)
+
+	contentItems := resp.Output[0].GetContentItems()
+	require.Len(t, contentItems, 1)
+	require.Equal(t, "Search result", contentItems[0].Text)
+	require.Len(t, contentItems[0].Annotations, 1)
+	require.Equal(t, "url_citation", contentItems[0].Annotations[0].Type)
+	require.NotNil(t, contentItems[0].Annotations[0].StartIndex)
+	require.NotNil(t, contentItems[0].Annotations[0].EndIndex)
+	require.Equal(t, int64(0), *contentItems[0].Annotations[0].StartIndex)
+	require.Equal(t, int64(6), *contentItems[0].Annotations[0].EndIndex)
+	require.NotNil(t, contentItems[0].Annotations[0].URLCitation)
+	require.Equal(t, "https://example.com/earlier", contentItems[0].Annotations[0].URLCitation.URL)
+	require.Equal(t, "Earlier Result", contentItems[0].Annotations[0].URLCitation.Title)
+}
+
+func TestAggregateStreamChunks_PreservesPreviousResponseID(t *testing.T) {
+	chunks := []*httpclient.StreamEvent{
+		{
+			Type: "response.created",
+			Data: []byte(`{
+				"type": "response.created",
+				"sequence_number": 0,
+				"response": {
+					"id": "resp_test_prev",
+					"object": "response",
+					"created_at": 1700000000,
+					"model": "gpt-5.4",
+					"status": "in_progress",
+					"previous_response_id": "resp_prev_123",
+					"output": []
+				}
+			}`),
+		},
+		{
+			Type: "response.completed",
+			Data: []byte(`{
+				"type": "response.completed",
+				"sequence_number": 1,
+				"response": {
+					"id": "resp_test_prev",
+					"object": "response",
+					"created_at": 1700000000,
+					"model": "gpt-5.4",
+					"status": "completed",
+					"previous_response_id": "resp_prev_123",
+					"output": []
+				}
+			}`),
+		},
+	}
+
+	resultBytes, _, err := AggregateStreamChunks(t.Context(), chunks)
+	require.NoError(t, err)
+
+	var resp Response
+
+	err = json.Unmarshal(resultBytes, &resp)
+	require.NoError(t, err)
+	require.NotNil(t, resp.PreviousResponseID)
+	require.Equal(t, "resp_prev_123", *resp.PreviousResponseID)
+}
+
 func TestAggregateStreamChunks_SkipsInvalidJSON(t *testing.T) {
 	chunks := []*httpclient.StreamEvent{
 		{
@@ -337,4 +734,265 @@ func TestAggregateStreamChunks_SkipsDONEMarker(t *testing.T) {
 	err = json.Unmarshal(resultBytes, &resp)
 	require.NoError(t, err)
 	require.Equal(t, "resp_test", resp.ID)
+}
+
+func TestAggregateStreamChunks_ReasoningSummaryMultipleParts(t *testing.T) {
+	chunks := []*httpclient.StreamEvent{
+		{
+			Type: "response.created",
+			Data: []byte(`{
+				"type": "response.created",
+				"sequence_number": 0,
+				"response": {
+					"id": "resp_test_reasoning_multi_summary",
+					"object": "response",
+					"created_at": 1700000000,
+					"model": "gpt-5",
+					"status": "in_progress",
+					"output": []
+				}
+			}`),
+		},
+		{
+			Type: "response.output_item.added",
+			Data: []byte(`{
+				"type": "response.output_item.added",
+				"sequence_number": 1,
+				"output_index": 0,
+				"item": {
+					"id": "rs_test_multi_001",
+					"type": "reasoning",
+					"status": "in_progress",
+					"summary": []
+				}
+			}`),
+		},
+		{
+			Type: "response.reasoning_summary_part.done",
+			Data: []byte(`{
+				"type": "response.reasoning_summary_part.done",
+				"sequence_number": 2,
+				"item_id": "rs_test_multi_001",
+				"output_index": 0,
+				"summary_index": 0,
+				"part": {
+					"type": "summary_text",
+					"text": "**Analyzing output logic**"
+				}
+			}`),
+		},
+		{
+			Type: "response.reasoning_summary_part.added",
+			Data: []byte(`{
+				"type": "response.reasoning_summary_part.added",
+				"sequence_number": 3,
+				"item_id": "rs_test_multi_001",
+				"output_index": 0,
+				"summary_index": 1,
+				"part": {
+					"type": "summary_text",
+					"text": ""
+				}
+			}`),
+		},
+		{
+			Type: "response.output_item.done",
+			Data: []byte(`{
+				"type": "response.output_item.done",
+				"sequence_number": 4,
+				"output_index": 0,
+				"item": {
+					"id": "rs_test_multi_001",
+					"type": "reasoning",
+					"status": "completed",
+					"summary": []
+				}
+			}`),
+		},
+		{
+			Type: "response.completed",
+			Data: []byte(`{
+				"type": "response.completed",
+				"sequence_number": 5,
+				"response": {
+					"id": "resp_test_reasoning_multi_summary",
+					"object": "response",
+					"created_at": 1700000000,
+					"model": "gpt-5",
+					"status": "completed",
+					"output": []
+				}
+			}`),
+		},
+	}
+
+	resultBytes, _, err := AggregateStreamChunks(t.Context(), chunks)
+	require.NoError(t, err)
+	require.NotNil(t, resultBytes)
+
+	var resp Response
+
+	err = json.Unmarshal(resultBytes, &resp)
+	require.NoError(t, err)
+
+	require.Len(t, resp.Output, 1)
+	require.Equal(t, "reasoning", resp.Output[0].Type)
+	require.Len(t, resp.Output[0].Summary, 2)
+	require.Equal(t, "summary_text", resp.Output[0].Summary[0].Type)
+	require.Equal(t, "**Analyzing output logic**", resp.Output[0].Summary[0].Text)
+	require.Equal(t, "summary_text", resp.Output[0].Summary[1].Type)
+	require.Equal(t, "", resp.Output[0].Summary[1].Text)
+}
+
+// TestAggregateStreamChunks_ReasoningText verifies that reasoning_text delta and
+// done events are reconstructed as the official reasoning item content array.
+func TestAggregateStreamChunks_ReasoningText(t *testing.T) {
+	chunks := []*httpclient.StreamEvent{
+		{Type: "response.created", Data: []byte(`{"type":"response.created","sequence_number":0,"response":{"id":"resp_reasoning_text","object":"response","created_at":1700000000,"model":"deepseek-v4-flash","status":"in_progress","output":[]}}`)},
+		{Type: "response.output_item.added", Data: []byte(`{"type":"response.output_item.added","sequence_number":1,"output_index":0,"item":{"id":"rs_text","type":"reasoning","status":"in_progress","summary":[],"content":[]}}`)},
+		{Type: "response.reasoning_text.delta", Data: []byte(`{"type":"response.reasoning_text.delta","sequence_number":2,"item_id":"rs_text","output_index":0,"content_index":0,"delta":"first"}`)},
+		{Type: "response.reasoning_text.delta", Data: []byte(`{"type":"response.reasoning_text.delta","sequence_number":3,"item_id":"rs_text","output_index":0,"content_index":0,"delta":" second"}`)},
+		{Type: "response.reasoning_text.done", Data: []byte(`{"type":"response.reasoning_text.done","sequence_number":4,"item_id":"rs_text","output_index":0,"content_index":0,"text":"first second"}`)},
+		{Type: "response.output_item.done", Data: []byte(`{"type":"response.output_item.done","sequence_number":5,"output_index":0,"item":{"id":"rs_text","type":"reasoning","status":"completed","summary":[]}}`)},
+		{Type: "response.completed", Data: []byte(`{"type":"response.completed","sequence_number":6,"response":{"id":"resp_reasoning_text","object":"response","created_at":1700000000,"model":"deepseek-v4-flash","status":"completed","output":[]}}`)},
+	}
+
+	resultBytes, _, err := AggregateStreamChunks(t.Context(), chunks)
+	require.NoError(t, err)
+
+	var response Response
+	require.NoError(t, json.Unmarshal(resultBytes, &response))
+	require.Len(t, response.Output, 1)
+	require.Equal(t, "reasoning", response.Output[0].Type)
+	require.NotNil(t, response.Output[0].Content)
+	require.Len(t, response.Output[0].Content.Items, 1)
+	require.Equal(t, "reasoning_text", response.Output[0].Content.Items[0].Type)
+	require.NotNil(t, response.Output[0].Content.Items[0].Text)
+	require.Equal(t, "first second", *response.Output[0].Content.Items[0].Text)
+}
+
+// TestAggregateStreamChunks_ReasoningTextRejectsInvalidContentIndex verifies that
+// provider-controlled indexes cannot panic or expand content storage without bounds.
+func TestAggregateStreamChunks_ReasoningTextRejectsInvalidContentIndex(t *testing.T) {
+	tests := []struct {
+		name  string
+		event *httpclient.StreamEvent
+	}{
+		{
+			name:  "negative delta index",
+			event: &httpclient.StreamEvent{Type: "response.reasoning_text.delta", Data: []byte(`{"type":"response.reasoning_text.delta","sequence_number":2,"item_id":"rs_text","output_index":0,"content_index":-1,"delta":"ignored"}`)},
+		},
+		{
+			name:  "negative done index",
+			event: &httpclient.StreamEvent{Type: "response.reasoning_text.done", Data: []byte(`{"type":"response.reasoning_text.done","sequence_number":2,"item_id":"rs_text","output_index":0,"content_index":-1,"text":"ignored"}`)},
+		},
+		{
+			name:  "oversized delta index",
+			event: &httpclient.StreamEvent{Type: "response.reasoning_text.delta", Data: []byte(`{"type":"response.reasoning_text.delta","sequence_number":2,"item_id":"rs_text","output_index":0,"content_index":1024,"delta":"ignored"}`)},
+		},
+		{
+			name:  "oversized done index",
+			event: &httpclient.StreamEvent{Type: "response.reasoning_text.done", Data: []byte(`{"type":"response.reasoning_text.done","sequence_number":2,"item_id":"rs_text","output_index":0,"content_index":1024,"text":"ignored"}`)},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			chunks := []*httpclient.StreamEvent{
+				{Type: "response.created", Data: []byte(`{"type":"response.created","sequence_number":0,"response":{"id":"resp_reasoning_text","object":"response","created_at":1700000000,"model":"deepseek-v4-flash","status":"in_progress","output":[]}}`)},
+				{Type: "response.output_item.added", Data: []byte(`{"type":"response.output_item.added","sequence_number":1,"output_index":0,"item":{"id":"rs_text","type":"reasoning","status":"in_progress","summary":[],"content":[]}}`)},
+				tt.event,
+				{Type: "response.completed", Data: []byte(`{"type":"response.completed","sequence_number":3,"response":{"id":"resp_reasoning_text","object":"response","created_at":1700000000,"model":"deepseek-v4-flash","status":"completed","output":[]}}`)},
+			}
+
+			resultBytes, _, err := AggregateStreamChunks(t.Context(), chunks)
+			require.NoError(t, err)
+
+			var response Response
+			require.NoError(t, json.Unmarshal(resultBytes, &response))
+			require.Len(t, response.Output, 1)
+			require.Nil(t, response.Output[0].Content)
+		})
+	}
+}
+
+func TestAggregateStreamChunks_ImageGenerationCall(t *testing.T) {
+	chunks := []*httpclient.StreamEvent{
+		{
+			Type: "response.created",
+			Data: []byte(`{
+				"type": "response.created",
+				"sequence_number": 0,
+				"response": {
+					"id": "resp_img_gen_001",
+					"object": "response",
+					"created_at": 1760000000,
+					"model": "gpt-image-2",
+					"status": "in_progress",
+					"output": []
+				}
+			}`),
+		},
+		{
+			Type: "response.output_item.added",
+			Data: []byte(`{
+				"type": "response.output_item.added",
+				"sequence_number": 1,
+				"output_index": 0,
+				"item": {
+					"id": "img_call_001",
+					"type": "image_generation_call",
+					"status": "in_progress",
+					"call_id": "call_abc"
+				}
+			}`),
+		},
+		{
+			Type: "response.output_item.done",
+			Data: []byte(`{
+				"type": "response.output_item.done",
+				"sequence_number": 2,
+				"output_index": 0,
+				"item": {
+					"id": "img_call_001",
+					"type": "image_generation_call",
+					"status": "completed",
+					"call_id": "call_abc",
+					"result": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+				}
+			}`),
+		},
+		{
+			Type: "response.completed",
+			Data: []byte(`{
+				"type": "response.completed",
+				"sequence_number": 3,
+				"response": {
+					"id": "resp_img_gen_001",
+					"object": "response",
+					"created_at": 1760000000,
+					"model": "gpt-image-2",
+					"status": "completed",
+					"output": []
+				}
+			}`),
+		},
+	}
+
+	resultBytes, _, err := AggregateStreamChunks(t.Context(), chunks)
+	require.NoError(t, err)
+	require.NotNil(t, resultBytes)
+
+	var resp Response
+
+	err = json.Unmarshal(resultBytes, &resp)
+	require.NoError(t, err)
+
+	require.Equal(t, "resp_img_gen_001", resp.ID)
+	require.Len(t, resp.Output, 1)
+	require.Equal(t, "image_generation_call", resp.Output[0].Type)
+	require.Equal(t, "completed", *resp.Output[0].Status)
+	require.Equal(t, "call_abc", resp.Output[0].CallID)
+	require.NotNil(t, resp.Output[0].Result)
+	require.Equal(t, "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==", *resp.Output[0].Result)
 }

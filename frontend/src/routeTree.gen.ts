@@ -26,6 +26,7 @@ import { Route as AuthenticatedUsersIndexRouteImport } from './routes/_authentic
 import { Route as AuthenticatedSystemIndexRouteImport } from './routes/_authenticated/system/index'
 import { Route as AuthenticatedSettingsIndexRouteImport } from './routes/_authenticated/settings/index'
 import { Route as AuthenticatedRolesIndexRouteImport } from './routes/_authenticated/roles/index'
+import { Route as AuthenticatedPromptProtectionRulesIndexRouteImport } from './routes/_authenticated/prompt-protection-rules/index'
 import { Route as AuthenticatedProjectsIndexRouteImport } from './routes/_authenticated/projects/index'
 import { Route as AuthenticatedPermissionDemoIndexRouteImport } from './routes/_authenticated/permission-demo/index'
 import { Route as AuthenticatedModelsIndexRouteImport } from './routes/_authenticated/models/index'
@@ -34,12 +35,16 @@ import { Route as AuthenticatedDataStoragesIndexRouteImport } from './routes/_au
 import { Route as AuthenticatedChatsIndexRouteImport } from './routes/_authenticated/chats/index'
 import { Route as AuthenticatedChannelsIndexRouteImport } from './routes/_authenticated/channels/index'
 import { Route as AuthenticatedApiKeysIndexRouteImport } from './routes/_authenticated/api-keys/index'
+import { Route as AuthenticatedAnalyticsIndexRouteImport } from './routes/_authenticated/analytics/index'
+import { Route as OauthOidcIdpCallbackRouteImport } from './routes/oauth/oidc/idp-callback'
 import { Route as AuthenticatedSettingsProfileRouteImport } from './routes/_authenticated/settings/profile'
 import { Route as AuthenticatedSettingsNotificationsRouteImport } from './routes/_authenticated/settings/notifications'
 import { Route as AuthenticatedSettingsDisplayRouteImport } from './routes/_authenticated/settings/display'
 import { Route as AuthenticatedSettingsAppearanceRouteImport } from './routes/_authenticated/settings/appearance'
+import { Route as AuthenticatedRequestsRequestIdRouteImport } from './routes/_authenticated/requests/$requestId'
+import { Route as AuthenticatedDashboardChannelSuccessRatesRouteImport } from './routes/_authenticated/dashboard/channel-success-rates'
 import { Route as AuthenticatedProjectUsersIndexRouteImport } from './routes/_authenticated/project/users/index'
-import { Route as AuthenticatedProjectUsageLogsIndexRouteImport } from './routes/_authenticated/project/usage-logs/index'
+import { Route as AuthenticatedProjectUsageStatsIndexRouteImport } from './routes/_authenticated/project/usage-stats/index'
 import { Route as AuthenticatedProjectTracesIndexRouteImport } from './routes/_authenticated/project/traces/index'
 import { Route as AuthenticatedProjectThreadsIndexRouteImport } from './routes/_authenticated/project/threads/index'
 import { Route as AuthenticatedProjectRolesIndexRouteImport } from './routes/_authenticated/project/roles/index'
@@ -138,6 +143,12 @@ const AuthenticatedRolesIndexRoute = AuthenticatedRolesIndexRouteImport.update({
   path: '/roles/',
   getParentRoute: () => AuthenticatedRouteRoute,
 } as any)
+const AuthenticatedPromptProtectionRulesIndexRoute =
+  AuthenticatedPromptProtectionRulesIndexRouteImport.update({
+    id: '/prompt-protection-rules/',
+    path: '/prompt-protection-rules/',
+    getParentRoute: () => AuthenticatedRouteRoute,
+  } as any)
 const AuthenticatedProjectsIndexRoute =
   AuthenticatedProjectsIndexRouteImport.update({
     id: '/projects/',
@@ -185,6 +196,17 @@ const AuthenticatedApiKeysIndexRoute =
     path: '/api-keys/',
     getParentRoute: () => AuthenticatedRouteRoute,
   } as any)
+const AuthenticatedAnalyticsIndexRoute =
+  AuthenticatedAnalyticsIndexRouteImport.update({
+    id: '/analytics/',
+    path: '/analytics/',
+    getParentRoute: () => AuthenticatedRouteRoute,
+  } as any)
+const OauthOidcIdpCallbackRoute = OauthOidcIdpCallbackRouteImport.update({
+  id: '/oauth/oidc/idp-callback',
+  path: '/oauth/oidc/idp-callback',
+  getParentRoute: () => rootRouteImport,
+} as any)
 const AuthenticatedSettingsProfileRoute =
   AuthenticatedSettingsProfileRouteImport.update({
     id: '/profile',
@@ -209,16 +231,28 @@ const AuthenticatedSettingsAppearanceRoute =
     path: '/appearance',
     getParentRoute: () => AuthenticatedSettingsRouteRoute,
   } as any)
+const AuthenticatedRequestsRequestIdRoute =
+  AuthenticatedRequestsRequestIdRouteImport.update({
+    id: '/requests/$requestId',
+    path: '/requests/$requestId',
+    getParentRoute: () => AuthenticatedRouteRoute,
+  } as any)
+const AuthenticatedDashboardChannelSuccessRatesRoute =
+  AuthenticatedDashboardChannelSuccessRatesRouteImport.update({
+    id: '/dashboard/channel-success-rates',
+    path: '/dashboard/channel-success-rates',
+    getParentRoute: () => AuthenticatedRouteRoute,
+  } as any)
 const AuthenticatedProjectUsersIndexRoute =
   AuthenticatedProjectUsersIndexRouteImport.update({
     id: '/project/users/',
     path: '/project/users/',
     getParentRoute: () => AuthenticatedRouteRoute,
   } as any)
-const AuthenticatedProjectUsageLogsIndexRoute =
-  AuthenticatedProjectUsageLogsIndexRouteImport.update({
-    id: '/project/usage-logs/',
-    path: '/project/usage-logs/',
+const AuthenticatedProjectUsageStatsIndexRoute =
+  AuthenticatedProjectUsageStatsIndexRouteImport.update({
+    id: '/project/usage-stats/',
+    path: '/project/usage-stats/',
     getParentRoute: () => AuthenticatedRouteRoute,
   } as any)
 const AuthenticatedProjectTracesIndexRoute =
@@ -283,6 +317,7 @@ const AuthenticatedProjectRequestsRequestIdRoute =
   } as any)
 
 export interface FileRoutesByFullPath {
+  '/': typeof AuthenticatedIndexRoute
   '/settings': typeof AuthenticatedSettingsRouteRouteWithChildren
   '/forgot-password': typeof authForgotPasswordRoute
   '/initialization': typeof authInitializationRoute
@@ -294,35 +329,39 @@ export interface FileRoutesByFullPath {
   '/500': typeof errors500Route
   '/503': typeof errors503Route
   '/permission': typeof AuthenticatedPermissionRoute
-  '/': typeof AuthenticatedIndexRoute
+  '/dashboard/channel-success-rates': typeof AuthenticatedDashboardChannelSuccessRatesRoute
+  '/requests/$requestId': typeof AuthenticatedRequestsRequestIdRoute
   '/settings/appearance': typeof AuthenticatedSettingsAppearanceRoute
   '/settings/display': typeof AuthenticatedSettingsDisplayRoute
   '/settings/notifications': typeof AuthenticatedSettingsNotificationsRoute
   '/settings/profile': typeof AuthenticatedSettingsProfileRoute
-  '/api-keys': typeof AuthenticatedApiKeysIndexRoute
-  '/channels': typeof AuthenticatedChannelsIndexRoute
-  '/chats': typeof AuthenticatedChatsIndexRoute
-  '/data-storages': typeof AuthenticatedDataStoragesIndexRoute
-  '/help-center': typeof AuthenticatedHelpCenterIndexRoute
-  '/models': typeof AuthenticatedModelsIndexRoute
-  '/permission-demo': typeof AuthenticatedPermissionDemoIndexRoute
-  '/projects': typeof AuthenticatedProjectsIndexRoute
-  '/roles': typeof AuthenticatedRolesIndexRoute
+  '/oauth/oidc/idp-callback': typeof OauthOidcIdpCallbackRoute
+  '/analytics/': typeof AuthenticatedAnalyticsIndexRoute
+  '/api-keys/': typeof AuthenticatedApiKeysIndexRoute
+  '/channels/': typeof AuthenticatedChannelsIndexRoute
+  '/chats/': typeof AuthenticatedChatsIndexRoute
+  '/data-storages/': typeof AuthenticatedDataStoragesIndexRoute
+  '/help-center/': typeof AuthenticatedHelpCenterIndexRoute
+  '/models/': typeof AuthenticatedModelsIndexRoute
+  '/permission-demo/': typeof AuthenticatedPermissionDemoIndexRoute
+  '/projects/': typeof AuthenticatedProjectsIndexRoute
+  '/prompt-protection-rules/': typeof AuthenticatedPromptProtectionRulesIndexRoute
+  '/roles/': typeof AuthenticatedRolesIndexRoute
   '/settings/': typeof AuthenticatedSettingsIndexRoute
-  '/system': typeof AuthenticatedSystemIndexRoute
-  '/users': typeof AuthenticatedUsersIndexRoute
+  '/system/': typeof AuthenticatedSystemIndexRoute
+  '/users/': typeof AuthenticatedUsersIndexRoute
   '/project/requests/$requestId': typeof AuthenticatedProjectRequestsRequestIdRoute
   '/project/threads/$threadId': typeof AuthenticatedProjectThreadsThreadIdRoute
   '/project/traces/$traceId': typeof AuthenticatedProjectTracesTraceIdRoute
-  '/project/api-keys': typeof AuthenticatedProjectApiKeysIndexRoute
-  '/project/playground': typeof AuthenticatedProjectPlaygroundIndexRoute
-  '/project/prompts': typeof AuthenticatedProjectPromptsIndexRoute
-  '/project/requests': typeof AuthenticatedProjectRequestsIndexRoute
-  '/project/roles': typeof AuthenticatedProjectRolesIndexRoute
-  '/project/threads': typeof AuthenticatedProjectThreadsIndexRoute
-  '/project/traces': typeof AuthenticatedProjectTracesIndexRoute
-  '/project/usage-logs': typeof AuthenticatedProjectUsageLogsIndexRoute
-  '/project/users': typeof AuthenticatedProjectUsersIndexRoute
+  '/project/api-keys/': typeof AuthenticatedProjectApiKeysIndexRoute
+  '/project/playground/': typeof AuthenticatedProjectPlaygroundIndexRoute
+  '/project/prompts/': typeof AuthenticatedProjectPromptsIndexRoute
+  '/project/requests/': typeof AuthenticatedProjectRequestsIndexRoute
+  '/project/roles/': typeof AuthenticatedProjectRolesIndexRoute
+  '/project/threads/': typeof AuthenticatedProjectThreadsIndexRoute
+  '/project/traces/': typeof AuthenticatedProjectTracesIndexRoute
+  '/project/usage-stats/': typeof AuthenticatedProjectUsageStatsIndexRoute
+  '/project/users/': typeof AuthenticatedProjectUsersIndexRoute
 }
 export interface FileRoutesByTo {
   '/forgot-password': typeof authForgotPasswordRoute
@@ -336,10 +375,14 @@ export interface FileRoutesByTo {
   '/503': typeof errors503Route
   '/permission': typeof AuthenticatedPermissionRoute
   '/': typeof AuthenticatedIndexRoute
+  '/dashboard/channel-success-rates': typeof AuthenticatedDashboardChannelSuccessRatesRoute
+  '/requests/$requestId': typeof AuthenticatedRequestsRequestIdRoute
   '/settings/appearance': typeof AuthenticatedSettingsAppearanceRoute
   '/settings/display': typeof AuthenticatedSettingsDisplayRoute
   '/settings/notifications': typeof AuthenticatedSettingsNotificationsRoute
   '/settings/profile': typeof AuthenticatedSettingsProfileRoute
+  '/oauth/oidc/idp-callback': typeof OauthOidcIdpCallbackRoute
+  '/analytics': typeof AuthenticatedAnalyticsIndexRoute
   '/api-keys': typeof AuthenticatedApiKeysIndexRoute
   '/channels': typeof AuthenticatedChannelsIndexRoute
   '/chats': typeof AuthenticatedChatsIndexRoute
@@ -348,6 +391,7 @@ export interface FileRoutesByTo {
   '/models': typeof AuthenticatedModelsIndexRoute
   '/permission-demo': typeof AuthenticatedPermissionDemoIndexRoute
   '/projects': typeof AuthenticatedProjectsIndexRoute
+  '/prompt-protection-rules': typeof AuthenticatedPromptProtectionRulesIndexRoute
   '/roles': typeof AuthenticatedRolesIndexRoute
   '/settings': typeof AuthenticatedSettingsIndexRoute
   '/system': typeof AuthenticatedSystemIndexRoute
@@ -362,7 +406,7 @@ export interface FileRoutesByTo {
   '/project/roles': typeof AuthenticatedProjectRolesIndexRoute
   '/project/threads': typeof AuthenticatedProjectThreadsIndexRoute
   '/project/traces': typeof AuthenticatedProjectTracesIndexRoute
-  '/project/usage-logs': typeof AuthenticatedProjectUsageLogsIndexRoute
+  '/project/usage-stats': typeof AuthenticatedProjectUsageStatsIndexRoute
   '/project/users': typeof AuthenticatedProjectUsersIndexRoute
 }
 export interface FileRoutesById {
@@ -380,10 +424,14 @@ export interface FileRoutesById {
   '/(errors)/503': typeof errors503Route
   '/_authenticated/permission': typeof AuthenticatedPermissionRoute
   '/_authenticated/': typeof AuthenticatedIndexRoute
+  '/_authenticated/dashboard/channel-success-rates': typeof AuthenticatedDashboardChannelSuccessRatesRoute
+  '/_authenticated/requests/$requestId': typeof AuthenticatedRequestsRequestIdRoute
   '/_authenticated/settings/appearance': typeof AuthenticatedSettingsAppearanceRoute
   '/_authenticated/settings/display': typeof AuthenticatedSettingsDisplayRoute
   '/_authenticated/settings/notifications': typeof AuthenticatedSettingsNotificationsRoute
   '/_authenticated/settings/profile': typeof AuthenticatedSettingsProfileRoute
+  '/oauth/oidc/idp-callback': typeof OauthOidcIdpCallbackRoute
+  '/_authenticated/analytics/': typeof AuthenticatedAnalyticsIndexRoute
   '/_authenticated/api-keys/': typeof AuthenticatedApiKeysIndexRoute
   '/_authenticated/channels/': typeof AuthenticatedChannelsIndexRoute
   '/_authenticated/chats/': typeof AuthenticatedChatsIndexRoute
@@ -392,6 +440,7 @@ export interface FileRoutesById {
   '/_authenticated/models/': typeof AuthenticatedModelsIndexRoute
   '/_authenticated/permission-demo/': typeof AuthenticatedPermissionDemoIndexRoute
   '/_authenticated/projects/': typeof AuthenticatedProjectsIndexRoute
+  '/_authenticated/prompt-protection-rules/': typeof AuthenticatedPromptProtectionRulesIndexRoute
   '/_authenticated/roles/': typeof AuthenticatedRolesIndexRoute
   '/_authenticated/settings/': typeof AuthenticatedSettingsIndexRoute
   '/_authenticated/system/': typeof AuthenticatedSystemIndexRoute
@@ -406,12 +455,13 @@ export interface FileRoutesById {
   '/_authenticated/project/roles/': typeof AuthenticatedProjectRolesIndexRoute
   '/_authenticated/project/threads/': typeof AuthenticatedProjectThreadsIndexRoute
   '/_authenticated/project/traces/': typeof AuthenticatedProjectTracesIndexRoute
-  '/_authenticated/project/usage-logs/': typeof AuthenticatedProjectUsageLogsIndexRoute
+  '/_authenticated/project/usage-stats/': typeof AuthenticatedProjectUsageStatsIndexRoute
   '/_authenticated/project/users/': typeof AuthenticatedProjectUsersIndexRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
   fullPaths:
+    | '/'
     | '/settings'
     | '/forgot-password'
     | '/initialization'
@@ -423,35 +473,39 @@ export interface FileRouteTypes {
     | '/500'
     | '/503'
     | '/permission'
-    | '/'
+    | '/dashboard/channel-success-rates'
+    | '/requests/$requestId'
     | '/settings/appearance'
     | '/settings/display'
     | '/settings/notifications'
     | '/settings/profile'
-    | '/api-keys'
-    | '/channels'
-    | '/chats'
-    | '/data-storages'
-    | '/help-center'
-    | '/models'
-    | '/permission-demo'
-    | '/projects'
-    | '/roles'
+    | '/oauth/oidc/idp-callback'
+    | '/analytics/'
+    | '/api-keys/'
+    | '/channels/'
+    | '/chats/'
+    | '/data-storages/'
+    | '/help-center/'
+    | '/models/'
+    | '/permission-demo/'
+    | '/projects/'
+    | '/prompt-protection-rules/'
+    | '/roles/'
     | '/settings/'
-    | '/system'
-    | '/users'
+    | '/system/'
+    | '/users/'
     | '/project/requests/$requestId'
     | '/project/threads/$threadId'
     | '/project/traces/$traceId'
-    | '/project/api-keys'
-    | '/project/playground'
-    | '/project/prompts'
-    | '/project/requests'
-    | '/project/roles'
-    | '/project/threads'
-    | '/project/traces'
-    | '/project/usage-logs'
-    | '/project/users'
+    | '/project/api-keys/'
+    | '/project/playground/'
+    | '/project/prompts/'
+    | '/project/requests/'
+    | '/project/roles/'
+    | '/project/threads/'
+    | '/project/traces/'
+    | '/project/usage-stats/'
+    | '/project/users/'
   fileRoutesByTo: FileRoutesByTo
   to:
     | '/forgot-password'
@@ -465,10 +519,14 @@ export interface FileRouteTypes {
     | '/503'
     | '/permission'
     | '/'
+    | '/dashboard/channel-success-rates'
+    | '/requests/$requestId'
     | '/settings/appearance'
     | '/settings/display'
     | '/settings/notifications'
     | '/settings/profile'
+    | '/oauth/oidc/idp-callback'
+    | '/analytics'
     | '/api-keys'
     | '/channels'
     | '/chats'
@@ -477,6 +535,7 @@ export interface FileRouteTypes {
     | '/models'
     | '/permission-demo'
     | '/projects'
+    | '/prompt-protection-rules'
     | '/roles'
     | '/settings'
     | '/system'
@@ -491,7 +550,7 @@ export interface FileRouteTypes {
     | '/project/roles'
     | '/project/threads'
     | '/project/traces'
-    | '/project/usage-logs'
+    | '/project/usage-stats'
     | '/project/users'
   id:
     | '__root__'
@@ -508,10 +567,14 @@ export interface FileRouteTypes {
     | '/(errors)/503'
     | '/_authenticated/permission'
     | '/_authenticated/'
+    | '/_authenticated/dashboard/channel-success-rates'
+    | '/_authenticated/requests/$requestId'
     | '/_authenticated/settings/appearance'
     | '/_authenticated/settings/display'
     | '/_authenticated/settings/notifications'
     | '/_authenticated/settings/profile'
+    | '/oauth/oidc/idp-callback'
+    | '/_authenticated/analytics/'
     | '/_authenticated/api-keys/'
     | '/_authenticated/channels/'
     | '/_authenticated/chats/'
@@ -520,6 +583,7 @@ export interface FileRouteTypes {
     | '/_authenticated/models/'
     | '/_authenticated/permission-demo/'
     | '/_authenticated/projects/'
+    | '/_authenticated/prompt-protection-rules/'
     | '/_authenticated/roles/'
     | '/_authenticated/settings/'
     | '/_authenticated/system/'
@@ -534,7 +598,7 @@ export interface FileRouteTypes {
     | '/_authenticated/project/roles/'
     | '/_authenticated/project/threads/'
     | '/_authenticated/project/traces/'
-    | '/_authenticated/project/usage-logs/'
+    | '/_authenticated/project/usage-stats/'
     | '/_authenticated/project/users/'
   fileRoutesById: FileRoutesById
 }
@@ -549,6 +613,7 @@ export interface RootRouteChildren {
   errors404Route: typeof errors404Route
   errors500Route: typeof errors500Route
   errors503Route: typeof errors503Route
+  OauthOidcIdpCallbackRoute: typeof OauthOidcIdpCallbackRoute
 }
 
 declare module '@tanstack/react-router' {
@@ -556,7 +621,7 @@ declare module '@tanstack/react-router' {
     '/_authenticated': {
       id: '/_authenticated'
       path: ''
-      fullPath: ''
+      fullPath: '/'
       preLoaderRoute: typeof AuthenticatedRouteRouteImport
       parentRoute: typeof rootRouteImport
     }
@@ -647,14 +712,14 @@ declare module '@tanstack/react-router' {
     '/_authenticated/users/': {
       id: '/_authenticated/users/'
       path: '/users'
-      fullPath: '/users'
+      fullPath: '/users/'
       preLoaderRoute: typeof AuthenticatedUsersIndexRouteImport
       parentRoute: typeof AuthenticatedRouteRoute
     }
     '/_authenticated/system/': {
       id: '/_authenticated/system/'
       path: '/system'
-      fullPath: '/system'
+      fullPath: '/system/'
       preLoaderRoute: typeof AuthenticatedSystemIndexRouteImport
       parentRoute: typeof AuthenticatedRouteRoute
     }
@@ -668,65 +733,86 @@ declare module '@tanstack/react-router' {
     '/_authenticated/roles/': {
       id: '/_authenticated/roles/'
       path: '/roles'
-      fullPath: '/roles'
+      fullPath: '/roles/'
       preLoaderRoute: typeof AuthenticatedRolesIndexRouteImport
+      parentRoute: typeof AuthenticatedRouteRoute
+    }
+    '/_authenticated/prompt-protection-rules/': {
+      id: '/_authenticated/prompt-protection-rules/'
+      path: '/prompt-protection-rules'
+      fullPath: '/prompt-protection-rules/'
+      preLoaderRoute: typeof AuthenticatedPromptProtectionRulesIndexRouteImport
       parentRoute: typeof AuthenticatedRouteRoute
     }
     '/_authenticated/projects/': {
       id: '/_authenticated/projects/'
       path: '/projects'
-      fullPath: '/projects'
+      fullPath: '/projects/'
       preLoaderRoute: typeof AuthenticatedProjectsIndexRouteImport
       parentRoute: typeof AuthenticatedRouteRoute
     }
     '/_authenticated/permission-demo/': {
       id: '/_authenticated/permission-demo/'
       path: '/permission-demo'
-      fullPath: '/permission-demo'
+      fullPath: '/permission-demo/'
       preLoaderRoute: typeof AuthenticatedPermissionDemoIndexRouteImport
       parentRoute: typeof AuthenticatedRouteRoute
     }
     '/_authenticated/models/': {
       id: '/_authenticated/models/'
       path: '/models'
-      fullPath: '/models'
+      fullPath: '/models/'
       preLoaderRoute: typeof AuthenticatedModelsIndexRouteImport
       parentRoute: typeof AuthenticatedRouteRoute
     }
     '/_authenticated/help-center/': {
       id: '/_authenticated/help-center/'
       path: '/help-center'
-      fullPath: '/help-center'
+      fullPath: '/help-center/'
       preLoaderRoute: typeof AuthenticatedHelpCenterIndexRouteImport
       parentRoute: typeof AuthenticatedRouteRoute
     }
     '/_authenticated/data-storages/': {
       id: '/_authenticated/data-storages/'
       path: '/data-storages'
-      fullPath: '/data-storages'
+      fullPath: '/data-storages/'
       preLoaderRoute: typeof AuthenticatedDataStoragesIndexRouteImport
       parentRoute: typeof AuthenticatedRouteRoute
     }
     '/_authenticated/chats/': {
       id: '/_authenticated/chats/'
       path: '/chats'
-      fullPath: '/chats'
+      fullPath: '/chats/'
       preLoaderRoute: typeof AuthenticatedChatsIndexRouteImport
       parentRoute: typeof AuthenticatedRouteRoute
     }
     '/_authenticated/channels/': {
       id: '/_authenticated/channels/'
       path: '/channels'
-      fullPath: '/channels'
+      fullPath: '/channels/'
       preLoaderRoute: typeof AuthenticatedChannelsIndexRouteImport
       parentRoute: typeof AuthenticatedRouteRoute
     }
     '/_authenticated/api-keys/': {
       id: '/_authenticated/api-keys/'
       path: '/api-keys'
-      fullPath: '/api-keys'
+      fullPath: '/api-keys/'
       preLoaderRoute: typeof AuthenticatedApiKeysIndexRouteImport
       parentRoute: typeof AuthenticatedRouteRoute
+    }
+    '/_authenticated/analytics/': {
+      id: '/_authenticated/analytics/'
+      path: '/analytics'
+      fullPath: '/analytics/'
+      preLoaderRoute: typeof AuthenticatedAnalyticsIndexRouteImport
+      parentRoute: typeof AuthenticatedRouteRoute
+    }
+    '/oauth/oidc/idp-callback': {
+      id: '/oauth/oidc/idp-callback'
+      path: '/oauth/oidc/idp-callback'
+      fullPath: '/oauth/oidc/idp-callback'
+      preLoaderRoute: typeof OauthOidcIdpCallbackRouteImport
+      parentRoute: typeof rootRouteImport
     }
     '/_authenticated/settings/profile': {
       id: '/_authenticated/settings/profile'
@@ -756,66 +842,80 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AuthenticatedSettingsAppearanceRouteImport
       parentRoute: typeof AuthenticatedSettingsRouteRoute
     }
+    '/_authenticated/requests/$requestId': {
+      id: '/_authenticated/requests/$requestId'
+      path: '/requests/$requestId'
+      fullPath: '/requests/$requestId'
+      preLoaderRoute: typeof AuthenticatedRequestsRequestIdRouteImport
+      parentRoute: typeof AuthenticatedRouteRoute
+    }
+    '/_authenticated/dashboard/channel-success-rates': {
+      id: '/_authenticated/dashboard/channel-success-rates'
+      path: '/dashboard/channel-success-rates'
+      fullPath: '/dashboard/channel-success-rates'
+      preLoaderRoute: typeof AuthenticatedDashboardChannelSuccessRatesRouteImport
+      parentRoute: typeof AuthenticatedRouteRoute
+    }
     '/_authenticated/project/users/': {
       id: '/_authenticated/project/users/'
       path: '/project/users'
-      fullPath: '/project/users'
+      fullPath: '/project/users/'
       preLoaderRoute: typeof AuthenticatedProjectUsersIndexRouteImport
       parentRoute: typeof AuthenticatedRouteRoute
     }
-    '/_authenticated/project/usage-logs/': {
-      id: '/_authenticated/project/usage-logs/'
-      path: '/project/usage-logs'
-      fullPath: '/project/usage-logs'
-      preLoaderRoute: typeof AuthenticatedProjectUsageLogsIndexRouteImport
+    '/_authenticated/project/usage-stats/': {
+      id: '/_authenticated/project/usage-stats/'
+      path: '/project/usage-stats'
+      fullPath: '/project/usage-stats/'
+      preLoaderRoute: typeof AuthenticatedProjectUsageStatsIndexRouteImport
       parentRoute: typeof AuthenticatedRouteRoute
     }
     '/_authenticated/project/traces/': {
       id: '/_authenticated/project/traces/'
       path: '/project/traces'
-      fullPath: '/project/traces'
+      fullPath: '/project/traces/'
       preLoaderRoute: typeof AuthenticatedProjectTracesIndexRouteImport
       parentRoute: typeof AuthenticatedRouteRoute
     }
     '/_authenticated/project/threads/': {
       id: '/_authenticated/project/threads/'
       path: '/project/threads'
-      fullPath: '/project/threads'
+      fullPath: '/project/threads/'
       preLoaderRoute: typeof AuthenticatedProjectThreadsIndexRouteImport
       parentRoute: typeof AuthenticatedRouteRoute
     }
     '/_authenticated/project/roles/': {
       id: '/_authenticated/project/roles/'
       path: '/project/roles'
-      fullPath: '/project/roles'
+      fullPath: '/project/roles/'
       preLoaderRoute: typeof AuthenticatedProjectRolesIndexRouteImport
       parentRoute: typeof AuthenticatedRouteRoute
     }
     '/_authenticated/project/requests/': {
       id: '/_authenticated/project/requests/'
       path: '/project/requests'
-      fullPath: '/project/requests'
+      fullPath: '/project/requests/'
       preLoaderRoute: typeof AuthenticatedProjectRequestsIndexRouteImport
       parentRoute: typeof AuthenticatedRouteRoute
     }
     '/_authenticated/project/prompts/': {
       id: '/_authenticated/project/prompts/'
       path: '/project/prompts'
-      fullPath: '/project/prompts'
+      fullPath: '/project/prompts/'
       preLoaderRoute: typeof AuthenticatedProjectPromptsIndexRouteImport
       parentRoute: typeof AuthenticatedRouteRoute
     }
     '/_authenticated/project/playground/': {
       id: '/_authenticated/project/playground/'
       path: '/project/playground'
-      fullPath: '/project/playground'
+      fullPath: '/project/playground/'
       preLoaderRoute: typeof AuthenticatedProjectPlaygroundIndexRouteImport
       parentRoute: typeof AuthenticatedRouteRoute
     }
     '/_authenticated/project/api-keys/': {
       id: '/_authenticated/project/api-keys/'
       path: '/project/api-keys'
-      fullPath: '/project/api-keys'
+      fullPath: '/project/api-keys/'
       preLoaderRoute: typeof AuthenticatedProjectApiKeysIndexRouteImport
       parentRoute: typeof AuthenticatedRouteRoute
     }
@@ -870,6 +970,9 @@ interface AuthenticatedRouteRouteChildren {
   AuthenticatedSettingsRouteRoute: typeof AuthenticatedSettingsRouteRouteWithChildren
   AuthenticatedPermissionRoute: typeof AuthenticatedPermissionRoute
   AuthenticatedIndexRoute: typeof AuthenticatedIndexRoute
+  AuthenticatedDashboardChannelSuccessRatesRoute: typeof AuthenticatedDashboardChannelSuccessRatesRoute
+  AuthenticatedRequestsRequestIdRoute: typeof AuthenticatedRequestsRequestIdRoute
+  AuthenticatedAnalyticsIndexRoute: typeof AuthenticatedAnalyticsIndexRoute
   AuthenticatedApiKeysIndexRoute: typeof AuthenticatedApiKeysIndexRoute
   AuthenticatedChannelsIndexRoute: typeof AuthenticatedChannelsIndexRoute
   AuthenticatedChatsIndexRoute: typeof AuthenticatedChatsIndexRoute
@@ -878,6 +981,7 @@ interface AuthenticatedRouteRouteChildren {
   AuthenticatedModelsIndexRoute: typeof AuthenticatedModelsIndexRoute
   AuthenticatedPermissionDemoIndexRoute: typeof AuthenticatedPermissionDemoIndexRoute
   AuthenticatedProjectsIndexRoute: typeof AuthenticatedProjectsIndexRoute
+  AuthenticatedPromptProtectionRulesIndexRoute: typeof AuthenticatedPromptProtectionRulesIndexRoute
   AuthenticatedRolesIndexRoute: typeof AuthenticatedRolesIndexRoute
   AuthenticatedSystemIndexRoute: typeof AuthenticatedSystemIndexRoute
   AuthenticatedUsersIndexRoute: typeof AuthenticatedUsersIndexRoute
@@ -891,7 +995,7 @@ interface AuthenticatedRouteRouteChildren {
   AuthenticatedProjectRolesIndexRoute: typeof AuthenticatedProjectRolesIndexRoute
   AuthenticatedProjectThreadsIndexRoute: typeof AuthenticatedProjectThreadsIndexRoute
   AuthenticatedProjectTracesIndexRoute: typeof AuthenticatedProjectTracesIndexRoute
-  AuthenticatedProjectUsageLogsIndexRoute: typeof AuthenticatedProjectUsageLogsIndexRoute
+  AuthenticatedProjectUsageStatsIndexRoute: typeof AuthenticatedProjectUsageStatsIndexRoute
   AuthenticatedProjectUsersIndexRoute: typeof AuthenticatedProjectUsersIndexRoute
 }
 
@@ -899,6 +1003,10 @@ const AuthenticatedRouteRouteChildren: AuthenticatedRouteRouteChildren = {
   AuthenticatedSettingsRouteRoute: AuthenticatedSettingsRouteRouteWithChildren,
   AuthenticatedPermissionRoute: AuthenticatedPermissionRoute,
   AuthenticatedIndexRoute: AuthenticatedIndexRoute,
+  AuthenticatedDashboardChannelSuccessRatesRoute:
+    AuthenticatedDashboardChannelSuccessRatesRoute,
+  AuthenticatedRequestsRequestIdRoute: AuthenticatedRequestsRequestIdRoute,
+  AuthenticatedAnalyticsIndexRoute: AuthenticatedAnalyticsIndexRoute,
   AuthenticatedApiKeysIndexRoute: AuthenticatedApiKeysIndexRoute,
   AuthenticatedChannelsIndexRoute: AuthenticatedChannelsIndexRoute,
   AuthenticatedChatsIndexRoute: AuthenticatedChatsIndexRoute,
@@ -907,6 +1015,8 @@ const AuthenticatedRouteRouteChildren: AuthenticatedRouteRouteChildren = {
   AuthenticatedModelsIndexRoute: AuthenticatedModelsIndexRoute,
   AuthenticatedPermissionDemoIndexRoute: AuthenticatedPermissionDemoIndexRoute,
   AuthenticatedProjectsIndexRoute: AuthenticatedProjectsIndexRoute,
+  AuthenticatedPromptProtectionRulesIndexRoute:
+    AuthenticatedPromptProtectionRulesIndexRoute,
   AuthenticatedRolesIndexRoute: AuthenticatedRolesIndexRoute,
   AuthenticatedSystemIndexRoute: AuthenticatedSystemIndexRoute,
   AuthenticatedUsersIndexRoute: AuthenticatedUsersIndexRoute,
@@ -925,8 +1035,8 @@ const AuthenticatedRouteRouteChildren: AuthenticatedRouteRouteChildren = {
   AuthenticatedProjectRolesIndexRoute: AuthenticatedProjectRolesIndexRoute,
   AuthenticatedProjectThreadsIndexRoute: AuthenticatedProjectThreadsIndexRoute,
   AuthenticatedProjectTracesIndexRoute: AuthenticatedProjectTracesIndexRoute,
-  AuthenticatedProjectUsageLogsIndexRoute:
-    AuthenticatedProjectUsageLogsIndexRoute,
+  AuthenticatedProjectUsageStatsIndexRoute:
+    AuthenticatedProjectUsageStatsIndexRoute,
   AuthenticatedProjectUsersIndexRoute: AuthenticatedProjectUsersIndexRoute,
 }
 
@@ -944,6 +1054,7 @@ const rootRouteChildren: RootRouteChildren = {
   errors404Route: errors404Route,
   errors500Route: errors500Route,
   errors503Route: errors503Route,
+  OauthOidcIdpCallbackRoute: OauthOidcIdpCallbackRoute,
 }
 export const routeTree = rootRouteImport
   ._addFileChildren(rootRouteChildren)

@@ -3,6 +3,7 @@ package biz
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/samber/lo"
 
@@ -20,6 +21,10 @@ type UsageLogService struct {
 
 	SystemService  *SystemService
 	ChannelService *ChannelService
+
+	// OnUsageLogCreated is called after a usage log is successfully created.
+	// Used to invalidate caches that depend on usage log data.
+	OnUsageLogCreated func()
 }
 
 func (s *UsageLogService) computeUsageCost(ctx context.Context, channelID int, modelID string, usage *llm.Usage) ([]objects.CostItem, *float64, string) {
@@ -46,7 +51,7 @@ func (s *UsageLogService) computeUsageCost(ctx context.Context, channelID int, m
 	}
 
 	if modelPrice, ok := ch.cachedModelPrices[modelID]; ok {
-		items, total := ComputeUsageCost(usage, modelPrice.Price)
+		items, total := ComputeUsageCost(usage, modelPrice.Price, time.Now())
 
 		totalCost := total.InexactFloat64()
 		if log.DebugEnabled(ctx) {
@@ -63,6 +68,18 @@ func (s *UsageLogService) computeUsageCost(ctx context.Context, channelID int, m
 	}
 
 	return nil, nil, ""
+}
+
+// InjectUsageCost writes AxonHub-calculated cost onto usage when a matching
+// channel model price is cached. usage is left unchanged when it is nil.
+// When no matching price is available, usage.Cost is set to nil.
+func (s *UsageLogService) InjectUsageCost(ctx context.Context, channelID int, modelID string, usage *llm.Usage) {
+	if usage == nil {
+		return
+	}
+
+	_, totalCost, _ := s.computeUsageCost(ctx, channelID, modelID, usage)
+	usage.Cost = totalCost
 }
 
 // NewUsageLogService creates a new UsageLogService.
@@ -161,6 +178,10 @@ func (s *UsageLogService) CreateUsageLog(ctx context.Context, params CreateUsage
 			log.String("model_id", params.ActualModelID),
 			log.Int64("total_tokens", params.Usage.TotalTokens),
 		)
+	}
+
+	if s.OnUsageLogCreated != nil {
+		s.OnUsageLogCreated()
 	}
 
 	return usageLog, nil

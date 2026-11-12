@@ -11,6 +11,7 @@ import (
 
 	"github.com/99designs/gqlgen/graphql"
 	"github.com/looplj/axonhub/internal/contexts"
+	"github.com/looplj/axonhub/internal/log"
 	"github.com/looplj/axonhub/internal/server/backup"
 	"github.com/looplj/axonhub/internal/server/biz"
 	"github.com/samber/lo"
@@ -74,6 +75,10 @@ func (r *mutationResolver) UpdateAutoBackupSettings(ctx context.Context, input U
 		settings.DataStorageID = *input.DataStorageID
 	}
 
+	if input.IncludeSystemConfigs != nil {
+		settings.IncludeSystemConfigs = *input.IncludeSystemConfigs
+	}
+
 	if input.IncludeChannels != nil {
 		settings.IncludeChannels = *input.IncludeChannels
 	}
@@ -90,6 +95,14 @@ func (r *mutationResolver) UpdateAutoBackupSettings(ctx context.Context, input U
 		settings.IncludeModelPrices = *input.IncludeModelPrices
 	}
 
+	if input.IncludeUsageStats != nil {
+		settings.IncludeUsageStats = *input.IncludeUsageStats
+	}
+
+	if input.IncludeRequestLogs != nil {
+		settings.IncludeRequestLogs = *input.IncludeRequestLogs
+	}
+
 	if input.RetentionDays != nil {
 		settings.RetentionDays = *input.RetentionDays
 	}
@@ -97,6 +110,8 @@ func (r *mutationResolver) UpdateAutoBackupSettings(ctx context.Context, input U
 	if err := r.systemService.SetAutoBackupSettings(ctx, *settings); err != nil {
 		return false, err
 	}
+
+	r.backupService.Reschedule(ctx, r.scheduler)
 
 	return true, nil
 }
@@ -108,12 +123,16 @@ func (r *mutationResolver) TriggerAutoBackup(ctx context.Context) (*TriggerBacku
 		return nil, ErrNotOwner
 	}
 
-	if err := r.backupService.RunBackupNow(ctx); err != nil {
-		return &TriggerBackupPayload{
-			Success: false,
-			Message: lo.ToPtr(err.Error()),
-		}, nil
-	}
+	go func() {
+		// Use a detached context so the 30s HTTP request timeout
+		// doesn't cancel the long-running WebDAV upload.
+		// RunBackupNow internally injects a fresh ent client (svc.db),
+		// so it does NOT depend on the HTTP request's transactional context.
+		bgCtx := context.WithoutCancel(ctx)
+		if err := r.backupService.RunBackupNow(bgCtx); err != nil {
+			log.Error(bgCtx, "Manual trigger autobackup failed", log.Cause(err))
+		}
+	}()
 
 	return &TriggerBackupPayload{
 		Success: true,

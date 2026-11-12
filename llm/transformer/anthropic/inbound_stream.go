@@ -2,12 +2,13 @@ package anthropic
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 
+	"github.com/google/uuid"
 	"github.com/samber/lo"
 
-	"github.com/looplj/axonhub/internal/dumper"
 	"github.com/looplj/axonhub/llm"
 	"github.com/looplj/axonhub/llm/httpclient"
 	"github.com/looplj/axonhub/llm/streams"
@@ -19,9 +20,12 @@ func (t *InboundTransformer) TransformStream(
 ) (streams.Stream[*httpclient.StreamEvent], error) {
 	// Create a custom stream that handles the stateful transformation
 	return &anthropicInboundStream{
-		source:    stream,
-		ctx:       ctx,
-		toolCalls: make(map[int]*llm.ToolCall),
+		source:                     stream,
+		ctx:                        ctx,
+		toolCalls:                  make(map[int]*llm.ToolCall),
+		pendingTextCitations:       nil,
+		pendingReasoningContent:    make(map[string][]string),
+		pendingReasoningSignatures: make(map[string]*string),
 	}, nil
 }
 
@@ -44,12 +48,453 @@ type anthropicInboundStream struct {
 	queueIndex                int
 	err                       error
 	stopReason                *string
+	pendingUsage              *Usage
 	// Tool call tracking
-	toolCalls map[int]*llm.ToolCall // Track tool calls by index
-
-	sourceEvents []*llm.Response
+	toolCalls            map[int]*llm.ToolCall // Track tool calls by index
+	currentToolCallIndex int
+	hasCurrentToolCall   bool
 
 	lastEventType string
+
+	// Buffered signature: when signature arrives before thinking starts,
+	// we hold it until thinking finishes.
+	pendingSignature       *string
+	pendingReasoningItemID string
+	// Responses may interleave summary deltas from different reasoning items.
+	// Keep those item-scoped buffers separate until their final signature arrives.
+	pendingReasoningContent    map[string][]string
+	pendingReasoningSignatures map[string]*string
+	pendingReasoningItemOrder  []string
+	flushingReasoningItems     bool
+
+	// Buffered citations for the currently open text block. These are emitted as
+	// citations_delta events immediately before the text block is closed.
+	pendingTextCitations []TextCitation
+}
+
+// generateSignature generates a random signature using base64(uuid).
+func generateSignature() string {
+	return base64.StdEncoding.EncodeToString([]byte(uuid.New().String()))
+}
+
+func citationKey(citation TextCitation) string {
+	return citation.Type + "\x00" + citation.URL + "\x00" + citation.Title
+}
+
+func (s *anthropicInboundStream) appendPendingTextCitations(annotations []llm.Annotation, metadata map[string]any) {
+	for _, annotation := range annotations {
+		citation, ok := citationFromLLMAnnotation(annotation, metadata)
+		if !ok {
+			continue
+		}
+
+		key := citationKey(citation)
+		exists := lo.ContainsBy(s.pendingTextCitations, func(existing TextCitation) bool {
+			return citationKey(existing) == key
+		})
+		if exists {
+			continue
+		}
+
+		s.pendingTextCitations = append(s.pendingTextCitations, citation)
+	}
+}
+
+func (s *anthropicInboundStream) flushPendingTextCitations() error {
+	if !s.hasTextContentStarted || len(s.pendingTextCitations) == 0 {
+		return nil
+	}
+
+	for i := range s.pendingTextCitations {
+		citation := s.pendingTextCitations[i]
+		if err := s.enqueEvent(&StreamEvent{
+			Type:  "content_block_delta",
+			Index: &s.contentIndex,
+			Delta: &StreamDelta{
+				Type:     lo.ToPtr("citations_delta"),
+				Citation: &citation,
+			},
+		}); err != nil {
+			return fmt.Errorf("failed to enqueue citations_delta event: %w", err)
+		}
+	}
+
+	s.pendingTextCitations = nil
+
+	return nil
+}
+
+func (s *anthropicInboundStream) emitBufferedReadToolArguments(toolCallIndex int) error {
+	toolCall := s.toolCalls[toolCallIndex]
+	if toolCall == nil || !isReadToolName(toolCall.Function.Name) {
+		return nil
+	}
+
+	arguments := toolCall.Function.Arguments
+	if arguments == "" {
+		return nil
+	}
+
+	sanitized, complete := normalizeReadToolArguments(arguments)
+	if !complete {
+		sanitized = arguments
+	}
+
+	streamEvent := StreamEvent{
+		Type:  "content_block_delta",
+		Index: &s.contentIndex,
+		Delta: &StreamDelta{
+			Type:        lo.ToPtr("input_json_delta"),
+			PartialJSON: &sanitized,
+		},
+	}
+	if err := s.enqueEvent(&streamEvent); err != nil {
+		return fmt.Errorf("failed to enqueue buffered Read input_json_delta event: %w", err)
+	}
+
+	return nil
+}
+
+func (s *anthropicInboundStream) emitCurrentReadToolArguments() error {
+	if !s.hasCurrentToolCall {
+		return nil
+	}
+
+	return s.emitBufferedReadToolArguments(s.currentToolCallIndex)
+}
+
+func (s *anthropicInboundStream) closeToolBlock() error {
+	if !s.hasToolContentStarted {
+		return nil
+	}
+
+	if err := s.emitCurrentReadToolArguments(); err != nil {
+		return err
+	}
+
+	s.hasToolContentStarted = false
+	s.hasCurrentToolCall = false
+
+	streamEvent := StreamEvent{
+		Type:  "content_block_stop",
+		Index: &s.contentIndex,
+	}
+	if err := s.enqueEvent(&streamEvent); err != nil {
+		return fmt.Errorf("failed to enqueue content_block_stop event: %w", err)
+	}
+
+	s.contentIndex += 1
+
+	return nil
+}
+
+func (s *anthropicInboundStream) validateToolArguments() error {
+	for index, toolCall := range s.toolCalls {
+		if toolCall == nil || toolCall.Function.Arguments == "" {
+			continue
+		}
+
+		var input map[string]json.RawMessage
+		if err := json.Unmarshal([]byte(toolCall.Function.Arguments), &input); err != nil || input == nil {
+			return fmt.Errorf("invalid tool call arguments for tool call index %d", index)
+		}
+	}
+
+	return nil
+}
+
+// closeThinkingBlock ensures any open or implied thinking block is properly
+// closed. It handles three scenarios:
+//  1. pendingSignature exists but no thinking block was started — creates a
+//     synthetic empty thinking block (start + signature_delta + stop).
+//  2. A thinking block is open — flushes any pending signature as
+//     signature_delta, then emits content_block_stop.
+//  3. Neither — no-op.
+//
+// If no signature is available when closing a thinking block, a random
+// base64-encoded UUID is generated as a placeholder signature.
+func (s *anthropicInboundStream) closeThinkingBlock() error {
+	if !s.flushingReasoningItems && len(s.pendingReasoningItemOrder) > 0 {
+		s.flushingReasoningItems = true
+		err := s.flushBufferedReasoningItems()
+		s.flushingReasoningItems = false
+		if err != nil {
+			return err
+		}
+	}
+
+	if s.pendingSignature != nil && !s.hasThinkingContentStarted {
+		sig := s.pendingSignature
+		s.pendingSignature = nil
+		s.pendingReasoningItemID = ""
+
+		// Close any previously open content block before creating the synthetic thinking block.
+		if s.hasTextContentStarted {
+			if err := s.flushPendingTextCitations(); err != nil {
+				return fmt.Errorf("failed to flush text citations before pending signature: %w", err)
+			}
+
+			s.hasTextContentStarted = false
+
+			if err := s.enqueEvent(&StreamEvent{
+				Type:  "content_block_stop",
+				Index: &s.contentIndex,
+			}); err != nil {
+				return fmt.Errorf("failed to enqueue content_block_stop for text before pending signature: %w", err)
+			}
+
+			s.contentIndex += 1
+		}
+
+		if s.hasToolContentStarted {
+			if err := s.closeToolBlock(); err != nil {
+				return fmt.Errorf("failed to close tool before pending signature: %w", err)
+			}
+		}
+
+		if err := s.enqueEvent(&StreamEvent{
+			Type:  "content_block_start",
+			Index: &s.contentIndex,
+			ContentBlock: &MessageContentBlock{
+				Type:     "thinking",
+				Thinking: lo.ToPtr(""),
+			},
+		}); err != nil {
+			return fmt.Errorf("failed to enqueue thinking content_block_start for pending signature: %w", err)
+		}
+
+		if err := s.enqueEvent(&StreamEvent{
+			Type:  "content_block_delta",
+			Index: &s.contentIndex,
+			Delta: &StreamDelta{
+				Type:      lo.ToPtr("signature_delta"),
+				Signature: sig,
+			},
+		}); err != nil {
+			return fmt.Errorf("failed to enqueue signature_delta for pending signature: %w", err)
+		}
+
+		if err := s.enqueEvent(&StreamEvent{
+			Type:  "content_block_stop",
+			Index: &s.contentIndex,
+		}); err != nil {
+			return fmt.Errorf("failed to enqueue content_block_stop for pending signature: %w", err)
+		}
+
+		s.contentIndex += 1
+
+		return nil
+	}
+
+	if s.hasThinkingContentStarted {
+		s.hasThinkingContentStarted = false
+
+		// Use pending signature if available, otherwise generate a random one.
+		sig := s.pendingSignature
+		s.pendingSignature = nil
+
+		if sig == nil {
+			rs := generateSignature()
+			sig = &rs
+		}
+
+		if err := s.enqueEvent(&StreamEvent{
+			Type:  "content_block_delta",
+			Index: &s.contentIndex,
+			Delta: &StreamDelta{
+				Type:      lo.ToPtr("signature_delta"),
+				Signature: sig,
+			},
+		}); err != nil {
+			return fmt.Errorf("failed to enqueue signature_delta event: %w", err)
+		}
+
+		if err := s.enqueEvent(&StreamEvent{
+			Type:  "content_block_stop",
+			Index: &s.contentIndex,
+		}); err != nil {
+			return fmt.Errorf("failed to enqueue content_block_stop event: %w", err)
+		}
+
+		s.contentIndex += 1
+		s.pendingReasoningItemID = ""
+	}
+
+	return nil
+}
+
+func getResponsesReasoningItemID(metadata map[string]any) string {
+	raw, ok := metadata["openai_responses_reasoning_item"]
+	if !ok || raw == nil {
+		return ""
+	}
+
+	if item, ok := raw.(map[string]any); ok {
+		if id, ok := item["id"].(string); ok {
+			return id
+		}
+	}
+
+	return ""
+}
+
+func responsesReasoningItemDone(metadata map[string]any) bool {
+	raw, ok := metadata["openai_responses_reasoning_item"].(map[string]any)
+	if !ok {
+		return false
+	}
+
+	done, _ := raw["done"].(bool)
+	return done
+}
+
+func (s *anthropicInboundStream) rememberReasoningItem(itemID string) {
+	if _, exists := s.pendingReasoningContent[itemID]; exists {
+		return
+	}
+	if _, exists := s.pendingReasoningSignatures[itemID]; exists {
+		return
+	}
+
+	s.pendingReasoningItemOrder = append(s.pendingReasoningItemOrder, itemID)
+}
+
+func (s *anthropicInboundStream) emitBufferedReasoningItem(itemID string) error {
+	content, hasContent := s.pendingReasoningContent[itemID]
+	signature, hasSignature := s.pendingReasoningSignatures[itemID]
+	if !hasContent && !hasSignature {
+		return nil
+	}
+
+	wasFlushing := s.flushingReasoningItems
+	s.flushingReasoningItems = true
+	err := s.closeThinkingBlock()
+	s.flushingReasoningItems = wasFlushing
+	if err != nil {
+		return err
+	}
+	if s.hasTextContentStarted {
+		if err := s.flushPendingTextCitations(); err != nil {
+			return err
+		}
+		s.hasTextContentStarted = false
+		if err := s.enqueEvent(&StreamEvent{Type: "content_block_stop", Index: &s.contentIndex}); err != nil {
+			return err
+		}
+		s.contentIndex++
+	}
+	if s.hasToolContentStarted {
+		if err := s.closeToolBlock(); err != nil {
+			return err
+		}
+	}
+
+	if err := s.enqueEvent(&StreamEvent{
+		Type:         "content_block_start",
+		Index:        &s.contentIndex,
+		ContentBlock: &MessageContentBlock{Type: "thinking", Thinking: lo.ToPtr("")},
+	}); err != nil {
+		return err
+	}
+	for _, delta := range content {
+		delta := delta
+		if err := s.enqueEvent(&StreamEvent{
+			Type:  "content_block_delta",
+			Index: &s.contentIndex,
+			Delta: &StreamDelta{Type: lo.ToPtr("thinking_delta"), Thinking: &delta},
+		}); err != nil {
+			return err
+		}
+	}
+	if signature == nil {
+		generated := generateSignature()
+		signature = &generated
+	}
+	if err := s.enqueEvent(&StreamEvent{
+		Type:  "content_block_delta",
+		Index: &s.contentIndex,
+		Delta: &StreamDelta{Type: lo.ToPtr("signature_delta"), Signature: signature},
+	}); err != nil {
+		return err
+	}
+	if err := s.enqueEvent(&StreamEvent{Type: "content_block_stop", Index: &s.contentIndex}); err != nil {
+		return err
+	}
+	s.contentIndex++
+	delete(s.pendingReasoningContent, itemID)
+	delete(s.pendingReasoningSignatures, itemID)
+	return nil
+}
+
+func (s *anthropicInboundStream) flushBufferedReasoningItems() error {
+	for _, itemID := range s.pendingReasoningItemOrder {
+		if err := s.emitBufferedReasoningItem(itemID); err != nil {
+			return err
+		}
+	}
+	s.pendingReasoningItemOrder = nil
+	return nil
+}
+
+func (s *anthropicInboundStream) closeOpenContentBlocks() error {
+	if err := s.closeThinkingBlock(); err != nil {
+		return fmt.Errorf("failed to close thinking block: %w", err)
+	}
+
+	if s.hasTextContentStarted {
+		if err := s.flushPendingTextCitations(); err != nil {
+			return fmt.Errorf("failed to flush text citations: %w", err)
+		}
+
+		s.hasTextContentStarted = false
+
+		if err := s.enqueEvent(&StreamEvent{
+			Type:  "content_block_stop",
+			Index: &s.contentIndex,
+		}); err != nil {
+			return fmt.Errorf("failed to enqueue content_block_stop event: %w", err)
+		}
+
+		s.contentIndex += 1
+	}
+
+	if s.hasToolContentStarted {
+		if err := s.closeToolBlock(); err != nil {
+			return fmt.Errorf("failed to close tool block: %w", err)
+		}
+	}
+
+	return nil
+}
+
+func (s *anthropicInboundStream) enqueueTerminalEvents() error {
+	usage := s.pendingUsage
+	if usage == nil {
+		usage = &Usage{}
+	}
+
+	streamEvent := StreamEvent{
+		Type:  "message_delta",
+		Usage: usage,
+	}
+
+	if s.stopReason != nil {
+		streamEvent.Delta = &StreamDelta{
+			StopReason: s.stopReason,
+		}
+	}
+
+	if err := s.enqueEvent(&streamEvent); err != nil {
+		return fmt.Errorf("failed to enqueue message_delta event: %w", err)
+	}
+
+	if err := s.enqueEvent(&StreamEvent{Type: "message_stop"}); err != nil {
+		return fmt.Errorf("failed to enqueue message_stop event: %w", err)
+	}
+
+	s.messageStoped = true
+
+	return nil
 }
 
 func (s *anthropicInboundStream) enqueEvent(ev *StreamEvent) error {
@@ -86,16 +531,48 @@ func (s *anthropicInboundStream) Next() bool {
 
 	// Try to get the next chunk from source
 	if !s.source.Next() {
-		return false
+		if s.source.Err() != nil || !s.hasStarted || s.messageStoped {
+			return false
+		}
+		if !s.hasFinished {
+			if err := s.validateToolArguments(); err != nil {
+				s.err = fmt.Errorf("failed to validate tool arguments at stream end: %w", err)
+				return false
+			}
+		}
+
+		if err := s.closeOpenContentBlocks(); err != nil {
+			s.err = fmt.Errorf("failed to close content blocks at stream end: %w", err)
+			return false
+		}
+
+		if s.stopReason == nil {
+			stopReason := "end_turn"
+			for _, toolCall := range s.toolCalls {
+				anthropicType := getAnthropicType(toolCall.TransformerMetadata)
+				if anthropicType == "" || anthropicType == "tool_use" {
+					stopReason = "tool_use"
+					break
+				}
+			}
+			s.stopReason = &stopReason
+		}
+
+		if err := s.enqueueTerminalEvents(); err != nil {
+			s.err = fmt.Errorf("failed to finalize message at stream end: %w", err)
+			return false
+		}
+
+		return s.Next()
 	}
 
 	chunk := s.source.Current()
-	if chunk == nil {
-		return s.Next() // Try next chunk
+	if chunk != nil && chunk.Usage != nil {
+		s.pendingUsage = convertToAnthropicUsage(chunk.Usage)
 	}
 
-	if dumper.Enabled() {
-		s.sourceEvents = append(s.sourceEvents, chunk)
+	if chunk == nil {
+		return s.Next() // Try next chunk
 	}
 
 	// Handle [DONE] marker
@@ -147,119 +624,135 @@ func (s *anthropicInboundStream) Next() bool {
 	if len(chunk.Choices) > 0 {
 		choice := chunk.Choices[0]
 
+		if choice.Message != nil && len(choice.Message.Annotations) > 0 {
+			s.appendPendingTextCitations(choice.Message.Annotations, chunk.TransformerMetadata)
+		}
+		if choice.Delta != nil && len(choice.Delta.Annotations) > 0 {
+			s.appendPendingTextCitations(choice.Delta.Annotations, chunk.TransformerMetadata)
+		}
+
 		// Handle reasoning content (thinking) delta
 		if choice.Delta != nil && choice.Delta.ReasoningContent != nil && *choice.Delta.ReasoningContent != "" {
-			// If the tool content has started before the thinking content, we need to stop it
-			if s.hasToolContentStarted {
-				s.hasToolContentStarted = false
+			itemID := getResponsesReasoningItemID(chunk.TransformerMetadata)
+			if itemID != "" {
+				s.rememberReasoningItem(itemID)
+				s.pendingReasoningContent[itemID] = append(s.pendingReasoningContent[itemID], *choice.Delta.ReasoningContent)
+			} else {
 
-				streamEvent := StreamEvent{
-					Type:  "content_block_stop",
-					Index: &s.contentIndex,
+				// If the text content has started before the thinking content, we need to stop it
+				if s.hasTextContentStarted {
+					if err := s.flushPendingTextCitations(); err != nil {
+						s.err = fmt.Errorf("failed to flush text citations before thinking: %w", err)
+						return false
+					}
+
+					s.hasTextContentStarted = false
+
+					if err := s.enqueEvent(&StreamEvent{
+						Type:  "content_block_stop",
+						Index: &s.contentIndex,
+					}); err != nil {
+						s.err = fmt.Errorf("failed to enqueue content_block_stop event: %w", err)
+						return false
+					}
+
+					s.contentIndex += 1
 				}
 
-				err := s.enqueEvent(&streamEvent)
-				if err != nil {
-					s.err = fmt.Errorf("failed to enqueue content_block_stop event: %w", err)
-					return false
+				// If the tool content has started before the thinking content, we need to stop it
+				if s.hasToolContentStarted {
+					if err := s.closeToolBlock(); err != nil {
+						s.err = fmt.Errorf("failed to close tool block before thinking: %w", err)
+						return false
+					}
 				}
 
-				s.contentIndex += 1
-			}
+				// Generate content_block_start if this is the first thinking content
+				if !s.hasThinkingContentStarted {
+					s.hasThinkingContentStarted = true
 
-			// Generate content_block_start if this is the first thinking content
-			if !s.hasThinkingContentStarted {
-				s.hasThinkingContentStarted = true
+					streamEvent := StreamEvent{
+						Type:  "content_block_start",
+						Index: &s.contentIndex,
+						ContentBlock: &MessageContentBlock{
+							Type:     "thinking",
+							Thinking: lo.ToPtr(""),
+						},
+					}
 
+					err := s.enqueEvent(&streamEvent)
+					if err != nil {
+						s.err = fmt.Errorf("failed to enqueue content_block_start event: %w", err)
+						return false
+					}
+				}
+
+				// Generate content_block_delta for thinking
 				streamEvent := StreamEvent{
-					Type:  "content_block_start",
+					Type:  "content_block_delta",
 					Index: &s.contentIndex,
-					ContentBlock: &MessageContentBlock{
-						Type:     "thinking",
-						Thinking: lo.ToPtr(""),
+					Delta: &StreamDelta{
+						Type:     lo.ToPtr("thinking_delta"),
+						Thinking: choice.Delta.ReasoningContent,
 					},
 				}
 
 				err := s.enqueEvent(&streamEvent)
 				if err != nil {
-					s.err = fmt.Errorf("failed to enqueue content_block_start event: %w", err)
+					s.err = fmt.Errorf("failed to enqueue content_block_delta event: %w", err)
 					return false
 				}
 			}
-
-			// Generate content_block_delta for thinking
-			streamEvent := StreamEvent{
-				Type:  "content_block_delta",
-				Index: &s.contentIndex,
-				Delta: &StreamDelta{
-					Type:     lo.ToPtr("thinking_delta"),
-					Thinking: choice.Delta.ReasoningContent,
-				},
-			}
-
-			err := s.enqueEvent(&streamEvent)
-			if err != nil {
-				s.err = fmt.Errorf("failed to enqueue content_block_delta event: %w", err)
-				return false
-			}
 		}
 
-		// Add signature delta before stopping thinking block if signature is available
+		// Buffer signature: defer emission to closeThinkingBlock so that each
+		// thinking block gets exactly one signature_delta. Responses encrypted
+		// content is item-scoped and opaque: when the upstream supplies an item
+		// ID, a new ID closes the previous block and a repeated ID replaces the
+		// provisional value with the latest value instead of concatenating blobs.
 		if choice.Delta != nil && choice.Delta.ReasoningSignature != nil && *choice.Delta.ReasoningSignature != "" {
-			err := s.enqueEvent(&StreamEvent{
-				Type:  "content_block_delta",
-				Index: &s.contentIndex,
-				Delta: &StreamDelta{
-					Type:      lo.ToPtr("signature_delta"),
-					Signature: choice.Delta.ReasoningSignature,
-				},
-			})
-			if err != nil {
-				s.err = fmt.Errorf("failed to enqueue signature_delta event: %w", err)
-				return false
+			itemID := getResponsesReasoningItemID(chunk.TransformerMetadata)
+			if itemID != "" {
+				s.rememberReasoningItem(itemID)
+				s.pendingReasoningSignatures[itemID] = choice.Delta.ReasoningSignature
+				if responsesReasoningItemDone(chunk.TransformerMetadata) {
+					if err := s.emitBufferedReasoningItem(itemID); err != nil {
+						s.err = fmt.Errorf("failed to emit completed reasoning item: %w", err)
+						return false
+					}
+				}
+			} else {
+				if s.pendingSignature == nil {
+					s.pendingSignature = choice.Delta.ReasoningSignature
+				} else {
+					combined := *s.pendingSignature + *choice.Delta.ReasoningSignature
+					s.pendingSignature = &combined
+				}
 			}
 		}
 
 		// Handle redacted reasoning content (redacted_thinking)
 		if choice.Delta != nil && choice.Delta.RedactedReasoningContent != nil && *choice.Delta.RedactedReasoningContent != "" {
-			// If the thinking content has started before the redacted thinking content, we need to stop it
-			if s.hasThinkingContentStarted {
-				s.hasThinkingContentStarted = false
-
-				stopEvent := StreamEvent{
-					Type:  "content_block_stop",
-					Index: &s.contentIndex,
-				}
-
-				err := s.enqueEvent(&stopEvent)
-				if err != nil {
-					s.err = fmt.Errorf("failed to enqueue content_block_stop event: %w", err)
-					return false
-				}
-
-				s.contentIndex += 1
+			if err := s.closeThinkingBlock(); err != nil {
+				s.err = fmt.Errorf("failed to close thinking block: %w", err)
+				return false
 			}
 
 			// If the tool content has started before the redacted thinking content, we need to stop it
 			if s.hasToolContentStarted {
-				s.hasToolContentStarted = false
-
-				streamEvent := StreamEvent{
-					Type:  "content_block_stop",
-					Index: &s.contentIndex,
-				}
-
-				err := s.enqueEvent(&streamEvent)
-				if err != nil {
-					s.err = fmt.Errorf("failed to enqueue content_block_stop event: %w", err)
+				if err := s.closeToolBlock(); err != nil {
+					s.err = fmt.Errorf("failed to close tool block before redacted thinking: %w", err)
 					return false
 				}
-
-				s.contentIndex += 1
 			}
 
 			// If the text content has started before the redacted thinking content, we need to stop it
 			if s.hasTextContentStarted {
+				if err := s.flushPendingTextCitations(); err != nil {
+					s.err = fmt.Errorf("failed to flush text citations: %w", err)
+					return false
+				}
+
 				s.hasTextContentStarted = false
 
 				streamEvent := StreamEvent{
@@ -306,40 +799,17 @@ func (s *anthropicInboundStream) Next() bool {
 
 		// Handle content delta
 		if choice.Delta != nil && choice.Delta.Content.Content != nil && *choice.Delta.Content.Content != "" {
-			// If the thinking content has started before the text content, we need to stop it
-			if s.hasThinkingContentStarted {
-				s.hasThinkingContentStarted = false
-
-				stopEvent := StreamEvent{
-					Type:  "content_block_stop",
-					Index: &s.contentIndex,
-				}
-
-				err := s.enqueEvent(&stopEvent)
-				if err != nil {
-					s.err = fmt.Errorf("failed to enqueue content_block_stop event: %w", err)
-					return false
-				}
-
-				s.contentIndex += 1
+			if err := s.closeThinkingBlock(); err != nil {
+				s.err = fmt.Errorf("failed to close thinking block: %w", err)
+				return false
 			}
 
 			// If the tool content has started before the content block, we need to stop it
 			if s.hasToolContentStarted {
-				s.hasToolContentStarted = false
-
-				streamEvent := StreamEvent{
-					Type:  "content_block_stop",
-					Index: &s.contentIndex,
-				}
-
-				err := s.enqueEvent(&streamEvent)
-				if err != nil {
-					s.err = fmt.Errorf("failed to enqueue content_block_stop event: %w", err)
+				if err := s.closeToolBlock(); err != nil {
+					s.err = fmt.Errorf("failed to close tool block before text: %w", err)
 					return false
 				}
-
-				s.contentIndex += 1
 			}
 
 			// Generate content_block_start if this is the first content
@@ -381,27 +851,18 @@ func (s *anthropicInboundStream) Next() bool {
 
 		// Handle tool calls
 		if choice.Delta != nil && len(choice.Delta.ToolCalls) > 0 {
-			// Support tool call when the thinking.
-			// If the thinking content has started before the text content, we need to stop it
-			if s.hasThinkingContentStarted {
-				s.hasThinkingContentStarted = false
-
-				stopEvent := StreamEvent{
-					Type:  "content_block_stop",
-					Index: &s.contentIndex,
-				}
-
-				err := s.enqueEvent(&stopEvent)
-				if err != nil {
-					s.err = fmt.Errorf("failed to enqueue content_block_stop event: %w", err)
-					return false
-				}
-
-				s.contentIndex += 1
+			if err := s.closeThinkingBlock(); err != nil {
+				s.err = fmt.Errorf("failed to close thinking block: %w", err)
+				return false
 			}
 
 			// If the text content has started before the tool content, we need to stop it
 			if s.hasTextContentStarted {
+				if err := s.flushPendingTextCitations(); err != nil {
+					s.err = fmt.Errorf("failed to flush text citations: %w", err)
+					return false
+				}
+
 				s.hasTextContentStarted = false
 
 				streamEvent := StreamEvent{
@@ -425,20 +886,17 @@ func (s *anthropicInboundStream) Next() bool {
 				if _, ok := s.toolCalls[toolCallIndex]; !ok {
 					// Start a new tool use block, we should stop the previous tool use block
 					if toolCallIndex > 0 {
-						streamEvent := StreamEvent{
-							Type:  "content_block_stop",
-							Index: &s.contentIndex,
+						if s.hasToolContentStarted {
+							if err := s.closeToolBlock(); err != nil {
+								s.err = fmt.Errorf("failed to close previous tool block: %w", err)
+								return false
+							}
 						}
-
-						err := s.enqueEvent(&streamEvent)
-						if err != nil {
-							s.err = fmt.Errorf("failed to enqueue content_block_stop event: %w", err)
-							return false
-						}
-
-						s.contentIndex += 1
 					}
 
+					s.hasToolContentStarted = true
+					s.currentToolCallIndex = toolCallIndex
+					s.hasCurrentToolCall = true
 					s.toolCalls[toolCallIndex] = &llm.ToolCall{
 						Index: toolCallIndex,
 						ID:    deltaToolCall.ID,
@@ -447,16 +905,26 @@ func (s *anthropicInboundStream) Next() bool {
 							Name:      deltaToolCall.Function.Name,
 							Arguments: "",
 						},
+						TransformerMetadata: deltaToolCall.TransformerMetadata,
+					}
+
+					// Restore the original Anthropic block type (tool_use /
+					// server_tool_use / mcp_tool_use / ...) and caller when the
+					// upstream tagged it via TransformerMetadata.
+					blockType := "tool_use"
+					if at := getAnthropicType(deltaToolCall.TransformerMetadata); at != "" {
+						blockType = at
 					}
 
 					streamEvent := StreamEvent{
 						Type:  "content_block_start",
 						Index: &s.contentIndex,
 						ContentBlock: &MessageContentBlock{
-							Type:  "tool_use",
-							ID:    deltaToolCall.ID,
-							Name:  &deltaToolCall.Function.Name,
-							Input: json.RawMessage("{}"),
+							Type:   blockType,
+							ID:     deltaToolCall.ID,
+							Name:   &deltaToolCall.Function.Name,
+							Input:  json.RawMessage("{}"),
+							Caller: getAnthropicCaller(deltaToolCall.TransformerMetadata),
 						},
 					}
 
@@ -469,6 +937,9 @@ func (s *anthropicInboundStream) Next() bool {
 					// If the tool call has arguments, we need to generate a content_block_delta.
 					if deltaToolCall.Function.Arguments != "" {
 						s.toolCalls[toolCallIndex].Function.Arguments += deltaToolCall.Function.Arguments
+						if isReadToolName(deltaToolCall.Function.Name) {
+							continue
+						}
 
 						streamEvent := StreamEvent{
 							Type:  "content_block_delta",
@@ -487,6 +958,9 @@ func (s *anthropicInboundStream) Next() bool {
 					}
 				} else {
 					s.toolCalls[toolCallIndex].Function.Arguments += deltaToolCall.Function.Arguments
+					if isReadToolName(s.toolCalls[toolCallIndex].Function.Name) {
+						continue
+					}
 
 					// Generate content_block_delta for input_json_delta
 					// contentBlockIndex := int64(toolCallIndex)
@@ -512,19 +986,125 @@ func (s *anthropicInboundStream) Next() bool {
 			}
 		}
 
+		// Handle assistant-inlined tool results (Anthropic *_tool_result
+		// blocks carried via llm.Message.InlineToolResults). Each one is
+		// emitted as a complete content_block_start + content_block_stop
+		// pair, since Anthropic delivers tool result blocks whole.
+		if choice.Delta != nil && len(choice.Delta.InlineToolResults) > 0 {
+			if err := s.closeThinkingBlock(); err != nil {
+				s.err = fmt.Errorf("failed to close thinking block: %w", err)
+				return false
+			}
+
+			// Close any open tool_use block before starting a tool_result.
+			if s.hasToolContentStarted {
+				if err := s.closeToolBlock(); err != nil {
+					s.err = fmt.Errorf("failed to close tool block before tool_result: %w", err)
+					return false
+				}
+			}
+
+			// Close any open text block before starting a tool_result.
+			if s.hasTextContentStarted {
+				s.hasTextContentStarted = false
+
+				stopEvent := StreamEvent{
+					Type:  "content_block_stop",
+					Index: &s.contentIndex,
+				}
+				if err := s.enqueEvent(&stopEvent); err != nil {
+					s.err = fmt.Errorf("failed to enqueue content_block_stop event: %w", err)
+					return false
+				}
+
+				s.contentIndex += 1
+			}
+
+			for _, ir := range choice.Delta.InlineToolResults {
+				block, ok := toolResultBlockFromInline(ir)
+				if !ok {
+					continue
+				}
+
+				startEvent := StreamEvent{
+					Type:         "content_block_start",
+					Index:        &s.contentIndex,
+					ContentBlock: &block,
+				}
+				if err := s.enqueEvent(&startEvent); err != nil {
+					s.err = fmt.Errorf("failed to enqueue *_tool_result content_block_start: %w", err)
+					return false
+				}
+
+				stopEvent := StreamEvent{
+					Type:  "content_block_stop",
+					Index: &s.contentIndex,
+				}
+				if err := s.enqueEvent(&stopEvent); err != nil {
+					s.err = fmt.Errorf("failed to enqueue *_tool_result content_block_stop: %w", err)
+					return false
+				}
+
+				s.contentIndex += 1
+			}
+		}
+
 		// Handle finish reason
 		if choice.FinishReason != nil && !s.hasFinished {
 			s.hasFinished = true
 
-			streamEvent := StreamEvent{
-				Type:  "content_block_stop",
-				Index: &s.contentIndex,
+			contentClosed := false
+
+			if err := s.closeThinkingBlock(); err != nil {
+				s.err = fmt.Errorf("failed to close thinking block: %w", err)
+				return false
+			}
+			if s.lastEventType == "content_block_stop" {
+				contentClosed = true
 			}
 
-			err := s.enqueEvent(&streamEvent)
-			if err != nil {
-				s.err = fmt.Errorf("failed to enqueue content_block_stop event: %w", err)
-				return false
+			if s.hasTextContentStarted {
+				if err := s.flushPendingTextCitations(); err != nil {
+					s.err = fmt.Errorf("failed to flush text citations: %w", err)
+					return false
+				}
+
+				s.hasTextContentStarted = false
+
+				streamEvent := StreamEvent{
+					Type:  "content_block_stop",
+					Index: &s.contentIndex,
+				}
+
+				err := s.enqueEvent(&streamEvent)
+				if err != nil {
+					s.err = fmt.Errorf("failed to enqueue content_block_stop event: %w", err)
+					return false
+				}
+
+				s.contentIndex += 1
+				contentClosed = true
+			}
+
+			if s.hasToolContentStarted {
+				if err := s.closeToolBlock(); err != nil {
+					s.err = fmt.Errorf("failed to close tool block at finish: %w", err)
+					return false
+				}
+				contentClosed = true
+			}
+
+			if !contentClosed && !s.hasTextContentStarted && !s.hasToolContentStarted && !s.hasThinkingContentStarted {
+				streamEvent := StreamEvent{
+					Type:  "content_block_stop",
+					Index: &s.contentIndex,
+				}
+
+				err := s.enqueEvent(&streamEvent)
+				if err != nil {
+					s.err = fmt.Errorf("failed to enqueue content_block_stop event: %w", err)
+					return false
+				}
 			}
 
 			// Convert finish reason to Anthropic format
@@ -547,38 +1127,16 @@ func (s *anthropicInboundStream) Next() bool {
 		}
 	}
 
-	if chunk.Usage != nil && s.hasFinished && !s.messageStoped {
-		// Usage-only chunk after finish_reason - generate message_delta with both stop reason and usage
-		streamEvent := StreamEvent{
-			Type: "message_delta",
-		}
-
-		if s.stopReason != nil {
-			streamEvent.Delta = &StreamDelta{
-				StopReason: s.stopReason,
-			}
-		}
-
-		streamEvent.Usage = convertToAnthropicUsage(chunk.Usage)
-
-		err := s.enqueEvent(&streamEvent)
-		if err != nil {
-			s.err = fmt.Errorf("failed to enqueue message_delta event: %w", err)
+	// The terminal event must wait for the choices-less usage-only chunk that carries the
+	// real counts. Some providers (e.g. ModelScope) attach a zeroed usage object to every
+	// chunk, including the one carrying finish_reason; finalizing there would emit the
+	// placeholder zeros and drop the real counts arriving afterwards.
+	if chunk.Usage != nil && len(chunk.Choices) == 0 && s.hasFinished && !s.messageStoped {
+		// Usage-only chunk after finish_reason - generate message_delta with both stop reason and usage.
+		if err := s.enqueueTerminalEvents(); err != nil {
+			s.err = err
 			return false
 		}
-
-		// Generate message_stop
-		stopEvent := StreamEvent{
-			Type: "message_stop",
-		}
-
-		err = s.enqueEvent(&stopEvent)
-		if err != nil {
-			s.err = fmt.Errorf("failed to enqueue message_stop event: %w", err)
-			return false
-		}
-
-		s.messageStoped = true
 	}
 
 	// Continue to the next event.
@@ -605,9 +1163,5 @@ func (s *anthropicInboundStream) Err() error {
 }
 
 func (s *anthropicInboundStream) Close() error {
-	if dumper.Enabled() {
-		dumper.DumpObject(s.ctx, s.sourceEvents, "anthropic-inbound-stream")
-	}
-
 	return s.source.Close()
 }

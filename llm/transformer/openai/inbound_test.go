@@ -12,6 +12,8 @@ import (
 
 	"github.com/looplj/axonhub/llm"
 	"github.com/looplj/axonhub/llm/httpclient"
+	"github.com/looplj/axonhub/llm/streams"
+	"github.com/looplj/axonhub/llm/transformer/shared"
 )
 
 func TestInboundTransformer_TransformRequest(t *testing.T) {
@@ -204,6 +206,60 @@ func TestInboundTransformer_TransformRequest(t *testing.T) {
 					req.ReasoningEffort == "high" &&
 					req.ReasoningBudget != nil &&
 					*req.ReasoningBudget == 16384
+			},
+		},
+		{
+			name: "request with thinking disabled - maps to reasoning_effort none",
+			request: &httpclient.Request{
+				Method: http.MethodPost,
+				URL:    "/v1/chat/completions",
+				Headers: http.Header{
+					"Content-Type": []string{"application/json"},
+				},
+				Body: mustMarshal(Request{
+					Model: "deepseek-reasoner",
+					Messages: []Message{
+						{
+							Role: "user",
+							Content: MessageContent{
+								Content: lo.ToPtr("Hello"),
+							},
+						},
+					},
+					Thinking: &Thinking{Type: "disabled"},
+				}),
+			},
+			wantErr: false,
+			validate: func(req *llm.Request) bool {
+				return req != nil &&
+					req.ReasoningEffort == "none"
+			},
+		},
+		{
+			name: "request with thinking enabled - no reasoning_effort mapping",
+			request: &httpclient.Request{
+				Method: http.MethodPost,
+				URL:    "/v1/chat/completions",
+				Headers: http.Header{
+					"Content-Type": []string{"application/json"},
+				},
+				Body: mustMarshal(Request{
+					Model: "deepseek-reasoner",
+					Messages: []Message{
+						{
+							Role: "user",
+							Content: MessageContent{
+								Content: lo.ToPtr("Hello"),
+							},
+						},
+					},
+					Thinking: &Thinking{Type: "enabled"},
+				}),
+			},
+			wantErr: false,
+			validate: func(req *llm.Request) bool {
+				return req != nil &&
+					req.ReasoningEffort == ""
 			},
 		},
 		{
@@ -473,6 +529,74 @@ func TestInboundTransformer_TransformStreamChunk(t *testing.T) {
 	}
 }
 
+func TestInboundTransformer_TransformStream_SkipsPureReasoningSignatureChunk(t *testing.T) {
+	transformer := NewInboundTransformer()
+	signature := "stream_signature"
+
+	stream, err := transformer.TransformStream(t.Context(), streams.SliceStream([]*llm.Response{
+		{
+			ID:      "chatcmpl-123",
+			Object:  "chat.completion.chunk",
+			Created: 1677652288,
+			Model:   "gemini-3-pro",
+			Choices: []llm.Choice{
+				{
+					Index: 0,
+					Delta: &llm.Message{
+						ReasoningSignature: &signature,
+					},
+				},
+			},
+		},
+		{
+			ID:      "chatcmpl-123",
+			Object:  "chat.completion.chunk",
+			Created: 1677652289,
+			Model:   "gemini-3-pro",
+			Choices: []llm.Choice{
+				{
+					Index: 0,
+					Delta: &llm.Message{
+						Role: "assistant",
+						ToolCalls: []llm.ToolCall{
+							{
+								ID:   "call_1",
+								Type: "function",
+								Function: llm.FunctionCall{
+									Name:      "get_weather",
+									Arguments: `{"city":"Shanghai"}`,
+								},
+								Index: 0,
+							},
+						},
+					},
+					FinishReason: lo.ToPtr("tool_calls"),
+				},
+			},
+		},
+		{
+			Object: "[DONE]",
+		},
+	}))
+	require.NoError(t, err)
+
+	var events []*httpclient.StreamEvent
+	for stream.Next() {
+		events = append(events, stream.Current())
+	}
+
+	require.NoError(t, stream.Err())
+	require.Len(t, events, 2)
+
+	var chunkResp Response
+	require.NoError(t, json.Unmarshal(events[0].Data, &chunkResp))
+	require.Len(t, chunkResp.Choices, 1)
+	require.NotNil(t, chunkResp.Choices[0].Delta)
+	require.Len(t, chunkResp.Choices[0].Delta.ToolCalls, 1)
+	require.Nil(t, chunkResp.Choices[0].Delta.ToolCalls[0].ExtraContent)
+	require.Equal(t, "[DONE]", string(events[1].Data))
+}
+
 func TestInboundTransformer_TransformResponse(t *testing.T) {
 	transformer := NewInboundTransformer()
 
@@ -585,6 +709,7 @@ func mustMarshal(v any) []byte {
 
 func TestInboundTransformer_TransformError(t *testing.T) {
 	transformer := NewInboundTransformer()
+	var nilHTTPError *httpclient.Error
 
 	tests := []struct {
 		name          string
@@ -612,6 +737,37 @@ func TestInboundTransformer_TransformError(t *testing.T) {
 			expectedError: &httpclient.Error{
 				StatusCode: http.StatusInternalServerError,
 				Body:       []byte(`{"error":{"message":"An unexpected error occurred","type":"unexpected_error"}}`),
+			},
+		},
+		{
+			name: "typed nil http error",
+			err:  nilHTTPError,
+			expectedError: &httpclient.Error{
+				StatusCode: http.StatusInternalServerError,
+				Body:       []byte(`{"error":{"message":"An unexpected error occurred","type":"unexpected_error"}}`),
+			},
+		},
+		{
+			name: "response error without status code",
+			err: &llm.ResponseError{
+				Detail: llm.ErrorDetail{
+					Message: "provider temporarily unavailable",
+					Type:    "provider_unavailable",
+				},
+			},
+			expectedError: &httpclient.Error{
+				StatusCode: http.StatusBadGateway,
+				Body:       []byte(`{"error":{"message":"provider temporarily unavailable","type":"provider_unavailable"}}`),
+			},
+		},
+		{
+			name: "http error without status code",
+			err: &httpclient.Error{
+				Body: []byte(`{"error":{"message":"provider temporarily unavailable","type":"provider_unavailable"}}`),
+			},
+			expectedError: &httpclient.Error{
+				StatusCode: http.StatusBadGateway,
+				Body:       []byte(`{"error":{"message":"provider temporarily unavailable","type":"provider_unavailable"}}`),
 			},
 		},
 	}
@@ -642,14 +798,18 @@ func TestMessageFromLLM_WithAnnotations(t *testing.T) {
 				Content: llm.MessageContent{Content: lo.ToPtr("The meaning of life...")},
 				Annotations: []llm.Annotation{
 					{
-						Type: "url_citation",
+						Type:       "url_citation",
+						StartIndex: lo.ToPtr(int64(0)),
+						EndIndex:   lo.ToPtr(int64(11)),
 						URLCitation: &llm.URLCitation{
 							URL:   "https://en.wikipedia.org/wiki/Meaning_of_life",
 							Title: "Meaning of life - Wikipedia",
 						},
 					},
 					{
-						Type: "url_citation",
+						Type:       "url_citation",
+						StartIndex: lo.ToPtr(int64(20)),
+						EndIndex:   lo.ToPtr(int64(27)),
 						URLCitation: &llm.URLCitation{
 							URL:   "https://plato.stanford.edu/entries/life-meaning/",
 							Title: "The Meaning of Life - Stanford Encyclopedia",
@@ -661,9 +821,22 @@ func TestMessageFromLLM_WithAnnotations(t *testing.T) {
 				require.Equal(t, "assistant", msg.Role)
 				require.Len(t, msg.Annotations, 2)
 				require.Equal(t, "url_citation", msg.Annotations[0].Type)
+				require.NotNil(t, msg.Annotations[0].StartIndex)
+				require.Equal(t, int64(0), *msg.Annotations[0].StartIndex)
+				require.NotNil(t, msg.Annotations[0].EndIndex)
+				require.Equal(t, int64(11), *msg.Annotations[0].EndIndex)
 				require.NotNil(t, msg.Annotations[0].URLCitation)
 				require.Equal(t, "https://en.wikipedia.org/wiki/Meaning_of_life", msg.Annotations[0].URLCitation.URL)
 				require.Equal(t, "Meaning of life - Wikipedia", msg.Annotations[0].URLCitation.Title)
+				require.NotNil(t, msg.Annotations[1].StartIndex)
+				require.Equal(t, int64(20), *msg.Annotations[1].StartIndex)
+				require.NotNil(t, msg.Annotations[1].EndIndex)
+				require.Equal(t, int64(27), *msg.Annotations[1].EndIndex)
+
+				payload, err := json.Marshal(msg)
+				require.NoError(t, err)
+				require.Contains(t, string(payload), `"start_index":0`)
+				require.Contains(t, string(payload), `"end_index":11`)
 			},
 		},
 		{
@@ -728,6 +901,7 @@ func TestInboundTransformer_TransformResponse_WithCitations(t *testing.T) {
 
 				// Parse the response body
 				var chatResp Response
+
 				err := json.Unmarshal(resp.Body, &chatResp)
 				if err != nil {
 					return false
@@ -769,6 +943,7 @@ func TestInboundTransformer_TransformResponse_WithCitations(t *testing.T) {
 
 				// Parse the response body
 				var chatResp Response
+
 				err := json.Unmarshal(resp.Body, &chatResp)
 				if err != nil {
 					return false
@@ -791,4 +966,277 @@ func TestInboundTransformer_TransformResponse_WithCitations(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestMessage_ToLLMMessage_WithGeminiThoughtSignature(t *testing.T) {
+	msg := Message{
+		Role: "assistant",
+		ToolCalls: []ToolCall{
+			{
+				ID:   "call_1",
+				Type: "function",
+				Function: FunctionCall{
+					Name:      "get_weather",
+					Arguments: `{"city":"Shanghai"}`,
+				},
+				Index: 0,
+				ExtraContent: &ToolCallExtraContent{
+					Google: &ToolCallGoogleExtraContent{
+						ThoughtSignature: "base64_signature",
+					},
+				},
+			},
+		},
+	}
+
+	got := msg.ToLLMMessage()
+
+	require.Len(t, got.ToolCalls, 1)
+	require.NotNil(t, got.ReasoningSignature)
+	require.Equal(t, "base64_signature", *got.ReasoningSignature)
+}
+
+func TestMessage_ToLLMMessage_WithAlreadyPrefixedGeminiThoughtSignature(t *testing.T) {
+	msg := Message{
+		Role: "assistant",
+		ToolCalls: []ToolCall{
+			{
+				ID:   "call_1",
+				Type: "function",
+				Function: FunctionCall{
+					Name:      "get_weather",
+					Arguments: `{"city":"Shanghai"}`,
+				},
+				Index: 0,
+				ExtraContent: &ToolCallExtraContent{
+					Google: &ToolCallGoogleExtraContent{
+						ThoughtSignature: "base64_signature",
+					},
+				},
+			},
+		},
+	}
+
+	got := msg.ToLLMMessage()
+
+	require.NotNil(t, got.ReasoningSignature)
+	require.Equal(t, "base64_signature", *got.ReasoningSignature)
+}
+
+func TestToolCall_ToLLMToolCall_NormalizesGeminiThoughtSignature(t *testing.T) {
+	tc := ToolCall{
+		ID:   "call_1",
+		Type: "function",
+		Function: FunctionCall{
+			Name:      "get_weather",
+			Arguments: `{"city":"Shanghai"}`,
+		},
+		Index: 0,
+		ExtraContent: &ToolCallExtraContent{
+			Google: &ToolCallGoogleExtraContent{
+				ThoughtSignature: "base64_signature",
+			},
+		},
+	}
+
+	got := tc.ToLLMToolCall()
+
+	require.NotNil(t, got.TransformerMetadata)
+	require.Equal(
+		t,
+		"base64_signature",
+		got.TransformerMetadata[TransformerMetadataKeyGoogleThoughtSignature],
+	)
+}
+
+func TestToolCall_ToLLMToolCall_NormalizesGeminiThoughtSignatureFromExtraFields(t *testing.T) {
+	tc := ToolCall{
+		ID:   "call_1",
+		Type: "function",
+		Function: FunctionCall{
+			Name:      "get_weather",
+			Arguments: `{"city":"Shanghai"}`,
+		},
+		Index: 0,
+		ExtraFields: &ToolCallExtraFields{
+			ExtraContent: &ToolCallExtraContent{
+				Google: &ToolCallGoogleExtraContent{
+					ThoughtSignature: "base64_signature",
+				},
+			},
+		},
+	}
+
+	got := tc.ToLLMToolCall()
+
+	require.NotNil(t, got.TransformerMetadata)
+	require.Equal(
+		t,
+		"base64_signature",
+		got.TransformerMetadata[TransformerMetadataKeyGoogleThoughtSignature],
+	)
+}
+
+func TestInboundTransformer_TransformRequest_WithToolCallExtraFieldsThoughtSignature(t *testing.T) {
+	transformer := NewInboundTransformer()
+
+	req := &httpclient.Request{
+		Method: http.MethodPost,
+		URL:    "/v1/chat/completions",
+		Headers: http.Header{
+			"Content-Type": []string{"application/json"},
+		},
+		Body: []byte(`{
+			"model":"gemini-2.5-flash",
+			"messages":[
+				{
+					"role":"assistant",
+					"tool_calls":[
+						{
+							"id":"call_1",
+							"type":"function",
+							"index":0,
+							"function":{"name":"game-art_generate_image","arguments":"{}"},
+							"extra_fields":{
+								"extra_content":{
+									"google":{"thought_signature":"raw_signature_from_extra_fields"}
+								}
+							}
+						}
+					]
+				}
+			]
+		}`),
+	}
+
+	got, err := transformer.TransformRequest(t.Context(), req)
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	require.Len(t, got.Messages, 1)
+	require.Len(t, got.Messages[0].ToolCalls, 1)
+	require.NotNil(t, got.Messages[0].ReasoningSignature)
+	require.Equal(
+		t,
+		"raw_signature_from_extra_fields",
+		*got.Messages[0].ReasoningSignature,
+	)
+
+	metadataSignature, ok := got.Messages[0].ToolCalls[0].TransformerMetadata[TransformerMetadataKeyGoogleThoughtSignature].(string)
+	require.True(t, ok)
+	require.Equal(
+		t,
+		"raw_signature_from_extra_fields",
+		metadataSignature,
+	)
+}
+
+func TestMessageFromLLM_WithGeminiThoughtSignatureDoesNotInjectToolCallExtraContent(t *testing.T) {
+	msg := llm.Message{
+		Role:               "assistant",
+		ReasoningSignature: shared.EncodeGeminiThoughtSignature(lo.ToPtr("base64_signature")),
+		ToolCalls: []llm.ToolCall{
+			{
+				ID:   "call_1",
+				Type: "function",
+				Function: llm.FunctionCall{
+					Name:      "get_weather",
+					Arguments: `{"city":"Shanghai"}`,
+				},
+				Index: 0,
+			},
+		},
+	}
+
+	got := MessageFromLLM(msg)
+
+	require.Len(t, got.ToolCalls, 1)
+	require.Nil(t, got.ToolCalls[0].ExtraContent)
+}
+
+func TestInboundTransformer_TransformResponse_WithGeminiToolCallThoughtSignatureDoesNotInjectExtraContent(t *testing.T) {
+	transformer := NewInboundTransformer()
+
+	resp, err := transformer.TransformResponse(t.Context(), &llm.Response{
+		ID:      "chatcmpl-1",
+		Object:  "chat.completion",
+		Created: 123,
+		Model:   "gemini-3-pro",
+		Choices: []llm.Choice{
+			{
+				Index: 0,
+				Message: &llm.Message{
+					Role:               "assistant",
+					ReasoningSignature: shared.EncodeGeminiThoughtSignature(lo.ToPtr("base64_signature")),
+					ToolCalls: []llm.ToolCall{
+						{
+							ID:   "call_1",
+							Type: "function",
+							Function: llm.FunctionCall{
+								Name:      "get_weather",
+								Arguments: `{"city":"Shanghai"}`,
+							},
+							Index: 0,
+						},
+					},
+				},
+				FinishReason: lo.ToPtr("tool_calls"),
+			},
+		},
+	})
+	require.NoError(t, err)
+
+	var oaiResp Response
+	require.NoError(t, json.Unmarshal(resp.Body, &oaiResp))
+	require.Len(t, oaiResp.Choices, 1)
+	require.NotNil(t, oaiResp.Choices[0].Message)
+	require.Len(t, oaiResp.Choices[0].Message.ToolCalls, 1)
+	require.Nil(t, oaiResp.Choices[0].Message.ToolCalls[0].ExtraContent)
+}
+
+func TestInboundTransformer_TransformResponse_WithGeminiPrefixedToolCallMetadata(t *testing.T) {
+	transformer := NewInboundTransformer()
+
+	resp, err := transformer.TransformResponse(t.Context(), &llm.Response{
+		ID:      "chatcmpl-1",
+		Object:  "chat.completion",
+		Created: 123,
+		Model:   "gemini-3-pro",
+		Choices: []llm.Choice{
+			{
+				Index: 0,
+				Message: &llm.Message{
+					Role: "assistant",
+					ToolCalls: []llm.ToolCall{
+						{
+							ID:   "call_1",
+							Type: "function",
+							Function: llm.FunctionCall{
+								Name:      "get_weather",
+								Arguments: `{"city":"Shanghai"}`,
+							},
+							Index: 0,
+							TransformerMetadata: map[string]any{
+								TransformerMetadataKeyGoogleThoughtSignature: "base64_signature",
+							},
+						},
+					},
+				},
+				FinishReason: lo.ToPtr("tool_calls"),
+			},
+		},
+	})
+	require.NoError(t, err)
+
+	var oaiResp Response
+	require.NoError(t, json.Unmarshal(resp.Body, &oaiResp))
+	require.Len(t, oaiResp.Choices, 1)
+	require.NotNil(t, oaiResp.Choices[0].Message)
+	require.Len(t, oaiResp.Choices[0].Message.ToolCalls, 1)
+	require.NotNil(t, oaiResp.Choices[0].Message.ToolCalls[0].ExtraContent)
+	require.NotNil(t, oaiResp.Choices[0].Message.ToolCalls[0].ExtraContent.Google)
+	require.Equal(
+		t,
+		"base64_signature",
+		oaiResp.Choices[0].Message.ToolCalls[0].ExtraContent.Google.ThoughtSignature,
+	)
 }

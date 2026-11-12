@@ -1,6 +1,6 @@
 'use client';
 
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { ChevronDown, ChevronRight, Workflow, ChevronsDownUp, ExternalLink, Filter } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { AnimatePresence, motion } from 'framer-motion';
@@ -12,7 +12,7 @@ import { Checkbox } from '@/components/ui/checkbox';
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
 import { formatDuration } from '../../../utils/format-duration';
 import type { Segment, RequestMetadata, Span } from '../data/schema';
-import { getSpanDisplayLabels, normalizeSpanType } from '../utils/span-display';
+import { getSpanDisplayLabels, getSpanTypeTranslationKey, normalizeSpanType } from '../utils/span-display';
 import { getSpanIcon } from './constant';
 
 type SpanKind = 'request' | 'response';
@@ -52,13 +52,16 @@ interface FlatSegment {
   sequentialOffset: number; // Offset in sequential layout
 }
 
-const segmentHueCache = new Map<string, number>();
-
 type ColorVariant = 'segment' | 'request' | 'response';
 
+// 使用普通 Map 缓存，并限制缓存大小以防止内存占用过高
+const MAX_HUE_CACHE_SIZE = 100;
+const segmentHueCache = new Map<string, number>();
+
 function hashStringToHue(value: string): number {
-  if (segmentHueCache.has(value)) {
-    return segmentHueCache.get(value) as number;
+  const cached = segmentHueCache.get(value);
+  if (cached !== undefined) {
+    return cached;
   }
 
   let hash = 0;
@@ -67,6 +70,15 @@ function hashStringToHue(value: string): number {
   }
 
   const hue = (hash + 360) % 360;
+  
+  // LRU 缓存策略：超过限制时清除最早的
+  if (segmentHueCache.size >= MAX_HUE_CACHE_SIZE) {
+    const firstKey = segmentHueCache.keys().next().value;
+    if (firstKey) {
+      segmentHueCache.delete(firstKey);
+    }
+  }
+  
   segmentHueCache.set(value, hue);
   return hue;
 }
@@ -83,11 +95,35 @@ function getSegmentTimelineColor(segmentId: string, variant: ColorVariant): stri
   return `hsla(${hue}, 70%, ${lightness}%, ${alpha})`;
 }
 
-function safeTime(value?: Date | string | null) {
+function safeTime(value?: Date | string | null): number | null {
   if (!value) return null;
-  const date = value instanceof Date ? value : new Date(value);
-  const time = date.getTime();
-  return Number.isFinite(time) ? time : null;
+  
+  try {
+    const date = value instanceof Date ? value : new Date(value);
+    const time = date.getTime();
+    return Number.isFinite(time) ? time : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 计算时间条的位置和宽度
+ * @param startRatio 开始位置的比率 (0-1)
+ * @param widthRatio 宽度的比率 (0-1)
+ * @returns { left: number, width: number } 返回百分比数值
+ */
+function calculateBarPosition(startRatio: number, widthRatio: number): { left: number; width: number } {
+  const leftOffset = Math.min(Math.max(startRatio * 100, 0), 100);
+  const maxAvailableWidth = Math.max(100 - leftOffset, 0);
+
+  let width = Math.min(Math.max(widthRatio * 100, 0), maxAvailableWidth);
+  // 确保至少有最小宽度（如果 widthRatio > 0）
+  if (widthRatio > 0 && width < 0.5) {
+    width = Math.min(0.5, maxAvailableWidth);
+  }
+
+  return { left: leftOffset, width };
 }
 
 function buildSpanNode(trace: Segment, span: Span, spanKind: SpanKind, rootStart: number): TimelineNode | null {
@@ -215,13 +251,7 @@ function SegmentRow({
   const leftOffsetRatio = totalDuration > 0 ? sequentialOffset / totalDuration : 0;
   const widthRatio = totalDuration > 0 ? segment.duration / totalDuration : 0;
 
-  const leftOffset = Math.min(Math.max(leftOffsetRatio * 100, 0), 100);
-  const maxAvailableWidth = Math.max(100 - leftOffset, 0);
-
-  let width = Math.min(Math.max(widthRatio * 100, 0), maxAvailableWidth);
-  if (widthRatio > 0 && width < 0.5) {
-    width = Math.min(0.5, maxAvailableWidth);
-  }
+  const { left: leftOffset, width } = calculateBarPosition(leftOffsetRatio, widthRatio);
 
   return (
     <>
@@ -254,20 +284,10 @@ function SegmentRow({
                 {segment.name}
               </Badge>
               <span className='text-muted-foreground text-[11px]'>
-                {t('traces.timeline.summary.duration', {
+              {t('traces.timeline.summary.duration', {
                   value: formatDuration(segment.duration),
                 })}
               </span>
-              {/* {segment.metadata?.totalTokens != null && (
-                <span className='text-muted-foreground text-[11px]'>
-                  {formatNumber(segment.metadata.totalTokens)} tokens
-                </span>
-              )}
-              {segment.metadata?.cachedTokens != null && segment.metadata.cachedTokens > 0 && (
-                <span className='text-muted-foreground text-[11px]'>
-                  ({formatNumber(segment.metadata.cachedTokens)} cached)
-                </span>
-              )} */}
               <Button variant='ghost' size='sm' className='h-6 w-6 p-0' onClick={handleViewRequest}>
                 <ExternalLink className='h-3 w-3' />
               </Button>
@@ -343,18 +363,18 @@ function SpanRow({ span, totalDuration, segmentSequentialOffset, onSelectSpan, s
   const leftOffsetRatio = totalDuration > 0 ? spanAbsoluteOffset / totalDuration : 0;
   const widthRatio = totalDuration > 0 ? span.duration / totalDuration : 0;
 
-  const leftOffset = Math.min(Math.max(leftOffsetRatio * 100, 0), 100);
-  const maxAvailableWidth = Math.max(100 - leftOffset, 0);
-
-  let width = Math.min(Math.max(widthRatio * 100, 0), maxAvailableWidth);
-  if (widthRatio > 0 && width < 0.5) {
-    width = Math.min(0.5, maxAvailableWidth);
-  }
+  const { left: leftOffset, width } = calculateBarPosition(leftOffsetRatio, widthRatio);
 
   const spanDisplay = getSpanDisplayLabels(spanSource.span, t);
   const spanKindLabel = t(`traces.common.badges.${spanSource.spanKind}`);
   const normalizedSpanType = normalizeSpanType(spanSource.span.type);
   const SpanIcon = getSpanIcon(normalizedSpanType);
+  const toolType = spanSource.span.value?.toolUse?.type;
+  const isResponsesCustomTool = normalizeSpanType(toolType) === 'responses_custom_tool';
+
+  const imageUrl = spanSource.span.value?.userImageUrl?.url || spanSource.span.value?.imageUrl?.url;
+  const videoUrl = spanSource.span.value?.userVideoUrl?.url || spanSource.span.value?.videoUrl?.url;
+  const summaryText = spanDisplay?.secondary;
 
   return (
     <div className='border-border/40 border-b'>
@@ -374,14 +394,36 @@ function SpanRow({ span, totalDuration, segmentSequentialOffset, onSelectSpan, s
           <SpanIcon className='text-muted-foreground h-4 w-4' />
         </div>
 
-        <div className='flex min-w-0 flex-1 items-center gap-2'>
-          <span className='truncate text-sm font-medium'>{spanDisplay?.primary ?? span.name}</span>
+        <div className='flex min-w-0 flex-1 items-center gap-3'>
+          {imageUrl && (
+            <img
+              src={imageUrl}
+              alt=''
+              className='h-8 w-8 flex-shrink-0 rounded border object-cover'
+            />
+          )}
+          {!imageUrl && videoUrl && (
+            <video
+              src={videoUrl}
+              className='h-8 w-8 flex-shrink-0 rounded border object-cover'
+              muted
+              preload='metadata'
+            />
+          )}
+          <span className='truncate text-sm font-medium'>{spanDisplay?.primary || span.name}</span>
           {spanKindLabel && (
             <Badge variant='secondary' className='text-[10px] tracking-wide uppercase'>
               {spanKindLabel}
             </Badge>
           )}
-          {spanDisplay?.secondary && <span className='text-muted-foreground truncate text-xs'>{spanDisplay.secondary}</span>}
+          {isResponsesCustomTool && toolType && (
+            <Badge variant='outline' className='text-[10px]'>
+              {toolType}
+            </Badge>
+          )}
+          <div className='text-muted-foreground ml-auto min-w-0 flex-1 text-right text-xs'>
+            {summaryText && <span className='block truncate'>{summaryText}</span>}
+          </div>
         </div>
 
         <div className='bg-muted/30 relative h-5 w-[180px] min-w-[180px] rounded'>
@@ -440,6 +482,7 @@ export function TraceFlatTimeline({ trace, onSelectSpan, selectedSpanId }: Trace
   const [expandedSegments, setExpandedSegments] = useState<Set<string>>(new Set());
   const [allExpanded, setAllExpanded] = useState(true);
   const [selectedSpanTypes, setSelectedSpanTypes] = useState<Set<string>>(new Set());
+  const initializedTraceIdRef = useRef<string | null>(null);
 
   const timelineData = useMemo(() => {
     const earliestStart = findEarliestStart(trace);
@@ -455,13 +498,13 @@ export function TraceFlatTimeline({ trace, onSelectSpan, selectedSpanId }: Trace
 
     const flatSegments = flattenSegments(rootNode, earliestStart);
 
-    // Collect all unique span types
-    const allSpanTypes = new Set<string>();
+    // Collect all unique span types with counts
+    const spanTypeCounts = new Map<string, number>();
     flatSegments.forEach((seg) => {
       seg.spans.forEach((span) => {
         if (span.source.type === 'span') {
           const normalizedType = normalizeSpanType(span.source.span.type);
-          allSpanTypes.add(normalizedType);
+          spanTypeCounts.set(normalizedType, (spanTypeCounts.get(normalizedType) ?? 0) + 1);
         }
       });
     });
@@ -492,24 +535,68 @@ export function TraceFlatTimeline({ trace, onSelectSpan, selectedSpanId }: Trace
     const totalTokens = tokenSum > 0 ? tokenSum : null;
     const totalCachedTokens = cachedTokenSum > 0 ? cachedTokenSum : null;
 
-    // Initialize expanded segments for first 10 items
-    const initialExpanded = new Set<string>();
-    flatSegments.slice(0, 10).forEach((seg) => {
-      if (seg.spans.length > 0) {
-        initialExpanded.add(seg.segment.id);
-      }
-    });
-    setExpandedSegments(initialExpanded);
-
     return {
       flatSegments,
       totalDuration: Math.max(totalDuration, 1),
       totalItems,
       totalTokens,
       totalCachedTokens,
-      allSpanTypes: Array.from(allSpanTypes).sort(),
+      spanTypeCounts,
+      allSpanTypes: Array.from(spanTypeCounts.keys()).sort(),
     };
   }, [trace]);
+
+  useEffect(() => {
+    if (!timelineData) return;
+    if (initializedTraceIdRef.current === trace.id) return;
+
+    initializedTraceIdRef.current = trace.id;
+
+    const storageKey = `axonhub_traces_flat_timeline_expanded_segments_${trace.id}`;
+    const expandableSegments = timelineData.flatSegments.filter((seg) => seg.spans.length > 0).map((seg) => seg.segment.id);
+    const expandableSegmentSet = new Set(expandableSegments);
+
+    let nextExpanded = new Set<string>();
+    try {
+      const raw = localStorage.getItem(storageKey);
+      const parsed = raw ? JSON.parse(raw) : null;
+      if (Array.isArray(parsed)) {
+        nextExpanded = new Set(parsed.filter((id) => typeof id === 'string' && expandableSegmentSet.has(id)));
+      }
+    } catch (_error) {
+      void _error;
+    }
+
+    if (nextExpanded.size === 0) {
+      timelineData.flatSegments.slice(0, 10).forEach((seg) => {
+        if (seg.spans.length > 0) {
+          nextExpanded.add(seg.segment.id);
+        }
+      });
+    }
+
+    setExpandedSegments(nextExpanded);
+    setAllExpanded(nextExpanded.size === expandableSegments.length && expandableSegments.length > 0);
+  }, [timelineData, trace.id]);
+
+  useEffect(() => {
+    if (!timelineData) return;
+    if (initializedTraceIdRef.current !== trace.id) return;
+
+    const storageKey = `axonhub_traces_flat_timeline_expanded_segments_${trace.id}`;
+    const next = Array.from(expandedSegments);
+    try {
+      localStorage.setItem(storageKey, JSON.stringify(next));
+    } catch (_error) {
+      void _error;
+    }
+  }, [expandedSegments, timelineData, trace.id]);
+
+  useEffect(() => {
+    if (!timelineData) return;
+    const expandableCount = timelineData.flatSegments.filter((seg) => seg.spans.length > 0).length;
+    setAllExpanded(expandableCount > 0 && expandedSegments.size === expandableCount);
+  }, [expandedSegments, timelineData]);
 
   const handleToggleAll = () => {
     if (!timelineData) return;
@@ -517,12 +604,10 @@ export function TraceFlatTimeline({ trace, onSelectSpan, selectedSpanId }: Trace
     if (allExpanded) {
       // Collapse all
       setExpandedSegments(new Set());
-      setAllExpanded(false);
     } else {
       // Expand all
       const allSegmentIds = new Set(timelineData.flatSegments.filter((seg) => seg.spans.length > 0).map((seg) => seg.segment.id));
       setExpandedSegments(allSegmentIds);
-      setAllExpanded(true);
     }
   };
 
@@ -590,7 +675,7 @@ export function TraceFlatTimeline({ trace, onSelectSpan, selectedSpanId }: Trace
     );
   }
 
-  const { flatSegments, totalDuration, totalItems, totalTokens, totalCachedTokens, allSpanTypes } = timelineData;
+  const { totalDuration, totalItems, totalTokens, totalCachedTokens, spanTypeCounts, allSpanTypes } = timelineData;
   const activeFilterCount = selectedSpanTypes.size;
 
   return (
@@ -678,8 +763,9 @@ export function TraceFlatTimeline({ trace, onSelectSpan, selectedSpanId }: Trace
                             />
                             <SpanIcon className='text-muted-foreground h-4 w-4 flex-shrink-0' />
                             <span className='flex-1 text-sm'>
-                              {t(`traces.timeline.spanTypes.${spanType}`, spanType)}
+                              {t(`traces.timeline.spanTypes.${getSpanTypeTranslationKey(spanType)}`, spanType)}
                             </span>
+                            <span className='text-muted-foreground text-xs tabular-nums'>{spanTypeCounts.get(spanType) ?? 0}</span>
                           </label>
                         );
                       })}

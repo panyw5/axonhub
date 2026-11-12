@@ -1,16 +1,21 @@
 package middleware
 
 import (
+	"context"
 	"errors"
 	"net/http"
+	"strconv"
 
 	"github.com/gin-gonic/gin"
 
+	"github.com/looplj/axonhub/internal/authz"
 	"github.com/looplj/axonhub/internal/contexts"
 	"github.com/looplj/axonhub/internal/ent"
 	"github.com/looplj/axonhub/internal/ent/apikey"
 	"github.com/looplj/axonhub/internal/ent/request"
+	"github.com/looplj/axonhub/internal/log"
 	"github.com/looplj/axonhub/internal/server/biz"
+	"github.com/looplj/axonhub/llm/transformer/shared"
 )
 
 // WithAPIKeyAuth 中间件用于验证 API key.
@@ -22,26 +27,50 @@ func WithAPIKeyAuth(auth *biz.AuthService) gin.HandlerFunc {
 func WithAPIKeyConfig(auth *biz.AuthService, config *APIKeyConfig) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		key, err := ExtractAPIKeyFromRequest(c.Request, config)
-		if err != nil {
-			AbortWithError(c, http.StatusUnauthorized, err)
+		// DO NOT ALLOW USE NO AUTH API KEY DIRECTLY.
+		if key == biz.NoAuthAPIKeyValue {
+			AbortWithError(c, http.StatusUnauthorized, errors.New("Invalid API key"))
 			return
 		}
 
-		apiKey, err := auth.AnthenticateAPIKey(c.Request.Context(), key)
+		var apiKey *ent.APIKey
+		if err == nil {
+			apiKey, err = auth.AuthenticateAPIKey(c.Request.Context(), key)
+		}
+		if err != nil {
+			apiKey, err = auth.AuthenticateNoAuth(c.Request.Context())
+		}
 		if err != nil {
 			if ent.IsNotFound(err) || errors.Is(err, biz.ErrInvalidAPIKey) {
 				AbortWithError(c, http.StatusUnauthorized, errors.New("Invalid API key"))
 			} else {
+				log.Error(c.Request.Context(), "Failed to validate API key", log.Cause(err))
 				AbortWithError(c, http.StatusInternalServerError, errors.New("Failed to validate API key"))
 			}
 
 			return
 		}
 
+		if len(apiKey.AllowedIps) > 0 {
+			clientIPs := clientIPCandidates(c)
+			if !isAnyAllowedIP(clientIPs, apiKey.AllowedIps) {
+				AbortWithError(c, http.StatusForbidden, errors.New("IP address is not allowed for this API key"))
+				return
+			}
+		}
+
 		ctx := contexts.WithAPIKey(c.Request.Context(), apiKey)
 
 		if apiKey.Edges.Project != nil {
 			ctx = contexts.WithProjectID(ctx, apiKey.Edges.Project.ID)
+		}
+
+		ctx = withSessionScopeForAPIKey(ctx, apiKey)
+
+		ctx, err = withAPIKeyPrincipal(ctx, apiKey)
+		if err != nil {
+			AbortWithError(c, http.StatusUnauthorized, errors.New("Invalid authentication context"))
+			return
 		}
 
 		c.Request = c.Request.WithContext(ctx)
@@ -73,6 +102,15 @@ func WithJWTAuth(auth *biz.AuthService) gin.HandlerFunc {
 		}
 
 		ctx := contexts.WithUser(c.Request.Context(), user)
+
+		ctx = shared.WithSessionScope(ctx, "user:"+strconv.Itoa(user.ID))
+
+		ctx, err = withUserPrincipal(ctx, user)
+		if err != nil {
+			AbortWithError(c, http.StatusUnauthorized, errors.New("Invalid authentication context"))
+			return
+		}
+
 		c.Request = c.Request.WithContext(ctx)
 
 		c.Next()
@@ -84,7 +122,10 @@ var apiKeyAuthConfig = &APIKeyConfig{
 	RequireBearer: true,
 }
 
-// WithOpenAPIAuth allows API key auth for createLLMAPIKey only.
+// WithOpenAPIAuth gates the OpenAPI GraphQL surface (/openapi/v1/graphql).
+// It accepts only service_account API keys and injects the API key principal,
+// project, and session scope so the ent privacy layer can enforce per-project,
+// scope-gated access for every query and mutation.
 func WithOpenAPIAuth(auth *biz.AuthService) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		key, err := ExtractAPIKeyFromRequest(c.Request, apiKeyAuthConfig)
@@ -93,7 +134,7 @@ func WithOpenAPIAuth(auth *biz.AuthService) gin.HandlerFunc {
 			return
 		}
 
-		apiKey, err := auth.AnthenticateAPIKey(c.Request.Context(), key)
+		apiKey, err := auth.AuthenticateAPIKey(c.Request.Context(), key)
 		if err != nil {
 			if ent.IsNotFound(err) || errors.Is(err, biz.ErrInvalidAPIKey) {
 				AbortWithError(c, http.StatusUnauthorized, errors.New("Invalid API key"))
@@ -109,9 +150,108 @@ func WithOpenAPIAuth(auth *biz.AuthService) gin.HandlerFunc {
 			return
 		}
 
+		if len(apiKey.AllowedIps) > 0 {
+			clientIPs := clientIPCandidates(c)
+			if !isAnyAllowedIP(clientIPs, apiKey.AllowedIps) {
+				AbortWithError(c, http.StatusForbidden, errors.New("IP address is not allowed for this API key"))
+				return
+			}
+		}
+
 		ctx := contexts.WithAPIKey(c.Request.Context(), apiKey)
 		if apiKey.Edges.Project != nil {
 			ctx = contexts.WithProjectID(ctx, apiKey.Edges.Project.ID)
+		}
+
+		ctx = withSessionScopeForAPIKey(ctx, apiKey)
+
+		ctx, err = withAPIKeyPrincipal(ctx, apiKey)
+		if err != nil {
+			AbortWithError(c, http.StatusUnauthorized, errors.New("Invalid authentication context"))
+			return
+		}
+
+		c.Request = c.Request.WithContext(ctx)
+		c.Next()
+	}
+}
+
+// WithAdminGraphqlAuth gates /admin/graphql. It accepts either a user JWT, the
+// admin UI's normal credential, or a service_account API key so automation can
+// read the management data. Service account keys stay read-only: the admin
+// GraphQL handler refuses their mutations, and the ent privacy layer plus the
+// authz scope checks decide which queries they may run.
+func WithAdminGraphqlAuth(auth *biz.AuthService) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		token, err := ExtractAPIKeyFromRequest(c.Request, &APIKeyConfig{
+			Headers:       []string{"Authorization"},
+			RequireBearer: true,
+		})
+		if err != nil {
+			AbortWithError(c, http.StatusUnauthorized, err)
+			return
+		}
+
+		user, jwtErr := auth.AuthenticateJWTToken(c.Request.Context(), token)
+		if jwtErr == nil {
+			ctx := contexts.WithUser(c.Request.Context(), user)
+			ctx = shared.WithSessionScope(ctx, "user:"+strconv.Itoa(user.ID))
+
+			ctx, err = withUserPrincipal(ctx, user)
+			if err != nil {
+				AbortWithError(c, http.StatusUnauthorized, errors.New("Invalid authentication context"))
+				return
+			}
+
+			c.Request = c.Request.WithContext(ctx)
+			c.Next()
+
+			return
+		}
+
+		// Only a token that fails JWT parsing falls through to API key auth. A
+		// server-side JWT failure (for example an unreadable secret key) is not
+		// an API key concern, so report it as such instead of a bogus 401.
+		if !errors.Is(jwtErr, biz.ErrInvalidJWT) {
+			AbortWithError(c, http.StatusInternalServerError, errors.New("Failed to validate token"))
+			return
+		}
+
+		apiKey, keyErr := auth.AuthenticateAPIKey(c.Request.Context(), token)
+		if keyErr != nil {
+			if ent.IsNotFound(keyErr) || errors.Is(keyErr, biz.ErrInvalidAPIKey) {
+				AbortWithError(c, http.StatusUnauthorized, errors.New("Invalid token"))
+			} else {
+				AbortWithError(c, http.StatusInternalServerError, errors.New("Failed to validate token"))
+			}
+
+			return
+		}
+
+		if apiKey.Type != apikey.TypeServiceAccount {
+			AbortWithError(c, http.StatusForbidden, errors.New("Only service account API keys may access the admin GraphQL API"))
+			return
+		}
+
+		if len(apiKey.AllowedIps) > 0 {
+			clientIPs := clientIPCandidates(c)
+			if !isAnyAllowedIP(clientIPs, apiKey.AllowedIps) {
+				AbortWithError(c, http.StatusForbidden, errors.New("IP address is not allowed for this API key"))
+				return
+			}
+		}
+
+		ctx := contexts.WithAPIKey(c.Request.Context(), apiKey)
+		if apiKey.Edges.Project != nil {
+			ctx = contexts.WithProjectID(ctx, apiKey.Edges.Project.ID)
+		}
+
+		ctx = withSessionScopeForAPIKey(ctx, apiKey)
+
+		ctx, err = withAPIKeyPrincipal(ctx, apiKey)
+		if err != nil {
+			AbortWithError(c, http.StatusUnauthorized, errors.New("Invalid authentication context"))
+			return
 		}
 
 		c.Request = c.Request.WithContext(ctx)
@@ -134,7 +274,7 @@ func WithGeminiKeyAuth(auth *biz.AuthService) gin.HandlerFunc {
 			}
 		}
 
-		apiKey, err := auth.AnthenticateAPIKey(c.Request.Context(), key)
+		apiKey, err := auth.AuthenticateAPIKey(c.Request.Context(), key)
 		if err != nil {
 			if ent.IsNotFound(err) || errors.Is(err, biz.ErrInvalidAPIKey) {
 				AbortWithError(c, http.StatusUnauthorized, biz.ErrInvalidAPIKey)
@@ -145,11 +285,27 @@ func WithGeminiKeyAuth(auth *biz.AuthService) gin.HandlerFunc {
 			return
 		}
 
+		if len(apiKey.AllowedIps) > 0 {
+			clientIPs := clientIPCandidates(c)
+			if !isAnyAllowedIP(clientIPs, apiKey.AllowedIps) {
+				AbortWithError(c, http.StatusForbidden, errors.New("IP address is not allowed for this API key"))
+				return
+			}
+		}
+
 		// 将 API key entity 保存到 context 中
 		ctx := contexts.WithAPIKey(c.Request.Context(), apiKey)
 
 		if apiKey.Edges.Project != nil {
 			ctx = contexts.WithProjectID(ctx, apiKey.Edges.Project.ID)
+		}
+
+		ctx = withSessionScopeForAPIKey(ctx, apiKey)
+
+		ctx, err = withAPIKeyPrincipal(ctx, apiKey)
+		if err != nil {
+			AbortWithError(c, http.StatusUnauthorized, errors.New("Invalid authentication context"))
+			return
 		}
 
 		c.Request = c.Request.WithContext(ctx)
@@ -165,4 +321,27 @@ func WithSource(source request.Source) gin.HandlerFunc {
 		c.Request = c.Request.WithContext(ctx)
 		c.Next()
 	}
+}
+
+func withSessionScopeForAPIKey(ctx context.Context, key *ent.APIKey) context.Context {
+	scope := "api_key:" + strconv.Itoa(key.ID)
+	if key.Edges.Project != nil {
+		scope += ":project:" + strconv.Itoa(key.Edges.Project.ID)
+	}
+	return shared.WithSessionScope(ctx, scope)
+}
+
+func withUserPrincipal(ctx context.Context, user *ent.User) (context.Context, error) {
+	principal := authz.Principal{Type: authz.PrincipalTypeUser, UserID: &user.ID}
+	return authz.WithPrincipal(ctx, principal)
+}
+
+func withAPIKeyPrincipal(ctx context.Context, key *ent.APIKey) (context.Context, error) {
+	principal := authz.Principal{Type: authz.PrincipalTypeAPIKey, APIKeyID: &key.ID}
+	if key.Edges.Project != nil {
+		projectID := key.Edges.Project.ID
+		principal.ProjectID = &projectID
+	}
+
+	return authz.WithPrincipal(ctx, principal)
 }

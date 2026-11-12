@@ -6,14 +6,15 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"strings"
 
 	"github.com/google/uuid"
 
-	"github.com/looplj/axonhub/internal/log"
 	"github.com/looplj/axonhub/llm"
 	"github.com/looplj/axonhub/llm/httpclient"
+	"github.com/looplj/axonhub/llm/internal/pkg/xurl"
 	"github.com/looplj/axonhub/llm/transformer"
 )
 
@@ -43,6 +44,7 @@ func (t *OutboundTransformer) buildImageGenerationAPIRequest(ctx context.Context
 	if rawReq.TransformerMetadata == nil {
 		rawReq.TransformerMetadata = map[string]any{}
 	}
+
 	rawReq.TransformerMetadata["model"] = chatReq.Model
 
 	return rawReq, nil
@@ -196,7 +198,7 @@ func downloadImageToDataURL(ctx context.Context, imageURL string) (string, error
 
 	defer func() {
 		if err := resp.Body.Close(); err != nil {
-			log.Error(ctx, "failed to close response body", log.Cause(err))
+			slog.ErrorContext(ctx, "failed to close response body", slog.Any("error", err))
 		}
 	}()
 
@@ -217,9 +219,11 @@ func downloadImageToDataURL(ctx context.Context, imageURL string) (string, error
 		contentType = "image/png"
 	}
 
-	// Convert to base64 data URL
+	// Convert to base64 data URL.
+	// Use xurl.BuildDataURL (single exact-size concat) instead of fmt.Sprintf to
+	// avoid the printer's doubling-growth buffer churn on large base64 data.
 	base64Data := base64.StdEncoding.EncodeToString(imageData)
-	dataURL := fmt.Sprintf("data:%s;base64,%s", contentType, base64Data)
+	dataURL := xurl.BuildDataURL(contentType, base64Data, true)
 
 	return dataURL, nil
 }

@@ -8,10 +8,9 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/looplj/axonhub/internal/pkg/xerrors"
-	"github.com/looplj/axonhub/internal/pkg/xjson"
 	"github.com/looplj/axonhub/llm"
 	"github.com/looplj/axonhub/llm/httpclient"
+	"github.com/looplj/axonhub/llm/internal/pkg/xjson"
 	transformer "github.com/looplj/axonhub/llm/transformer"
 )
 
@@ -21,10 +20,6 @@ type InboundTransformer struct{}
 // NewInboundTransformer creates a new Anthropic InboundTransformer.
 func NewInboundTransformer() *InboundTransformer {
 	return &InboundTransformer{}
-}
-
-func (t *InboundTransformer) APIFormat() llm.APIFormat {
-	return llm.APIFormatAnthropicMessage
 }
 
 // TransformRequest transforms Anthropic HTTP request to ChatCompletionRequest.
@@ -77,6 +72,47 @@ func (t *InboundTransformer) TransformRequest(ctx context.Context, httpReq *http
 				if prompt.Type != "text" {
 					return nil, fmt.Errorf("%w: system prompt must be text", transformer.ErrInvalidRequest)
 				}
+			}
+		}
+	}
+
+	// Validate thinking configuration
+	if anthropicReq.Thinking != nil {
+		switch anthropicReq.Thinking.Type {
+		case "disabled":
+			// valid
+		case "enabled":
+			// budget_tokens may be omitted (Z.AI/GLM-style clients); the default is resolved downstream.
+			if anthropicReq.Thinking.BudgetTokens < 0 {
+				return nil, fmt.Errorf("%w: budget_tokens must be positive when thinking type is enabled", transformer.ErrInvalidRequest)
+			}
+		case "adaptive":
+			// output_config is optional for adaptive thinking (defaults to "high" effort upstream)
+			if anthropicReq.OutputConfig != nil && anthropicReq.OutputConfig.Effort != "" {
+				switch anthropicReq.OutputConfig.Effort {
+				case "low", "medium", "high", "xhigh", "max":
+					// valid
+				default:
+					return nil, fmt.Errorf("%w: output_config.effort must be one of: low, medium, high, xhigh, max", transformer.ErrInvalidRequest)
+				}
+			}
+		default:
+			return nil, fmt.Errorf("%w: thinking.type must be one of: enabled, disabled, adaptive", transformer.ErrInvalidRequest)
+		}
+	}
+
+	// Validate tool_choice
+	if anthropicReq.ToolChoice != nil {
+		switch anthropicReq.ToolChoice.Type {
+		case "auto", "none", "any", "tool":
+			// valid
+		default:
+			return nil, fmt.Errorf("%w: tool_choice.type must be one of: auto, none, any, tool", transformer.ErrInvalidRequest)
+		}
+
+		if anthropicReq.ToolChoice.Type == "tool" {
+			if anthropicReq.ToolChoice.Name == nil || *anthropicReq.ToolChoice.Name == "" {
+				return nil, fmt.Errorf("%w: tool_choice.name is required when type is tool", transformer.ErrInvalidRequest)
 			}
 		}
 	}
@@ -135,7 +171,7 @@ func (t *InboundTransformer) TransformError(ctx context.Context, rawErr error) *
 		}
 	}
 
-	if llmErr, ok := xerrors.As[*llm.ResponseError](rawErr); ok {
+	if llmErr, ok := errors.AsType[*llm.ResponseError](rawErr); ok {
 		return &httpclient.Error{
 			StatusCode: llmErr.StatusCode,
 			Status:     http.StatusText(llmErr.StatusCode),
@@ -150,7 +186,7 @@ func (t *InboundTransformer) TransformError(ctx context.Context, rawErr error) *
 		}
 	}
 
-	if httpErr, ok := xerrors.As[*httpclient.Error](rawErr); ok {
+	if httpErr, ok := errors.AsType[*httpclient.Error](rawErr); ok {
 		return httpErr
 	}
 

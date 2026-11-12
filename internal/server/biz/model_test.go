@@ -7,15 +7,29 @@ import (
 	"entgo.io/ent/dialect"
 	"github.com/stretchr/testify/require"
 
+	"github.com/looplj/axonhub/internal/authz"
 	"github.com/looplj/axonhub/internal/contexts"
 	"github.com/looplj/axonhub/internal/ent"
 	"github.com/looplj/axonhub/internal/ent/channel"
 	"github.com/looplj/axonhub/internal/ent/enttest"
 	"github.com/looplj/axonhub/internal/ent/model"
-	"github.com/looplj/axonhub/internal/ent/privacy"
 	"github.com/looplj/axonhub/internal/objects"
 	"github.com/looplj/axonhub/internal/pkg/xcache"
 )
+
+func TestValidateModelSettingsRoutingPolicy(t *testing.T) {
+	settings := &objects.ModelSettings{}
+	require.NoError(t, validateModelSettings(settings))
+	require.Equal(t, objects.RoutingPolicyDefault, settings.LoadBalancerStrategy)
+	require.Equal(t, objects.RoutingPolicyDefault, settings.TraceStickyMode)
+
+	require.Error(t, validateModelSettings(&objects.ModelSettings{
+		LoadBalancerStrategy: "unknown",
+	}))
+	require.Error(t, validateModelSettings(&objects.ModelSettings{
+		TraceStickyMode: "unknown",
+	}))
+}
 
 func TestModelService_QueryModelChannelConnections(t *testing.T) {
 	client := enttest.Open(t, dialect.SQLite, "file:ent?mode=memory&_fk=0")
@@ -23,7 +37,7 @@ func TestModelService_QueryModelChannelConnections(t *testing.T) {
 
 	ctx := context.Background()
 	ctx = ent.NewContext(ctx, client)
-	ctx = privacy.DecisionContext(ctx, privacy.Allow)
+	ctx = authz.WithTestBypass(ctx)
 	svc := &ModelService{
 		AbstractService: &AbstractService{
 			db: client,
@@ -444,7 +458,7 @@ func TestModelService_ListEnabledModels(t *testing.T) {
 
 	ctx := context.Background()
 	ctx = ent.NewContext(ctx, client)
-	ctx = privacy.DecisionContext(ctx, privacy.Allow)
+	ctx = authz.WithTestBypass(ctx)
 
 	// Create channels with different configurations
 	_, err := client.Channel.Create().
@@ -880,7 +894,7 @@ func TestModelService_ListEnabledModels(t *testing.T) {
 		// Context without API key
 		ctxNoAPIKey := context.Background()
 		ctxNoAPIKey = ent.NewContext(ctxNoAPIKey, client)
-		ctxNoAPIKey = privacy.DecisionContext(ctxNoAPIKey, privacy.Allow)
+		ctxNoAPIKey = authz.WithTestBypass(ctxNoAPIKey)
 
 		result, err := modelSvc.ListEnabledModels(ctxNoAPIKey)
 		require.NoError(t, err)
@@ -894,6 +908,187 @@ func TestModelService_ListEnabledModels(t *testing.T) {
 		require.True(t, resultMap["gpt-4"], "gpt-4 should be in result")
 		require.True(t, resultMap["gpt-3.5-turbo"], "gpt-3.5-turbo should be in result")
 		require.True(t, resultMap["claude-3-opus-20240229"], "claude-3-opus-20240229 should be in result")
+	})
+
+	t.Run("ModelBlacklistRegex filters channel-derived models", func(t *testing.T) {
+		// Match deepseek-* family from channel models.
+		modelSettings := SystemModelSettings{
+			QueryAllChannelModels: true,
+			ModelBlacklistRegex:   "deepseek.*",
+		}
+		err := systemSvc.SetModelSettings(ctx, modelSettings)
+		require.NoError(t, err)
+
+		t.Cleanup(func() {
+			_ = systemSvc.SetModelSettings(ctx, SystemModelSettings{QueryAllChannelModels: true})
+		})
+
+		result, err := modelSvc.ListEnabledModels(ctx)
+		require.NoError(t, err)
+
+		resultMap := make(map[string]bool)
+		for _, m := range result {
+			resultMap[m.ID] = true
+		}
+
+		// Filtered out
+		require.False(t, resultMap["deepseek-chat"], "deepseek-chat should be filtered")
+		require.False(t, resultMap["deepseek-reasoner"], "deepseek-reasoner should be filtered")
+		require.False(t, resultMap["deepseek/deepseek-chat"], "deepseek/deepseek-chat should be filtered")
+		require.False(t, resultMap["deepseek/deepseek-reasoner"], "deepseek/deepseek-reasoner should be filtered")
+
+		// Untouched
+		require.True(t, resultMap["gpt-4"], "gpt-4 should be kept")
+		require.True(t, resultMap["claude-3-opus-20240229"], "claude-3-opus-20240229 should be kept")
+	})
+
+	t.Run("ModelBlacklistRegex empty pattern keeps all models", func(t *testing.T) {
+		modelSettings := SystemModelSettings{
+			QueryAllChannelModels: true,
+			ModelBlacklistRegex:   "",
+		}
+		err := systemSvc.SetModelSettings(ctx, modelSettings)
+		require.NoError(t, err)
+
+		result, err := modelSvc.ListEnabledModels(ctx)
+		require.NoError(t, err)
+
+		resultMap := make(map[string]bool)
+		for _, m := range result {
+			resultMap[m.ID] = true
+		}
+
+		require.True(t, resultMap["gpt-4"], "gpt-4 should be present")
+		require.True(t, resultMap["deepseek-chat"], "deepseek-chat should be present (no blacklist)")
+	})
+
+	t.Run("ModelBlacklistRegex invalid pattern rejected at save", func(t *testing.T) {
+		modelSettings := SystemModelSettings{
+			QueryAllChannelModels: true,
+			ModelBlacklistRegex:   "[unclosed",
+		}
+		err := systemSvc.SetModelSettings(ctx, modelSettings)
+		require.Error(t, err, "invalid regex should be rejected on save")
+	})
+
+	t.Run("ModelBlacklistRegex not effective when QueryAllChannelModels is false", func(t *testing.T) {
+		// A match-all pattern would wipe out all channel models if it ran.
+		// But QueryAllChannelModels=false short-circuits before the blacklist filter,
+		// so configured models must come through unaffected.
+		modelSettings := SystemModelSettings{
+			QueryAllChannelModels: false,
+			ModelBlacklistRegex:   ".*",
+		}
+		err := systemSvc.SetModelSettings(ctx, modelSettings)
+		require.NoError(t, err)
+
+		t.Cleanup(func() {
+			_ = systemSvc.SetModelSettings(ctx, SystemModelSettings{QueryAllChannelModels: true})
+		})
+
+		// Configured Model entity that should still be returned.
+		_, err = client.Model.Create().
+			SetDeveloper("openai").
+			SetModelID("gpt-4-blacklist-bypass").
+			SetName("GPT-4 Blacklist Bypass").
+			SetType(model.TypeChat).
+			SetGroup("gpt").
+			SetIcon("icon").
+			SetModelCard(&objects.ModelCard{}).
+			SetSettings(&objects.ModelSettings{
+				Associations: []*objects.ModelAssociation{
+					{Type: "model", ModelID: &objects.ModelIDAssociation{ModelID: "gpt-4"}},
+				},
+			}).
+			SetStatus(model.StatusEnabled).
+			Save(ctx)
+		require.NoError(t, err)
+
+		result, err := modelSvc.ListEnabledModels(ctx)
+		require.NoError(t, err)
+
+		resultMap := make(map[string]bool)
+		for _, m := range result {
+			resultMap[m.ID] = true
+		}
+
+		require.True(t, resultMap["gpt-4-blacklist-bypass"],
+			"configured model should pass through when QueryAllChannelModels=false, regardless of blacklist")
+		// Channel-derived models must not appear (regular QueryAllChannelModels=false behavior).
+		require.False(t, resultMap["deepseek-chat"], "channel-only model should not be returned when QueryAllChannelModels=false")
+	})
+
+	t.Run("ModelBlacklistRegex does not filter configured Model entities", func(t *testing.T) {
+		// Configured models are added before the channel loop and registered in modelSet,
+		// so the blacklist filter (which only runs in the channel loop) cannot touch them.
+		_, err := client.Model.Create().
+			SetDeveloper("openai").
+			SetModelID("gpt-4-cfg-protected").
+			SetName("GPT-4 Configured Protected").
+			SetType(model.TypeChat).
+			SetGroup("gpt").
+			SetIcon("icon").
+			SetModelCard(&objects.ModelCard{}).
+			SetSettings(&objects.ModelSettings{
+				Associations: []*objects.ModelAssociation{
+					{Type: "model", ModelID: &objects.ModelIDAssociation{ModelID: "gpt-4"}},
+				},
+			}).
+			SetStatus(model.StatusEnabled).
+			Save(ctx)
+		require.NoError(t, err)
+
+		modelSettings := SystemModelSettings{
+			QueryAllChannelModels: true,
+			ModelBlacklistRegex:   "gpt-4-cfg-protected", // would match if filter ran
+		}
+		err = systemSvc.SetModelSettings(ctx, modelSettings)
+		require.NoError(t, err)
+
+		t.Cleanup(func() {
+			_ = systemSvc.SetModelSettings(ctx, SystemModelSettings{QueryAllChannelModels: true})
+		})
+
+		result, err := modelSvc.ListEnabledModels(ctx)
+		require.NoError(t, err)
+
+		var found *ModelFacade
+		for i := range result {
+			if result[i].ID == "gpt-4-cfg-protected" {
+				found = &result[i]
+				break
+			}
+		}
+
+		require.NotNil(t, found, "configured model with id matching blacklist must still be returned")
+		require.Equal(t, "configured", found.OwnedBy, "model should be marked as configured, not from channel")
+	})
+
+	t.Run("ModelBlacklistRegex exact-string pattern uses exactMatch path", func(t *testing.T) {
+		// "deepseek-chat" has no regex metachars, so xregexp uses the exactMatch fast path.
+		// Verify the filter still works.
+		modelSettings := SystemModelSettings{
+			QueryAllChannelModels: true,
+			ModelBlacklistRegex:   "deepseek-chat",
+		}
+		err := systemSvc.SetModelSettings(ctx, modelSettings)
+		require.NoError(t, err)
+
+		t.Cleanup(func() {
+			_ = systemSvc.SetModelSettings(ctx, SystemModelSettings{QueryAllChannelModels: true})
+		})
+
+		result, err := modelSvc.ListEnabledModels(ctx)
+		require.NoError(t, err)
+
+		resultMap := make(map[string]bool)
+		for _, m := range result {
+			resultMap[m.ID] = true
+		}
+
+		require.False(t, resultMap["deepseek-chat"], "exact-string blacklist should filter deepseek-chat")
+		require.True(t, resultMap["deepseek-reasoner"], "exact-string blacklist must not match deepseek-reasoner")
+		require.True(t, resultMap["deepseek/deepseek-chat"], "exact-string blacklist must not match prefixed deepseek/deepseek-chat")
 	})
 
 	t.Run("QueryAllChannelModels=false returns configured models only", func(t *testing.T) {
@@ -1122,13 +1317,14 @@ func TestModelService_ListEnabledModels(t *testing.T) {
 		result, err := modelSvc.ListEnabledModels(ctx)
 		require.NoError(t, err)
 
-		// Should only return models from the specified channel
+		// Should only return models from the specified channel or configured models
 		require.NotEmpty(t, result, "Should have models from the specified channel")
 
-		// Verify all models are from the first channel
-		for _, model := range result {
-			require.Equal(t, channels[0].Channel.Type.String(), model.OwnedBy,
-				"Model %s should be from the first channel", model.ID)
+		// Verify all models are from the first channel or configured models
+		for _, m := range result {
+			require.True(t,
+				m.OwnedBy == channels[0].Channel.Type.String() || m.OwnedBy == "configured",
+				"Model %s should be from the first channel or configured, got %s", m.ID, m.OwnedBy)
 		}
 	})
 
@@ -1198,6 +1394,157 @@ func TestModelService_ListEnabledModels(t *testing.T) {
 		require.True(t, resultMap["tagged-model-2"], "tagged-model-2 should be in result")
 	})
 
+	t.Run("API key with ChannelTags all-match filters channels", func(t *testing.T) {
+		modelSettings := SystemModelSettings{
+			QueryAllChannelModels: true,
+		}
+		err = systemSvc.SetModelSettings(ctx, modelSettings)
+		require.NoError(t, err)
+
+		_, err = client.Channel.Create().
+			SetType(channel.TypeOpenai).
+			SetName("All Tags Channel").
+			SetBaseURL("https://api.all-tags.com/v1").
+			SetCredentials(objects.ChannelCredentials{APIKey: "key-all-tags"}).
+			SetSupportedModels([]string{"all-tags-model"}).
+			SetDefaultTestModel("all-tags-model").
+			SetStatus(channel.StatusEnabled).
+			SetTags([]string{"production", "team-a", "official"}).
+			Save(ctx)
+		require.NoError(t, err)
+
+		_, err = client.Channel.Create().
+			SetType(channel.TypeOpenai).
+			SetName("Partial Tags Channel").
+			SetBaseURL("https://api.partial-tags.com/v1").
+			SetCredentials(objects.ChannelCredentials{APIKey: "key-partial-tags"}).
+			SetSupportedModels([]string{"partial-tags-model"}).
+			SetDefaultTestModel("partial-tags-model").
+			SetStatus(channel.StatusEnabled).
+			SetTags([]string{"production", "team-a"}).
+			Save(ctx)
+		require.NoError(t, err)
+
+		enabledEntities, err := client.Channel.Query().
+			Where(channel.StatusEQ(channel.StatusEnabled)).
+			All(ctx)
+		require.NoError(t, err)
+
+		enabledChannels := make([]*Channel, 0, len(enabledEntities))
+		for _, e := range enabledEntities {
+			built, buildErr := channelSvc.buildChannelWithTransformer(e)
+			require.NoError(t, buildErr)
+
+			enabledChannels = append(enabledChannels, built)
+		}
+
+		channelSvc.SetEnabledChannelsForTest(enabledChannels)
+
+		apiKey := &ent.APIKey{
+			ID:   14,
+			Name: "test-api-key-14",
+			Profiles: &objects.APIKeyProfiles{
+				ActiveProfile: "production",
+				Profiles: []objects.APIKeyProfile{
+					{
+						Name:                 "production",
+						ChannelTags:          []string{"production", "team-a", "official"},
+						ChannelTagsMatchMode: objects.ChannelTagsMatchModeAll,
+					},
+				},
+			},
+		}
+
+		ctx := contexts.WithAPIKey(ctx, apiKey)
+
+		result, err := modelSvc.ListEnabledModels(ctx)
+		require.NoError(t, err)
+
+		resultMap := make(map[string]bool)
+		for _, model := range result {
+			resultMap[model.ID] = true
+		}
+
+		require.True(t, resultMap["all-tags-model"], "all-tags-model should be in result")
+		require.False(t, resultMap["partial-tags-model"], "partial-tags-model should not be in result")
+	})
+
+	t.Run("API key with ChannelTags none-match excludes tagged channels", func(t *testing.T) {
+		modelSettings := SystemModelSettings{
+			QueryAllChannelModels: true,
+		}
+		err = systemSvc.SetModelSettings(ctx, modelSettings)
+		require.NoError(t, err)
+
+		_, err = client.Channel.Create().
+			SetType(channel.TypeOpenai).
+			SetName("None Match Excluded Channel").
+			SetBaseURL("https://api.none-excluded.com/v1").
+			SetCredentials(objects.ChannelCredentials{APIKey: "key-none-excluded"}).
+			SetSupportedModels([]string{"none-excluded-model"}).
+			SetDefaultTestModel("none-excluded-model").
+			SetStatus(channel.StatusEnabled).
+			SetTags([]string{"cc", "internal"}).
+			Save(ctx)
+		require.NoError(t, err)
+
+		_, err = client.Channel.Create().
+			SetType(channel.TypeOpenai).
+			SetName("None Match Allowed Channel").
+			SetBaseURL("https://api.none-allowed.com/v1").
+			SetCredentials(objects.ChannelCredentials{APIKey: "key-none-allowed"}).
+			SetSupportedModels([]string{"none-allowed-model"}).
+			SetDefaultTestModel("none-allowed-model").
+			SetStatus(channel.StatusEnabled).
+			SetTags([]string{"general"}).
+			Save(ctx)
+		require.NoError(t, err)
+
+		enabledEntities, err := client.Channel.Query().
+			Where(channel.StatusEQ(channel.StatusEnabled)).
+			All(ctx)
+		require.NoError(t, err)
+
+		enabledChannels := make([]*Channel, 0, len(enabledEntities))
+		for _, e := range enabledEntities {
+			built, buildErr := channelSvc.buildChannelWithTransformer(e)
+			require.NoError(t, buildErr)
+
+			enabledChannels = append(enabledChannels, built)
+		}
+
+		channelSvc.SetEnabledChannelsForTest(enabledChannels)
+
+		apiKey := &ent.APIKey{
+			ID:   17,
+			Name: "test-api-key-17",
+			Profiles: &objects.APIKeyProfiles{
+				ActiveProfile: "production",
+				Profiles: []objects.APIKeyProfile{
+					{
+						Name:                 "production",
+						ChannelTags:          []string{"cc", "internal"},
+						ChannelTagsMatchMode: objects.ChannelTagsMatchModeNone,
+					},
+				},
+			},
+		}
+
+		ctx := contexts.WithAPIKey(ctx, apiKey)
+
+		result, err := modelSvc.ListEnabledModels(ctx)
+		require.NoError(t, err)
+
+		resultMap := make(map[string]bool)
+		for _, model := range result {
+			resultMap[model.ID] = true
+		}
+
+		require.NotEmpty(t, result, "Should still return models from channels that do not match excluded tags")
+		require.True(t, resultMap["none-allowed-model"], "none-allowed-model should be in result")
+		require.False(t, resultMap["none-excluded-model"], "none-excluded-model should not be in result")
+	})
+
 	t.Run("API key with both ChannelIDs and ChannelTags", func(t *testing.T) {
 		// Get the first channel ID
 		channels := channelSvc.GetEnabledChannels()
@@ -1234,6 +1581,163 @@ func TestModelService_ListEnabledModels(t *testing.T) {
 					"Model %s should be from the first channel", model.ID)
 			}
 		}
+	})
+
+	t.Run("project profile ChannelIDs and ChannelTags use intersection", func(t *testing.T) {
+		err = systemSvc.SetModelSettings(ctx, SystemModelSettings{
+			QueryAllChannelModels: true,
+		})
+		require.NoError(t, err)
+
+		idOnlyChannel, err := client.Channel.Create().
+			SetType(channel.TypeOpenai).
+			SetName("Project ID Only Channel").
+			SetBaseURL("https://api.project-id-only.com/v1").
+			SetCredentials(objects.ChannelCredentials{APIKey: "key-project-id-only"}).
+			SetSupportedModels([]string{"project-id-only-model"}).
+			SetDefaultTestModel("project-id-only-model").
+			SetStatus(channel.StatusEnabled).
+			Save(ctx)
+		require.NoError(t, err)
+
+		matchingChannel, err := client.Channel.Create().
+			SetType(channel.TypeOpenai).
+			SetName("Project Matching Channel").
+			SetBaseURL("https://api.project-matching.com/v1").
+			SetCredentials(objects.ChannelCredentials{APIKey: "key-project-matching"}).
+			SetSupportedModels([]string{"project-matching-model"}).
+			SetDefaultTestModel("project-matching-model").
+			SetStatus(channel.StatusEnabled).
+			SetTags([]string{"project-allowed"}).
+			Save(ctx)
+		require.NoError(t, err)
+
+		enabledEntities, err := client.Channel.Query().
+			Where(channel.StatusEQ(channel.StatusEnabled)).
+			All(ctx)
+		require.NoError(t, err)
+
+		enabledChannels := make([]*Channel, 0, len(enabledEntities))
+		for _, e := range enabledEntities {
+			built, buildErr := channelSvc.buildChannelWithTransformer(e)
+			require.NoError(t, buildErr)
+
+			enabledChannels = append(enabledChannels, built)
+		}
+
+		channelSvc.SetEnabledChannelsForTest(enabledChannels)
+
+		apiKey := &ent.APIKey{
+			ID:   15,
+			Name: "test-api-key-15",
+			Edges: ent.APIKeyEdges{
+				Project: &ent.Project{
+					ID: 100,
+					Profiles: &objects.ProjectProfiles{
+						ActiveProfile: "project-production",
+						Profiles: []objects.ProjectProfile{
+							{
+								Name:        "project-production",
+								ChannelIDs:  []int{idOnlyChannel.ID, matchingChannel.ID},
+								ChannelTags: []string{"project-allowed"},
+							},
+						},
+					},
+				},
+			},
+		}
+
+		projectCtx := contexts.WithAPIKey(ctx, apiKey)
+
+		result, err := modelSvc.ListEnabledModels(projectCtx)
+		require.NoError(t, err)
+
+		resultMap := make(map[string]bool)
+		for _, model := range result {
+			resultMap[model.ID] = true
+		}
+
+		require.True(t, resultMap["project-matching-model"], "channel matching both ID and tag should remain")
+		require.False(t, resultMap["project-id-only-model"], "channel matching only ID should be filtered out")
+	})
+
+	t.Run("project profile all-match ChannelTags filters channels", func(t *testing.T) {
+		err = systemSvc.SetModelSettings(ctx, SystemModelSettings{
+			QueryAllChannelModels: true,
+		})
+		require.NoError(t, err)
+
+		allTagsChannel, err := client.Channel.Create().
+			SetType(channel.TypeOpenai).
+			SetName("Project All Tags Channel").
+			SetBaseURL("https://api.project-all-tags.com/v1").
+			SetCredentials(objects.ChannelCredentials{APIKey: "key-project-all-tags"}).
+			SetSupportedModels([]string{"project-all-tags-model"}).
+			SetDefaultTestModel("project-all-tags-model").
+			SetStatus(channel.StatusEnabled).
+			SetTags([]string{"project-a", "project-b"}).
+			Save(ctx)
+		require.NoError(t, err)
+
+		partialTagsChannel, err := client.Channel.Create().
+			SetType(channel.TypeOpenai).
+			SetName("Project Partial Tags Channel").
+			SetBaseURL("https://api.project-partial-tags.com/v1").
+			SetCredentials(objects.ChannelCredentials{APIKey: "key-project-partial-tags"}).
+			SetSupportedModels([]string{"project-partial-tags-model"}).
+			SetDefaultTestModel("project-partial-tags-model").
+			SetStatus(channel.StatusEnabled).
+			SetTags([]string{"project-a"}).
+			Save(ctx)
+		require.NoError(t, err)
+
+		enabledEntities, err := client.Channel.Query().
+			Where(channel.StatusEQ(channel.StatusEnabled)).
+			All(ctx)
+		require.NoError(t, err)
+
+		enabledChannels := make([]*Channel, 0, len(enabledEntities))
+		for _, e := range enabledEntities {
+			built, buildErr := channelSvc.buildChannelWithTransformer(e)
+			require.NoError(t, buildErr)
+
+			enabledChannels = append(enabledChannels, built)
+		}
+
+		channelSvc.SetEnabledChannelsForTest(enabledChannels)
+
+		apiKey := &ent.APIKey{
+			ID:   16,
+			Name: "test-api-key-16",
+			Edges: ent.APIKeyEdges{
+				Project: &ent.Project{
+					ID: 101,
+					Profiles: &objects.ProjectProfiles{
+						ActiveProfile: "project-production",
+						Profiles: []objects.ProjectProfile{
+							{
+								Name:                 "project-production",
+								ChannelTags:          []string{"project-a", "project-b"},
+								ChannelTagsMatchMode: objects.ChannelTagsMatchModeAll,
+							},
+						},
+					},
+				},
+			},
+		}
+
+		projectCtx := contexts.WithAPIKey(ctx, apiKey)
+
+		result, err := modelSvc.ListEnabledModels(projectCtx)
+		require.NoError(t, err)
+
+		resultMap := make(map[string]bool)
+		for _, model := range result {
+			resultMap[model.ID] = true
+		}
+
+		require.True(t, resultMap[allTagsChannel.SupportedModels[0]], "channel matching all tags should remain")
+		require.False(t, resultMap[partialTagsChannel.SupportedModels[0]], "channel missing one tag should be filtered out")
 	})
 
 	t.Run("empty channels returns empty models", func(t *testing.T) {
@@ -1290,6 +1794,62 @@ func TestModelService_ListEnabledModels(t *testing.T) {
 		require.True(t, resultMap["gpt-4"], "gpt-4 should be in result")
 		require.True(t, resultMap["claude-3-opus"], "claude-3-opus should be in result")
 		require.False(t, resultMap["gpt-3.5-turbo"], "gpt-3.5-turbo should not be in result")
+	})
+
+	t.Run("QueryAllChannelModels=true includes configured models and channel models", func(t *testing.T) {
+		modelSettings := SystemModelSettings{
+			QueryAllChannelModels: true,
+		}
+		err = systemSvc.SetModelSettings(ctx, modelSettings)
+		require.NoError(t, err)
+
+		result, err := modelSvc.ListEnabledModels(ctx)
+		require.NoError(t, err)
+
+		resultMap := make(map[string]ModelFacade)
+		for _, m := range result {
+			resultMap[m.ID] = m
+		}
+
+		// Configured models should be present with OwnedBy="configured"
+		require.Contains(t, resultMap, "gpt-4")
+		require.Equal(t, "configured", resultMap["gpt-4"].OwnedBy, "configured model should have OwnedBy=configured")
+		require.Contains(t, resultMap, "claude-3-opus")
+		require.Equal(t, "configured", resultMap["claude-3-opus"].OwnedBy)
+
+		// Channel models not overridden by configured models should also be present
+		require.Contains(t, resultMap, "gpt-3.5-turbo")
+		require.Contains(t, resultMap, "claude-3-opus-20240229")
+		require.Contains(t, resultMap, "deepseek-chat")
+	})
+
+	t.Run("QueryAllChannelModels=true configured models take priority over channel models", func(t *testing.T) {
+		modelSettings := SystemModelSettings{
+			QueryAllChannelModels: true,
+		}
+		err = systemSvc.SetModelSettings(ctx, modelSettings)
+		require.NoError(t, err)
+
+		result, err := modelSvc.ListEnabledModels(ctx)
+		require.NoError(t, err)
+
+		// gpt-4 exists as both a channel model and a configured model entity.
+		// The configured model should win (OwnedBy="configured").
+		for _, m := range result {
+			if m.ID == "gpt-4" {
+				require.Equal(t, "configured", m.OwnedBy,
+					"configured model should take priority over channel model")
+
+				break
+			}
+		}
+
+		// No duplicates
+		seen := make(map[string]bool)
+		for _, m := range result {
+			require.False(t, seen[m.ID], "model %s should not appear twice", m.ID)
+			seen[m.ID] = true
+		}
 	})
 }
 

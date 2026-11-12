@@ -15,7 +15,7 @@ import (
 // selectCandidates creates a middleware that selects available channel model candidates for the model.
 // This is the second step in the inbound pipeline, moved from outbound transformer.
 // If no valid candidates are found, it returns ErrInvalidModel to fail fast.
-func selectCandidates(inbound *PersistentInboundTransformer) pipeline.Middleware {
+func selectCandidates(inbound *PersistentInboundTransformer, quotaProvider ProviderQuotaStatusProvider, systemService biz.QuotaRoutingSettingsProvider) pipeline.Middleware {
 	return pipeline.OnLlmRequest("select-candidates", func(ctx context.Context, llmRequest *llm.Request) (*llm.Request, error) {
 		// Only select candidates once
 		if len(inbound.state.ChannelModelsCandidates) > 0 {
@@ -24,32 +24,58 @@ func selectCandidates(inbound *PersistentInboundTransformer) pipeline.Middleware
 
 		selector := inbound.state.CandidateSelector
 
+		// Project-level profile filtering (upper boundary)
+		if inbound.state.APIKey != nil {
+			if project := inbound.state.APIKey.Edges.Project; project != nil {
+				if projectProfile := project.GetActiveProfile(); projectProfile != nil {
+					if len(projectProfile.ChannelIDs) > 0 {
+						selector = WithSelectedChannelsSelector(selector, projectProfile.ChannelIDs)
+					}
+
+					if len(projectProfile.ChannelTags) > 0 {
+						selector = WithChannelTagsFilterSelector(selector, projectProfile.ChannelTags, projectProfile.ChannelTagsMatchMode)
+					}
+				}
+			}
+		}
+
+		// Key-level profile filtering (narrows further within project scope)
 		if profile := inbound.state.APIKey.GetActiveProfile(); profile != nil {
-			// 先应用 ChannelIDs 过滤
 			if len(profile.ChannelIDs) > 0 {
 				selector = WithSelectedChannelsSelector(selector, profile.ChannelIDs)
 			}
 
-			// 再应用 ChannelTags 过滤（链式装饰器，与 IDs 取交集）
 			if len(profile.ChannelTags) > 0 {
-				selector = WithTagsFilterSelector(selector, profile.ChannelTags)
+				selector = WithChannelTagsFilterSelector(selector, profile.ChannelTags, profile.ChannelTagsMatchMode)
 			}
 		}
 
-		// 应用 Google 原生工具过滤（仅对 Gemini 原生 API 格式生效）
-		if inbound.APIFormat() == llm.APIFormatGeminiContents {
+		// Apply Google native tools filter (only for Gemini native API format)
+		if llmRequest.APIFormat == llm.APIFormatGeminiContents {
 			selector = WithGoogleNativeToolsSelector(selector)
 		}
 
-		// 应用 Anthropic 原生工具过滤（对所有 API 格式生效）
-		// 无论通过 OpenAI 还是 Anthropic 格式入口，只要包含 web_search 工具，
-		// 都需要优先路由到支持 Anthropic 原生工具的渠道
-		selector = WithAnthropicNativeToolsSelector(selector)
+		// Apply Anthropic native tools filter (only for Anthropic message API format)
+		if llmRequest.APIFormat == llm.APIFormatAnthropicMessage {
+			selector = WithAnthropicNativeToolsSelector(selector)
+		}
 
 		selector = WithStreamPolicySelector(selector)
 
-		if inbound.state.LoadBalancer != nil {
-			selector = WithLoadBalancedSelector(selector, inbound.state.LoadBalancer, inbound.state.RetryPolicyProvider)
+		gate := NewQuotaRoutingGate(quotaProvider, systemService.QuotaRoutingSettingsOrDefault(ctx))
+
+		if len(inbound.state.LoadBalancers) > 0 {
+			selector = WithRoutingPolicyLoadBalancedSelector(
+				selector,
+				inbound.state.LoadBalancers,
+				inbound.state.RetryPolicyProvider,
+				inbound.state.RequestService,
+				inbound.state.APIKey,
+				&inbound.state.RoutingPolicy,
+				gate,
+			)
+		} else {
+			selector = WithQuotaRoutingSelector(selector, gate)
 		}
 
 		candidates, err := selector.Select(ctx, llmRequest)
@@ -61,6 +87,8 @@ func selectCandidates(inbound *PersistentInboundTransformer) pipeline.Middleware
 			log.Debug(ctx, "selected candidates",
 				log.Int("candidate_count", len(candidates)),
 				log.String("model", llmRequest.Model),
+				log.String("load_balance_strategy", inbound.state.RoutingPolicy.LoadBalancerStrategy),
+				log.String("trace_sticky_mode", string(inbound.state.RoutingPolicy.TraceStickyMode)),
 				log.Any("candidates", lo.Map(candidates, func(candidate *ChannelModelsCandidate, _ int) map[string]any {
 					return map[string]any{
 						"channel_name": candidate.Channel.Name,
@@ -79,6 +107,9 @@ func selectCandidates(inbound *PersistentInboundTransformer) pipeline.Middleware
 		}
 
 		if len(candidates) == 0 {
+			if gate.DroppedCount() > 0 {
+				return nil, NewQuotaExhaustedError(llmRequest.Model)
+			}
 			return nil, fmt.Errorf("%w: %s", biz.ErrInvalidModel, llmRequest.Model)
 		}
 

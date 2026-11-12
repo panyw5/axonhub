@@ -59,8 +59,8 @@ AxonHub provides partial support for the OpenAI Responses API. This API offers a
 **Endpoints:**
 - `POST /v1/responses` - Generate a response
 
-**Limitations:**
-- ❌ `previous_response_id` is **not supported** - conversation history must be managed client-side
+**Capabilities:**
+- ✅ `previous_response_id` passthrough is supported for continued Responses conversations on the same upstream channel
 - ✅ Basic response generation is fully functional
 - ✅ Streaming responses are supported
 
@@ -84,9 +84,10 @@ client := openai.NewClient(
 
 ctx := context.Background()
 
-// Generate a response (previous_response_id not supported)
+// Generate a response (previous_response_id passthrough on the same upstream channel)
 params := responses.ResponseNewParams{
     Model: shared.ResponsesModel("gpt-4o"),
+    PreviousResponseID: openai.String("resp_prev_123"),
     Input: responses.ResponseNewParamsInputUnion{
         OfString: openai.String("Hello, how are you?"),
     },
@@ -149,6 +150,141 @@ if err := stream.Err(); err != nil {
 fmt.Println("\nComplete response:", fullContent.String())
 ```
 
+### OpenAI Decisions API
+
+AxonHub supports the native OpenAI Decisions contract as a dedicated,
+non-streaming endpoint. The request is sent to `POST /v1/decisions` and keeps
+the Decisions JSON shape instead of converting it to Chat Completions,
+Responses, or SystemOne.
+
+**Endpoint:**
+
+- `POST /v1/decisions` - Evaluate shared input with typed questions
+
+**Channel endpoint configuration:**
+
+Add a custom endpoint with `api_format: openai/decisions` to a channel that
+should receive Decisions requests. The endpoint may inherit the channel
+`base_url`, or provide its own `base_url`. An optional `path` replaces the
+default path and must start with `/`, for example `/v1/decisions`. Decisions
+does not fall back to a Chat endpoint. A channel must have a compatible
+`openai/decisions` endpoint to receive this request type.
+
+```json
+{
+  "api_format": "openai/decisions",
+  "base_url": "https://decisions.example.test/api",
+  "path": "/v1/decisions"
+}
+```
+
+**Request contract:**
+
+The native request requires `model`, `input`, and a non-empty `questions`
+array. `input` may be a non-empty string or an array of supported message
+items. Text parts use `input_text`; image parts use `input_image`; a `message`
+item may contain text or nested content parts. Question and answer objects are
+kept as native JSON, including unknown fields and typed choice values.
+
+```json
+{
+  "model": "example-decisions-model",
+  "input": "A synthetic customer report says the package arrived intact.",
+  "questions": [
+    {
+      "type": "choice",
+      "name": "route",
+      "instructions": "Choose the best synthetic routing label.",
+      "choices": [
+        { "value": "review", "description": "Needs manual review." },
+        { "value": "complete", "description": "No follow-up is needed." }
+      ]
+    }
+  ]
+}
+```
+
+**Response and limits:**
+
+- A successful response is returned as native Decisions JSON with an
+  `answers` array. Answers may be typed results such as `choice`, `predicate`,
+  or `score`, and may include a `refusal` answer.
+- Decisions is non-streaming in phase one. Set `stream` to `false` or omit it.
+  A request with `"stream": true` is rejected locally with an invalid request
+  error. SSE clients and streaming SDK helpers are not supported for this
+  endpoint.
+- If the response contains `usage`, only `usage.input_tokens` is mapped to
+  AxonHub prompt usage. Output, total, cache, and reasoning token fields are
+  not mapped by this contract. A missing or null usage object remains absent.
+- Prompt protection applies the configured prompt-protection rules for a
+  request: a matching rule may mask the matched text or reject the request.
+  Masking has a primary path and a conditional raw-replay path:
+  - Primary path: a string `input`, and the `text` of `input[].content[]` parts
+    whose `type` is `input_text`.
+  - Conditional raw-replay path: only when body pass-through is enabled and
+    applied, matched mask rules from the primary path are available, and the
+    extra fields themselves match those rules and their scopes, masking also
+    applies to standalone `input[].text` and string `message.content`. With
+    pass-through disabled, only the primary string `input` and nested
+    `input_text` fields are masked. On their own, the extra forms produce no
+    primary match and are returned unchanged.
+  Inline image values and unrelated provider fields are preserved, while trace
+  data does not expose inline image bytes.
+- The native Decisions request and response are not converted to SystemOne.
+  SystemOne endpoint configuration is a separate protocol boundary and is not
+  a fallback or compatibility path for `/v1/decisions`.
+
+**Synthetic response example:**
+
+```json
+{
+  "model": "example-decisions-model",
+  "answers": [
+    { "type": "choice", "name": "route", "choice": "complete" },
+    { "type": "refusal", "name": "safety_check", "refusal": "not evaluated" }
+  ],
+  "usage": { "input_tokens": 12, "output_tokens": 99 }
+}
+```
+
+**Synthetic error example:**
+
+```json
+{
+  "error": {
+    "message": "decision rate limit",
+    "type": "rate_limit_error",
+    "code": "rate_limit",
+    "x_beta": null
+  }
+}
+```
+
+**Synthetic conditional prompt-protection example:**
+
+A rule masking `secret-*` matches the nested `input_text` part, so the primary
+path masks it. If body pass-through is enabled and applied, that matched mask
+rule is available for raw replay, and the standalone `input[].text` also matches
+the rule and its scope, the conditional raw-replay path masks it too:
+
+```json
+{
+  "input": [
+    {
+      "type": "message",
+      "role": "user",
+      "content": [{ "type": "input_text", "text": "secret-nested" }]
+    },
+    { "type": "input_text", "text": "secret-standalone" }
+  ]
+}
+```
+
+Under these conditions, both instances of `secret-*` are masked. With
+pass-through disabled, only the nested `input_text` field is masked. With only the standalone
+`input[].text` present, no primary field matches, so the request is returned
+unchanged.
+
 ## API Translation Capabilities
 
 AxonHub automatically translates between API formats, enabling powerful scenarios:
@@ -184,6 +320,58 @@ responseText := completion.Choices[0].Message.Content
 fmt.Println(responseText)
 // AxonHub automatically translates OpenAI format → Gemini format
 ```
+
+## Moderations API
+
+AxonHub supports OpenAI-compatible content moderation through a standalone endpoint.
+
+**Endpoints:**
+- `POST /v1/moderations` - Classify text and/or image inputs with models such as `omni-moderation-latest`
+
+**Request parameters:**
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `input` | string \| string[] \| multimodal object[] | ✅ | Content to classify. Multimodal items use `{ "type": "text", "text": "..." }` or `{ "type": "image_url", "image_url": { "url": "..." } }`. |
+| `model` | string | ❌ | Moderation model. If omitted, AxonHub defaults to `omni-moderation-latest`. The model must be available on a channel that exposes the `openai/moderations` endpoint. |
+
+**Standalone request example:**
+
+```json
+{
+  "model": "omni-moderation-latest",
+  "input": "...text to classify goes here..."
+}
+```
+
+Multimodal input (text + image) is also supported:
+
+```json
+{
+  "model": "omni-moderation-latest",
+  "input": [
+    { "type": "text", "text": "...text to classify goes here..." },
+    {
+      "type": "image_url",
+      "image_url": { "url": "https://example.com/image.png" }
+    }
+  ]
+}
+```
+
+**Notes:**
+- Chat Completions / Responses do not model the optional inline `moderation` request field. Use this standalone endpoint instead.
+- OpenAI and several OpenAI-compatible channel types include `openai/moderations` in their default endpoint set. Channels that do not support upstream `/moderations` may return provider errors; remove or override the endpoint if needed.
+- When body pass-through is enabled and inbound/outbound formats match, model mapping still patches the top-level `model` field for moderations requests.
+
+## Codex Alpha Search API
+
+AxonHub can proxy the Codex/CPA-compatible alpha search endpoint without interpreting the provider-specific search payload.
+
+**Endpoint:**
+- `POST /v1/alpha/search`
+
+The request must include a `model` so AxonHub can select a channel. The remaining JSON, including `commands.search_query`, is forwarded unchanged apart from the mapped top-level `model`. The upstream response is returned unchanged. This endpoint is not part of the public OpenAI API; configure an `openai/alpha_search` channel endpoint only for an upstream that implements `/alpha/search` (for example CPA). The built-in Codex channel includes it by default; all other channels, including Fenno, OpenAI, and OpenAI Responses, must opt in explicitly.
 
 ## Embedding API
 
@@ -331,6 +519,7 @@ AxonHub provides an enhanced `/v1/models` endpoint that lists available models w
 | `description` | string | Model description |
 | `context_length` | integer | Maximum context length in tokens |
 | `max_output_tokens` | integer | Maximum output tokens |
+| `modalities` | object | Model supported input/output types (input, output) |
 | `capabilities` | object | Model capabilities (vision, tool_call, reasoning) |
 | `pricing` | object | Pricing information (input, output, cache_read, cache_write) |
 | `icon` | string | Model icon URL |
@@ -377,6 +566,10 @@ When using `?include=all` or selective fields, the response includes extended me
       "description": "GPT-4 model with advanced reasoning capabilities",
       "context_length": 8192,
       "max_output_tokens": 4096,
+      "modalities": {
+        "input": ["text", "image"],
+        "output": ["text"]
+      },
       "capabilities": {
         "vision": false,
         "tool_call": true,
@@ -402,6 +595,9 @@ When using `?include=all` or selective fields, the response includes extended me
 - `description` - Detailed model description
 - `context_length` - Maximum tokens in context window
 - `max_output_tokens` - Maximum tokens in response
+- `modalities` - Model supported input/output modality types:
+  - `input` - Array of supported input types (e.g. `text`, `image`, `audio`, `video`, `pdf`)
+  - `output` - Array of supported output types (e.g. `text`)
 - `capabilities` - Object with boolean flags:
   - `vision` - Supports image inputs
   - `tool_call` - Supports function calling

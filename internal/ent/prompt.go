@@ -10,6 +10,7 @@ import (
 
 	"entgo.io/ent"
 	"entgo.io/ent/dialect/sql"
+	"github.com/looplj/axonhub/internal/ent/project"
 	"github.com/looplj/axonhub/internal/ent/prompt"
 	"github.com/looplj/axonhub/internal/objects"
 )
@@ -37,6 +38,8 @@ type Prompt struct {
 	Content string `json:"content,omitempty"`
 	// Status holds the value of the "status" field.
 	Status prompt.Status `json:"status,omitempty"`
+	// prompt insertion order, smaller values are inserted first
+	Order int `json:"order,omitempty"`
 	// prompt settings in JSON format
 	Settings objects.PromptSettings `json:"settings,omitempty"`
 	// Edges holds the relations/edges for other nodes in the graph.
@@ -47,24 +50,24 @@ type Prompt struct {
 
 // PromptEdges holds the relations/edges for other nodes in the graph.
 type PromptEdges struct {
-	// Projects holds the value of the projects edge.
-	Projects []*Project `json:"projects,omitempty"`
+	// Project holds the value of the project edge.
+	Project *Project `json:"project,omitempty"`
 	// loadedTypes holds the information for reporting if a
 	// type was loaded (or requested) in eager-loading or not.
 	loadedTypes [1]bool
 	// totalCount holds the count of the edges above.
 	totalCount [1]map[string]int
-
-	namedProjects map[string][]*Project
 }
 
-// ProjectsOrErr returns the Projects value or an error if the edge
-// was not loaded in eager-loading.
-func (e PromptEdges) ProjectsOrErr() ([]*Project, error) {
-	if e.loadedTypes[0] {
-		return e.Projects, nil
+// ProjectOrErr returns the Project value or an error if the edge
+// was not loaded in eager-loading, or loaded but was not found.
+func (e PromptEdges) ProjectOrErr() (*Project, error) {
+	if e.Project != nil {
+		return e.Project, nil
+	} else if e.loadedTypes[0] {
+		return nil, &NotFoundError{label: project.Label}
 	}
-	return nil, &NotLoadedError{edge: "projects"}
+	return nil, &NotLoadedError{edge: "project"}
 }
 
 // scanValues returns the types for scanning values from sql.Rows.
@@ -74,7 +77,7 @@ func (*Prompt) scanValues(columns []string) ([]any, error) {
 		switch columns[i] {
 		case prompt.FieldSettings:
 			values[i] = new([]byte)
-		case prompt.FieldID, prompt.FieldDeletedAt, prompt.FieldProjectID:
+		case prompt.FieldID, prompt.FieldDeletedAt, prompt.FieldProjectID, prompt.FieldOrder:
 			values[i] = new(sql.NullInt64)
 		case prompt.FieldName, prompt.FieldDescription, prompt.FieldRole, prompt.FieldContent, prompt.FieldStatus:
 			values[i] = new(sql.NullString)
@@ -155,6 +158,12 @@ func (_m *Prompt) assignValues(columns []string, values []any) error {
 			} else if value.Valid {
 				_m.Status = prompt.Status(value.String)
 			}
+		case prompt.FieldOrder:
+			if value, ok := values[i].(*sql.NullInt64); !ok {
+				return fmt.Errorf("unexpected type %T for field order", values[i])
+			} else if value.Valid {
+				_m.Order = int(value.Int64)
+			}
 		case prompt.FieldSettings:
 			if value, ok := values[i].(*[]byte); !ok {
 				return fmt.Errorf("unexpected type %T for field settings", values[i])
@@ -176,9 +185,9 @@ func (_m *Prompt) Value(name string) (ent.Value, error) {
 	return _m.selectValues.Get(name)
 }
 
-// QueryProjects queries the "projects" edge of the Prompt entity.
-func (_m *Prompt) QueryProjects() *ProjectQuery {
-	return NewPromptClient(_m.config).QueryProjects(_m)
+// QueryProject queries the "project" edge of the Prompt entity.
+func (_m *Prompt) QueryProject() *ProjectQuery {
+	return NewPromptClient(_m.config).QueryProject(_m)
 }
 
 // Update returns a builder for updating this Prompt.
@@ -231,34 +240,13 @@ func (_m *Prompt) String() string {
 	builder.WriteString("status=")
 	builder.WriteString(fmt.Sprintf("%v", _m.Status))
 	builder.WriteString(", ")
+	builder.WriteString("order=")
+	builder.WriteString(fmt.Sprintf("%v", _m.Order))
+	builder.WriteString(", ")
 	builder.WriteString("settings=")
 	builder.WriteString(fmt.Sprintf("%v", _m.Settings))
 	builder.WriteByte(')')
 	return builder.String()
-}
-
-// NamedProjects returns the Projects named value or an error if the edge was not
-// loaded in eager-loading with this name.
-func (_m *Prompt) NamedProjects(name string) ([]*Project, error) {
-	if _m.Edges.namedProjects == nil {
-		return nil, &NotLoadedError{edge: name}
-	}
-	nodes, ok := _m.Edges.namedProjects[name]
-	if !ok {
-		return nil, &NotLoadedError{edge: name}
-	}
-	return nodes, nil
-}
-
-func (_m *Prompt) appendNamedProjects(name string, edges ...*Project) {
-	if _m.Edges.namedProjects == nil {
-		_m.Edges.namedProjects = make(map[string][]*Project)
-	}
-	if len(edges) == 0 {
-		_m.Edges.namedProjects[name] = []*Project{}
-	} else {
-		_m.Edges.namedProjects[name] = append(_m.Edges.namedProjects[name], edges...)
-	}
 }
 
 // Prompts is a parsable slice of Prompt.

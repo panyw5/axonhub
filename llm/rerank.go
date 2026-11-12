@@ -1,6 +1,7 @@
 package llm
 
 // RerankRequest represents a rerank request.
+// Note: Common fields like Model are in the parent Request struct, not here.
 type RerankRequest struct {
 	// Query is the search query to compare documents against.
 	Query string `json:"query" binding:"required"`
@@ -16,15 +17,13 @@ type RerankRequest struct {
 }
 
 // RerankResponse represents the response from a rerank request.
+// Note: Common fields like Usage are in the parent Response struct, not here.
 type RerankResponse struct {
 	// Object is the object type, typically "list".
 	Object string `json:"object"`
 
 	// Results contains the reranked documents with relevance scores.
 	Results []RerankResult `json:"results"`
-
-	// Usage contains token usage information if available.
-	Usage *RerankUsage `json:"usage,omitempty"`
 }
 
 // RerankResult represents a single reranked document result.
@@ -41,10 +40,4 @@ type RerankResult struct {
 
 type RerankDocument struct {
 	Text string `json:"text"`
-}
-
-// RerankUsage represents token usage for rerank requests.
-type RerankUsage struct {
-	PromptTokens int `json:"prompt_tokens"`
-	TotalTokens  int `json:"total_tokens"`
 }

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"maps"
+	"net/http"
 	"strings"
 
 	"github.com/samber/lo"
@@ -162,7 +163,7 @@ func ValidateOverrideParameters(params string) error {
 	}
 
 	for _, op := range ops {
-		if op.Op == objects.OverrideOpSet && strings.EqualFold(op.Path, "stream") {
+		if (op.Op == objects.OverrideOpSet || op.Op == objects.OverrideOpSetIfAbsent) && strings.EqualFold(op.Path, "stream") {
 			return fmt.Errorf("override parameters cannot contain the field \"stream\"")
 		}
 	}
@@ -171,15 +172,22 @@ func ValidateOverrideParameters(params string) error {
 }
 
 // ValidateBodyOverrideOperations validates body override operations.
-// - set/delete: require non-empty Path
+// - set/set_if_absent/delete/array_*: require non-empty Path
+// - set_if_absent: requires a non-empty Value
 // - rename/copy: require non-empty From and To
-// - set: cannot set the "stream" field.
+// - array_insert: requires Index
+// - array_remove: requires Match.Path and Match.Eq
+// - set/set_if_absent/array_*: cannot target the "stream" field.
 func ValidateBodyOverrideOperations(ops []objects.OverrideOperation) error {
 	for i, op := range ops {
 		switch op.Op {
-		case objects.OverrideOpSet:
+		case objects.OverrideOpSet, objects.OverrideOpSetIfAbsent:
 			if strings.TrimSpace(op.Path) == "" {
-				return fmt.Errorf("body operation at index %d (set) has an empty path", i)
+				return fmt.Errorf("body operation at index %d (%s) has an empty path", i, op.Op)
+			}
+
+			if op.Op == objects.OverrideOpSetIfAbsent && strings.TrimSpace(op.Value) == "" {
+				return fmt.Errorf("body operation at index %d (set_if_absent) has an empty value", i)
 			}
 
 			if strings.EqualFold(op.Path, "stream") {
@@ -192,6 +200,32 @@ func ValidateBodyOverrideOperations(ops []objects.OverrideOperation) error {
 		case objects.OverrideOpRename, objects.OverrideOpCopy:
 			if strings.TrimSpace(op.From) == "" || strings.TrimSpace(op.To) == "" {
 				return fmt.Errorf("body operation at index %d (%s) requires non-empty from and to", i, op.Op)
+			}
+		case objects.OverrideOpArrayAppend, objects.OverrideOpArrayPrepend, objects.OverrideOpArrayInsert, objects.OverrideOpArrayRemove:
+			if strings.TrimSpace(op.Path) == "" {
+				return fmt.Errorf("body operation at index %d (%s) has an empty path", i, op.Op)
+			}
+
+			if strings.EqualFold(op.Path, "stream") {
+				return fmt.Errorf("override parameters cannot contain the field \"stream\"")
+			}
+
+			if op.Op == objects.OverrideOpArrayInsert && op.Index == nil {
+				return fmt.Errorf("body operation at index %d (array_insert) requires an index", i)
+			}
+
+			if op.Op == objects.OverrideOpArrayRemove {
+				if op.Match == nil {
+					return fmt.Errorf("body operation at index %d (array_remove) requires a match", i)
+				}
+
+				if strings.TrimSpace(op.Match.Path) == "" {
+					return fmt.Errorf("body operation at index %d (array_remove) requires a match path", i)
+				}
+
+				if strings.TrimSpace(op.Match.Eq) == "" {
+					return fmt.Errorf("body operation at index %d (array_remove) requires a match eq value", i)
+				}
 			}
 		default:
 			return fmt.Errorf("body operation at index %d has unknown op %q", i, op.Op)
@@ -219,6 +253,10 @@ func ValidateOverrideHeaders(ops []objects.OverrideOperation) error {
 			if strings.TrimSpace(op.From) == "" || strings.TrimSpace(op.To) == "" {
 				return fmt.Errorf("header operation at index %d (%s) requires non-empty from and to", i, op.Op)
 			}
+		case objects.OverrideOpSetIfAbsent:
+			return fmt.Errorf("header operation at index %d (%s) is not supported on headers; it only applies to the body", i, op.Op)
+		case objects.OverrideOpArrayAppend, objects.OverrideOpArrayPrepend, objects.OverrideOpArrayInsert, objects.OverrideOpArrayRemove:
+			return fmt.Errorf("header operation at index %d (%s) is not supported on headers; array ops only apply to the body", i, op.Op)
 		default:
 			return fmt.Errorf("header operation at index %d has unknown op %q", i, op.Op)
 		}
@@ -270,4 +308,58 @@ func deepMergeMap(base, override map[string]any) map[string]any {
 	}
 
 	return result
+}
+
+// ApplyModelFetchHeaderOverrides applies the channel's header override operations to an
+// HTTP request used for model-list probing.
+//
+// Model probing runs outside the LLM request pipeline, so there is no RenderContext to
+// evaluate against: operations guarded by a Condition and set-values containing a template
+// placeholder ("{{") are skipped. Unconditional literal operations use the same semantics as
+// the chat/completion path (applyOverrideOperationToHeaders in
+// internal/server/orchestrator/override.go): set, delete, rename, copy. The legacy
+// "__AXONHUB_CLEAR__" value deletes the header.
+func ApplyModelFetchHeaderOverrides(headers http.Header, ops []objects.OverrideOperation) {
+	if headers == nil || len(ops) == 0 {
+		return
+	}
+
+	for _, op := range ops {
+		if op.Condition != "" {
+			continue
+		}
+
+		switch op.Op {
+		case objects.OverrideOpSet:
+			if strings.Contains(op.Value, "{{") {
+				// A templated value cannot be rendered without an LLM request context;
+				// sending the raw template would corrupt the probe request.
+				continue
+			}
+
+			if op.Value == ClearHeaderDirective {
+				headers.Del(op.Path)
+				continue
+			}
+
+			headers.Set(op.Path, op.Value)
+		case objects.OverrideOpDelete:
+			headers.Del(op.Path)
+		case objects.OverrideOpRename:
+			values := headers.Values(op.From)
+			if len(values) == 0 {
+				continue
+			}
+
+			headers.Del(op.From)
+
+			for _, v := range values {
+				headers.Add(op.To, v)
+			}
+		case objects.OverrideOpCopy:
+			for _, v := range headers.Values(op.From) {
+				headers.Add(op.To, v)
+			}
+		}
+	}
 }

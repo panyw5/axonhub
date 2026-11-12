@@ -230,6 +230,16 @@ func UserIDNotIn(vs ...int) predicate.APIKey {
 	return predicate.APIKey(sql.FieldNotIn(FieldUserID, vs...))
 }
 
+// UserIDIsNil applies the IsNil predicate on the "user_id" field.
+func UserIDIsNil() predicate.APIKey {
+	return predicate.APIKey(sql.FieldIsNull(FieldUserID))
+}
+
+// UserIDNotNil applies the NotNil predicate on the "user_id" field.
+func UserIDNotNil() predicate.APIKey {
+	return predicate.APIKey(sql.FieldNotNull(FieldUserID))
+}
+
 // ProjectIDEQ applies the EQ predicate on the "project_id" field.
 func ProjectIDEQ(v int) predicate.APIKey {
 	return predicate.APIKey(sql.FieldEQ(FieldProjectID, v))
@@ -438,6 +448,16 @@ func ProfilesIsNil() predicate.APIKey {
 // ProfilesNotNil applies the NotNil predicate on the "profiles" field.
 func ProfilesNotNil() predicate.APIKey {
 	return predicate.APIKey(sql.FieldNotNull(FieldProfiles))
+}
+
+// AllowedIpsIsNil applies the IsNil predicate on the "allowed_ips" field.
+func AllowedIpsIsNil() predicate.APIKey {
+	return predicate.APIKey(sql.FieldIsNull(FieldAllowedIps))
+}
+
+// AllowedIpsNotNil applies the NotNil predicate on the "allowed_ips" field.
+func AllowedIpsNotNil() predicate.APIKey {
+	return predicate.APIKey(sql.FieldNotNull(FieldAllowedIps))
 }
 
 // HasUser applies the HasEdge predicate on the "user" edge.

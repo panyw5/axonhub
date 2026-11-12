@@ -74,6 +74,14 @@ func (_c *APIKeyCreate) SetUserID(v int) *APIKeyCreate {
 	return _c
 }
 
+// SetNillableUserID sets the "user_id" field if the given value is not nil.
+func (_c *APIKeyCreate) SetNillableUserID(v *int) *APIKeyCreate {
+	if v != nil {
+		_c.SetUserID(*v)
+	}
+	return _c
+}
+
 // SetProjectID sets the "project_id" field.
 func (_c *APIKeyCreate) SetProjectID(v int) *APIKeyCreate {
 	_c.mutation.SetProjectID(v)
@@ -137,6 +145,12 @@ func (_c *APIKeyCreate) SetScopes(v []string) *APIKeyCreate {
 // SetProfiles sets the "profiles" field.
 func (_c *APIKeyCreate) SetProfiles(v *objects.APIKeyProfiles) *APIKeyCreate {
 	_c.mutation.SetProfiles(v)
+	return _c
+}
+
+// SetAllowedIps sets the "allowed_ips" field.
+func (_c *APIKeyCreate) SetAllowedIps(v []string) *APIKeyCreate {
+	_c.mutation.SetAllowedIps(v)
 	return _c
 }
 
@@ -240,22 +254,17 @@ func (_c *APIKeyCreate) defaults() error {
 		v := apikey.DefaultProfiles
 		_c.mutation.SetProfiles(v)
 	}
+	if _, ok := _c.mutation.AllowedIps(); !ok {
+		v := apikey.DefaultAllowedIps
+		_c.mutation.SetAllowedIps(v)
+	}
 	return nil
 }
 
 // check runs all checks and user-defined validators on the builder.
 func (_c *APIKeyCreate) check() error {
-	if _, ok := _c.mutation.CreatedAt(); !ok {
-		return &ValidationError{Name: "created_at", err: errors.New(`ent: missing required field "APIKey.created_at"`)}
-	}
-	if _, ok := _c.mutation.UpdatedAt(); !ok {
-		return &ValidationError{Name: "updated_at", err: errors.New(`ent: missing required field "APIKey.updated_at"`)}
-	}
 	if _, ok := _c.mutation.DeletedAt(); !ok {
 		return &ValidationError{Name: "deleted_at", err: errors.New(`ent: missing required field "APIKey.deleted_at"`)}
-	}
-	if _, ok := _c.mutation.UserID(); !ok {
-		return &ValidationError{Name: "user_id", err: errors.New(`ent: missing required field "APIKey.user_id"`)}
 	}
 	if _, ok := _c.mutation.ProjectID(); !ok {
 		return &ValidationError{Name: "project_id", err: errors.New(`ent: missing required field "APIKey.project_id"`)}
@@ -281,9 +290,6 @@ func (_c *APIKeyCreate) check() error {
 		if err := apikey.StatusValidator(v); err != nil {
 			return &ValidationError{Name: "status", err: fmt.Errorf(`ent: validator failed for field "APIKey.status": %w`, err)}
 		}
-	}
-	if len(_c.mutation.UserIDs()) == 0 {
-		return &ValidationError{Name: "user", err: errors.New(`ent: missing required edge "APIKey.user"`)}
 	}
 	if len(_c.mutation.ProjectIDs()) == 0 {
 		return &ValidationError{Name: "project", err: errors.New(`ent: missing required edge "APIKey.project"`)}
@@ -350,6 +356,10 @@ func (_c *APIKeyCreate) createSpec() (*APIKey, *sqlgraph.CreateSpec) {
 	if value, ok := _c.mutation.Profiles(); ok {
 		_spec.SetField(apikey.FieldProfiles, field.TypeJSON, value)
 		_node.Profiles = value
+	}
+	if value, ok := _c.mutation.AllowedIps(); ok {
+		_spec.SetField(apikey.FieldAllowedIps, field.TypeJSON, value)
+		_node.AllowedIps = value
 	}
 	if nodes := _c.mutation.UserIDs(); len(nodes) > 0 {
 		edge := &sqlgraph.EdgeSpec{
@@ -483,6 +493,18 @@ func (u *APIKeyUpsert) AddDeletedAt(v int) *APIKeyUpsert {
 	return u
 }
 
+// SetKey sets the "key" field.
+func (u *APIKeyUpsert) SetKey(v string) *APIKeyUpsert {
+	u.Set(apikey.FieldKey, v)
+	return u
+}
+
+// UpdateKey sets the "key" field to the value that was provided on create.
+func (u *APIKeyUpsert) UpdateKey() *APIKeyUpsert {
+	u.SetExcluded(apikey.FieldKey)
+	return u
+}
+
 // SetName sets the "name" field.
 func (u *APIKeyUpsert) SetName(v string) *APIKeyUpsert {
 	u.Set(apikey.FieldName, v)
@@ -555,6 +577,24 @@ func (u *APIKeyUpsert) ClearProfiles() *APIKeyUpsert {
 	return u
 }
 
+// SetAllowedIps sets the "allowed_ips" field.
+func (u *APIKeyUpsert) SetAllowedIps(v []string) *APIKeyUpsert {
+	u.Set(apikey.FieldAllowedIps, v)
+	return u
+}
+
+// UpdateAllowedIps sets the "allowed_ips" field to the value that was provided on create.
+func (u *APIKeyUpsert) UpdateAllowedIps() *APIKeyUpsert {
+	u.SetExcluded(apikey.FieldAllowedIps)
+	return u
+}
+
+// ClearAllowedIps clears the value of the "allowed_ips" field.
+func (u *APIKeyUpsert) ClearAllowedIps() *APIKeyUpsert {
+	u.SetNull(apikey.FieldAllowedIps)
+	return u
+}
+
 // UpdateNewValues updates the mutable fields using the new values that were set on create.
 // Using this option is equivalent to using:
 //
@@ -574,9 +614,6 @@ func (u *APIKeyUpsertOne) UpdateNewValues() *APIKeyUpsertOne {
 		}
 		if _, exists := u.create.mutation.ProjectID(); exists {
 			s.SetIgnore(apikey.FieldProjectID)
-		}
-		if _, exists := u.create.mutation.Key(); exists {
-			s.SetIgnore(apikey.FieldKey)
 		}
 	}))
 	return u
@@ -641,6 +678,20 @@ func (u *APIKeyUpsertOne) AddDeletedAt(v int) *APIKeyUpsertOne {
 func (u *APIKeyUpsertOne) UpdateDeletedAt() *APIKeyUpsertOne {
 	return u.Update(func(s *APIKeyUpsert) {
 		s.UpdateDeletedAt()
+	})
+}
+
+// SetKey sets the "key" field.
+func (u *APIKeyUpsertOne) SetKey(v string) *APIKeyUpsertOne {
+	return u.Update(func(s *APIKeyUpsert) {
+		s.SetKey(v)
+	})
+}
+
+// UpdateKey sets the "key" field to the value that was provided on create.
+func (u *APIKeyUpsertOne) UpdateKey() *APIKeyUpsertOne {
+	return u.Update(func(s *APIKeyUpsert) {
+		s.UpdateKey()
 	})
 }
 
@@ -725,6 +776,27 @@ func (u *APIKeyUpsertOne) UpdateProfiles() *APIKeyUpsertOne {
 func (u *APIKeyUpsertOne) ClearProfiles() *APIKeyUpsertOne {
 	return u.Update(func(s *APIKeyUpsert) {
 		s.ClearProfiles()
+	})
+}
+
+// SetAllowedIps sets the "allowed_ips" field.
+func (u *APIKeyUpsertOne) SetAllowedIps(v []string) *APIKeyUpsertOne {
+	return u.Update(func(s *APIKeyUpsert) {
+		s.SetAllowedIps(v)
+	})
+}
+
+// UpdateAllowedIps sets the "allowed_ips" field to the value that was provided on create.
+func (u *APIKeyUpsertOne) UpdateAllowedIps() *APIKeyUpsertOne {
+	return u.Update(func(s *APIKeyUpsert) {
+		s.UpdateAllowedIps()
+	})
+}
+
+// ClearAllowedIps clears the value of the "allowed_ips" field.
+func (u *APIKeyUpsertOne) ClearAllowedIps() *APIKeyUpsertOne {
+	return u.Update(func(s *APIKeyUpsert) {
+		s.ClearAllowedIps()
 	})
 }
 
@@ -913,9 +985,6 @@ func (u *APIKeyUpsertBulk) UpdateNewValues() *APIKeyUpsertBulk {
 			if _, exists := b.mutation.ProjectID(); exists {
 				s.SetIgnore(apikey.FieldProjectID)
 			}
-			if _, exists := b.mutation.Key(); exists {
-				s.SetIgnore(apikey.FieldKey)
-			}
 		}
 	}))
 	return u
@@ -980,6 +1049,20 @@ func (u *APIKeyUpsertBulk) AddDeletedAt(v int) *APIKeyUpsertBulk {
 func (u *APIKeyUpsertBulk) UpdateDeletedAt() *APIKeyUpsertBulk {
 	return u.Update(func(s *APIKeyUpsert) {
 		s.UpdateDeletedAt()
+	})
+}
+
+// SetKey sets the "key" field.
+func (u *APIKeyUpsertBulk) SetKey(v string) *APIKeyUpsertBulk {
+	return u.Update(func(s *APIKeyUpsert) {
+		s.SetKey(v)
+	})
+}
+
+// UpdateKey sets the "key" field to the value that was provided on create.
+func (u *APIKeyUpsertBulk) UpdateKey() *APIKeyUpsertBulk {
+	return u.Update(func(s *APIKeyUpsert) {
+		s.UpdateKey()
 	})
 }
 
@@ -1064,6 +1147,27 @@ func (u *APIKeyUpsertBulk) UpdateProfiles() *APIKeyUpsertBulk {
 func (u *APIKeyUpsertBulk) ClearProfiles() *APIKeyUpsertBulk {
 	return u.Update(func(s *APIKeyUpsert) {
 		s.ClearProfiles()
+	})
+}
+
+// SetAllowedIps sets the "allowed_ips" field.
+func (u *APIKeyUpsertBulk) SetAllowedIps(v []string) *APIKeyUpsertBulk {
+	return u.Update(func(s *APIKeyUpsert) {
+		s.SetAllowedIps(v)
+	})
+}
+
+// UpdateAllowedIps sets the "allowed_ips" field to the value that was provided on create.
+func (u *APIKeyUpsertBulk) UpdateAllowedIps() *APIKeyUpsertBulk {
+	return u.Update(func(s *APIKeyUpsert) {
+		s.UpdateAllowedIps()
+	})
+}
+
+// ClearAllowedIps clears the value of the "allowed_ips" field.
+func (u *APIKeyUpsertBulk) ClearAllowedIps() *APIKeyUpsertBulk {
+	return u.Update(func(s *APIKeyUpsert) {
+		s.ClearAllowedIps()
 	})
 }
 

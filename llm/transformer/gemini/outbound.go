@@ -32,6 +32,11 @@ type Config struct {
 	// APIKeyProvider provides API keys for authentication.
 	APIKeyProvider auth.APIKeyProvider `json:"-"`
 
+	// EndpointPath is an optional custom path override for this endpoint.
+	// When set, it replaces the default API path.
+	// Must start with "/". Skips default version normalization when set.
+	EndpointPath string `json:"endpoint_path,omitempty"`
+
 	// APIVersion is the API version to use.
 	APIVersion string `json:"api_version,omitempty"`
 
@@ -101,12 +106,21 @@ func (t *OutboundTransformer) TransformRequest(ctx context.Context, llmReq *llm.
 		return nil, fmt.Errorf("request is nil")
 	}
 
+	var apiKey string
+	if t.config.APIKeyProvider != nil {
+		apiKey = t.config.APIKeyProvider.Get(ctx)
+	}
+
 	//nolint:exhaustive // Checked.
 	switch llmReq.RequestType {
+	case llm.RequestTypeEmbedding:
+		return t.transformEmbeddingRequest(ctx, llmReq)
 	case llm.RequestTypeImage:
 		return t.buildImageGenerationRequest(ctx, llmReq)
 	case llm.RequestTypeChat, "":
 		// continue
+	case llm.RequestTypeCompact:
+		return nil, fmt.Errorf("%w: compact is only supported by OpenAI Responses API", transformer.ErrInvalidRequest)
 	default:
 		return nil, fmt.Errorf("%w: %s is not supported", transformer.ErrInvalidRequest, llmReq.RequestType)
 	}
@@ -119,8 +133,22 @@ func (t *OutboundTransformer) TransformRequest(ctx context.Context, llmReq *llm.
 		return nil, fmt.Errorf("%w: messages are required,%v", transformer.ErrInvalidRequest, llmReq.Messages)
 	}
 
-	// Convert to Gemini request format
-	geminiReq := convertLLMToGeminiRequest(llmReq)
+	// Convert to Gemini request format with config
+	geminiReq := convertLLMToGeminiRequestWithConfig(llmReq, &t.config)
+
+	// System and developer messages become systemInstruction, so a request made
+	// up only of them leaves contents empty. Gemini requires at least one
+	// content entry; fail here with an error that names the cause instead of
+	// forwarding an empty contents array that upstream rejects without
+	// mentioning the developer role.
+	if len(geminiReq.Contents) == 0 {
+		return nil, fmt.Errorf("%w: contents must contain at least one user or model turn; system and developer messages are converted to systemInstruction", transformer.ErrInvalidRequest)
+	}
+
+	// Clear function call/response IDs for Vertex AI (not supported)
+	if t.config.PlatformType == PlatformVertex {
+		clearFunctionIDsForVertexAI(geminiReq)
+	}
 
 	body, err := json.Marshal(geminiReq)
 	if err != nil {
@@ -135,14 +163,11 @@ func (t *OutboundTransformer) TransformRequest(ctx context.Context, llmReq *llm.
 	// Prepare authentication
 	var authConfig *httpclient.AuthConfig
 
-	if t.config.APIKeyProvider != nil {
-		apiKey := t.config.APIKeyProvider.Get(ctx)
-		if apiKey != "" {
-			authConfig = &httpclient.AuthConfig{
-				Type:      "api_key",
-				APIKey:    apiKey,
-				HeaderKey: "x-goog-api-key",
-			}
+	if apiKey != "" {
+		authConfig = &httpclient.AuthConfig{
+			Type:      "api_key",
+			APIKey:    apiKey,
+			HeaderKey: "x-goog-api-key",
 		}
 	}
 
@@ -160,12 +185,18 @@ func (t *OutboundTransformer) TransformRequest(ctx context.Context, llmReq *llm.
 		Headers:               headers,
 		Body:                  body,
 		Auth:                  authConfig,
+		APIFormat:             string(llm.APIFormatGeminiContents),
 		SkipInboundQueryMerge: true,
+		Metadata:              nil,
 	}, nil
 }
 
 // buildFullRequestURL constructs the appropriate URL for the Gemini API.
 func (t *OutboundTransformer) buildFullRequestURL(llmReq *llm.Request) string {
+	if t.config.EndpointPath != "" {
+		return strings.TrimSuffix(t.config.BaseURL, "/") + t.config.EndpointPath
+	}
+
 	// Determine endpoint based on streaming
 	var action string
 	if llmReq.Stream != nil && *llmReq.Stream {
@@ -207,6 +238,11 @@ func (t *OutboundTransformer) buildFullRequestURL(llmReq *llm.Request) string {
 func (t *OutboundTransformer) TransformResponse(ctx context.Context, httpResp *httpclient.Response) (*llm.Response, error) {
 	if httpResp == nil {
 		return nil, fmt.Errorf("http response is nil")
+	}
+
+	// Check if this is an embedding request
+	if httpResp.Request != nil && httpResp.Request.APIFormat == string(llm.APIFormatGeminiEmbedding) {
+		return t.transformEmbeddingResponse(ctx, httpResp)
 	}
 
 	// Check if this is an image generation request
@@ -274,4 +310,21 @@ func (t *OutboundTransformer) SetAPIKey(apiKey string) {
 // SetBaseURL updates the base URL.
 func (t *OutboundTransformer) SetBaseURL(baseURL string) {
 	t.config.BaseURL = baseURL
+}
+
+// clearFunctionIDsForVertexAI clears the ID field from all FunctionCall and FunctionResponse
+// parts in the request. Vertex AI does not support the ID field in function_call or
+// function_response objects.
+func clearFunctionIDsForVertexAI(req *GenerateContentRequest) {
+	for _, content := range req.Contents {
+		for _, part := range content.Parts {
+			if part.FunctionCall != nil {
+				part.FunctionCall.ID = ""
+			}
+
+			if part.FunctionResponse != nil {
+				part.FunctionResponse.ID = ""
+			}
+		}
+	}
 }

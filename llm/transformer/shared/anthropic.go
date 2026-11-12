@@ -1,13 +1,28 @@
 package shared
 
-// IsAnthropicRedactedContent checks if the content should be treated as Anthropic redacted content.
-// It explicitly excludes signatures from other providers (like Gemini or OpenAI) to prevent
-// conflicts during the transformation process. This isolation ensures that model-specific
-// private protocols do not interfere with each other when converting to the Anthropic format.
-func IsAnthropicRedactedContent(content *string) bool {
-	if content == nil {
-		return false
+// EncodeAnthropicSignature encodes a raw Anthropic signature for storage in ReasoningSignature.
+// Anthropic signatures are typically raw bytes, so we base64-encode them if needed.
+func EncodeAnthropicSignature(signature *string) *string {
+	if signature == nil {
+		return nil
 	}
 
-	return !IsGeminiThoughtSignature(content) && !IsOpenAIEncryptedContent(content)
+	encoded := EnsureBase64Encoding(*signature)
+	return &encoded
+}
+
+// DecodeAnthropicSignature checks whether a signature blob is safe to use as an Anthropic thinking signature.
+// Returns the raw value only if the blob is recognized as Anthropic.
+// Returns nil for signatures from other providers (OpenAI/Gemini) or unknown formats.
+func DecodeAnthropicSignature(signature *string) *string {
+	if signature == nil {
+		return nil
+	}
+
+	result := GuessSignatureProvider(*signature)
+	if result.Provider != ProviderAnthropic {
+		return nil
+	}
+
+	return signature
 }

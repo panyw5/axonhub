@@ -4,11 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 
 	"github.com/kaptinlin/jsonrepair"
 	"github.com/samber/lo"
 
-	"github.com/looplj/axonhub/internal/log"
 	"github.com/looplj/axonhub/llm"
 	"github.com/looplj/axonhub/llm/httpclient"
 )
@@ -38,19 +38,24 @@ func AggregateStreamChunks(ctx context.Context, chunks []*httpclient.StreamEvent
 
 		switch event.Type {
 		case "message_start":
-			messageStart = &event
-			if event.Message != nil && event.Message.Usage != nil {
-				usage = event.Message.Usage
+			if event.Message != nil {
+				messageStart = &event
+				if event.Message.Usage != nil {
+					usage = event.Message.Usage
+				}
 			}
 		case "content_block_start":
 			if event.ContentBlock != nil {
 				block := *event.ContentBlock
-				// For tool_use blocks, initialize Input as nil to be built from deltas
-				if block.Type == "tool_use" {
+				// For tool-use-like blocks, reset Input to nil so it is built
+				// from subsequent input_json_delta events.
+				if isAnthropicToolUseLike(block.Type) {
 					block.Input = nil
 				}
 				// redacted_thinking blocks come complete in content_block_start
-				// with their Data field already populated
+				// with their Data field already populated.
+				// *_tool_result blocks also arrive complete (content + caller);
+				// we preserve them as-is.
 
 				contentBlocks = append(contentBlocks, block)
 			}
@@ -70,6 +75,12 @@ func AggregateStreamChunks(ctx context.Context, chunks []*httpclient.StreamEvent
 							}
 
 							*contentBlocks[index].Text += *event.Delta.Text
+						}
+					}
+
+					if event.Delta.Citation != nil {
+						if contentBlocks[index].Type == "text" {
+							contentBlocks[index].Citations = append(contentBlocks[index].Citations, *event.Delta.Citation)
 						}
 					}
 
@@ -105,14 +116,14 @@ func AggregateStreamChunks(ctx context.Context, chunks []*httpclient.StreamEvent
 					}
 
 					if event.Delta.PartialJSON != nil {
-						switch contentBlocks[index].Type {
-						case "tool_use":
+						switch {
+						case isAnthropicToolUseLike(contentBlocks[index].Type):
 							if contentBlocks[index].Input == nil {
 								contentBlocks[index].Input = []byte(*event.Delta.PartialJSON)
 							} else {
 								contentBlocks[index].Input = append(contentBlocks[index].Input, []byte(*event.Delta.PartialJSON)...)
 							}
-						case "text":
+						case contentBlocks[index].Type == "text":
 							if contentBlocks[index].Text == nil {
 								contentBlocks[index].Text = lo.ToPtr("")
 							}
@@ -159,9 +170,9 @@ func AggregateStreamChunks(ctx context.Context, chunks []*httpclient.StreamEvent
 				index := int(*event.Index)
 
 				block := contentBlocks[index]
-				if block.Type == "tool_use" {
+				if isAnthropicToolUseLike(block.Type) {
 					if !json.Valid(block.Input) {
-						log.Warn(ctx, "invalid tool use input", log.String("input", string(block.Input)))
+						slog.WarnContext(ctx, "invalid tool use input", slog.String("input", string(block.Input)))
 
 						repaired, err := jsonrepair.JSONRepair(string(block.Input))
 						if err == nil {
@@ -223,12 +234,14 @@ func AggregateStreamChunks(ctx context.Context, chunks []*httpclient.StreamEvent
 	// Convert and return usage if available
 	if usage != nil {
 		return data, llm.ResponseMeta{
-			ID:    message.ID,
-			Usage: convertToLlmUsage(usage, platformType),
+			ID:        message.ID,
+			Usage:     convertToLlmUsage(usage, platformType),
+			Completed: messageStart != nil && stopReason != nil && *stopReason != "",
 		}, nil
 	}
 
 	return data, llm.ResponseMeta{
-		ID: message.ID,
+		ID:        message.ID,
+		Completed: messageStart != nil && stopReason != nil && *stopReason != "",
 	}, nil
 }

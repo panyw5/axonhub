@@ -6,8 +6,9 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/looplj/axonhub/internal/pkg/xtest"
 	"github.com/looplj/axonhub/llm"
+	"github.com/looplj/axonhub/llm/auth"
+	"github.com/looplj/axonhub/llm/internal/pkg/xtest"
 	"github.com/looplj/axonhub/llm/streams"
 )
 
@@ -34,7 +35,13 @@ import (
 // Regression test for: Missing delta field in finish_reason events causes
 // OpenAI client compatibility issues.
 func TestOutboundTransformer_FinishReason_AlwaysIncludesDelta(t *testing.T) {
-	transformer, err := NewOutboundTransformer("https://api.anthropic.com", string(PlatformDirect))
+	baseURL := "https://api.anthropic.com"
+	apiKey := string(PlatformDirect)
+	transformer, err := NewOutboundTransformerWithConfig(&Config{
+		Type:           PlatformDirect,
+		BaseURL:        baseURL,
+		APIKeyProvider: auth.NewStaticKeyProvider(apiKey),
+	})
 	require.NoError(t, err)
 
 	// Load actual Anthropic stream test data
@@ -42,7 +49,8 @@ func TestOutboundTransformer_FinishReason_AlwaysIncludesDelta(t *testing.T) {
 	require.NoError(t, err)
 
 	mockStream := streams.SliceStream(streamEvents)
-	transformedStream, err := transformer.TransformStream(t.Context(), mockStream)
+	ctx := t.Context()
+	transformedStream, err := transformer.TransformStream(ctx, nil, mockStream)
 	require.NoError(t, err)
 
 	var responses []*llm.Response
@@ -91,14 +99,21 @@ func TestOutboundTransformer_AllStreamingChunks_HaveDelta(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			transformer, err := NewOutboundTransformer("https://api.anthropic.com", string(PlatformDirect))
+			baseURL := "https://api.anthropic.com"
+			apiKey := string(PlatformDirect)
+			transformer, err := NewOutboundTransformerWithConfig(&Config{
+				Type:           PlatformDirect,
+				BaseURL:        baseURL,
+				APIKeyProvider: auth.NewStaticKeyProvider(apiKey),
+			})
 			require.NoError(t, err)
 
 			streamEvents, err := xtest.LoadStreamChunks(t, tc.streamFile)
 			require.NoError(t, err)
 
 			mockStream := streams.SliceStream(streamEvents)
-			transformedStream, err := transformer.TransformStream(t.Context(), mockStream)
+			ctx := t.Context()
+			transformedStream, err := transformer.TransformStream(ctx, nil, mockStream)
 			require.NoError(t, err)
 
 			var responses []*llm.Response

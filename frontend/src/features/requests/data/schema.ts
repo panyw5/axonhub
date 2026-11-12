@@ -2,7 +2,7 @@ import { z } from 'zod';
 import { pageInfoSchema } from '@/gql/pagination';
 import { apiKeySchema } from '@/features/apikeys/data/schema';
 import { channelSchema } from '@/features/channels/data';
-import { usageLogSchema } from '@/features/usage-logs/data/schema';
+import { usageLogSchema } from './usage-logs-schema';
 
 // Request Status
 export const requestStatusSchema = z.enum(['pending', 'processing', 'completed', 'failed', 'canceled']);
@@ -25,16 +25,28 @@ export const requestExecutionSchema = z.object({
   // requestID: z.string(),
   // channelID: z.number(),
   channel: channelSchema.partial().nullable().optional(),
+  // 1-based position of the API key used within the channel's credential list.
+  // Null for single-key/OAuth channels and for executions recorded before the
+  // field existed.
+  channelAPIKeyIndex: z.number().nullable().optional(),
   modelID: z.string(),
+  upstreamModelID: z.string().nullable().optional(),
   requestHeaders: z.any().nullable().optional(),
+  responseHeaders: z.any().nullable().optional(),
   requestBody: z.any(), // JSONRawMessage
   responseBody: z.any().nullable(), // JSONRawMessage
   responseChunks: z.array(z.any()).nullable(), // [JSONRawMessage!]
   errorMessage: z.string().nullable(),
+  responseStatusCode: z.number().nullable().optional(),
   status: requestExecutionStatusSchema,
   format: z.string().optional(),
+  reasoningEffort: z.string().nullable().optional(),
+  channelAPIKeySuffix: z.string().nullable().optional(),
   metricsLatencyMs: z.number().nullable().optional(),
   metricsFirstTokenLatencyMs: z.number().nullable().optional(),
+  metricsReasoningDurationMs: z.number().nullable().optional(),
+  requestURL: z.string().nullable().optional(),
+  passThroughApplied: z.boolean().optional(),
 });
 export type RequestExecution = z.infer<typeof requestExecutionSchema>;
 
@@ -49,16 +61,22 @@ export const requestSchema = z.object({
   channel: channelSchema.partial().nullable().optional(),
   source: requestSourceSchema,
   modelID: z.string(),
+  reasoningEffort: z.string().nullable().optional(),
+  contentSaved: z.boolean().optional(),
+  contentStorageKey: z.string().nullable().optional(),
   requestHeaders: z.any().nullable().optional(),
+  responseHeaders: z.any().nullable().optional(),
   requestBody: z.any().nullable().optional(), // JSONRawMessage
   responseBody: z.any().nullable().optional(), // JSONRawMessage
   responseChunks: z.array(z.any()).nullable().optional(), // [JSONRawMessage!]
   status: requestStatusSchema,
   format: z.string().optional(),
   clientIP: z.string().nullable().optional(),
+  userAgent: z.string().nullable().optional(),
   stream: z.boolean().nullable(),
   metricsLatencyMs: z.number().nullable().optional(),
   metricsFirstTokenLatencyMs: z.number().nullable().optional(),
+  metricsReasoningDurationMs: z.number().nullable().optional(),
   executions: z
     .object({
       edges: z.array(
@@ -67,8 +85,9 @@ export const requestSchema = z.object({
           cursor: z.string(),
         })
       ),
-      pageInfo: pageInfoSchema,
-      totalCount: z.number(),
+      // The request list only needs execution summary rows; nested pagination metadata is not requested.
+      pageInfo: pageInfoSchema.optional(),
+      totalCount: z.number().optional(),
     })
     .optional(),
   usageLogs: z
@@ -98,7 +117,7 @@ export const requestConnectionSchema = z.object({
     })
   ),
   pageInfo: pageInfoSchema,
-  totalCount: z.number(),
+  totalCount: z.number().optional(),
 });
 export type RequestConnection = z.infer<typeof requestConnectionSchema>;
 

@@ -1,29 +1,47 @@
+import { useEffect } from 'react';
 import { z } from 'zod';
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { keepPreviousData, useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { graphqlRequest } from '@/gql/graphql';
 import { pageInfoSchema } from '@/gql/pagination';
 import { useTranslation } from 'react-i18next';
 import { toast } from 'sonner';
+import { useSelectedProjectId } from '@/stores/projectStore';
 import { useErrorHandler } from '@/hooks/use-error-handler';
+import { mergeChannelSettingsForUpdate } from '../utils/merge';
+import { shouldNotifyChannelQueryError } from './channel-query-error';
 import {
   Channel,
   ChannelConnection,
+  ChannelSummaryConnection,
   CreateChannelInput,
   UpdateChannelInput,
   channelConnectionSchema,
   channelSchema,
+  channelEndpointsResponseSchema,
   BulkImportChannelsInput,
   BulkImportChannelsResult,
   bulkImportChannelsResultSchema,
   BulkUpdateChannelOrderingInput,
   BulkUpdateChannelOrderingResult,
   bulkUpdateChannelOrderingResultSchema,
-  channelOrderingConnectionSchema,
+  BulkUpdateChannelAutoDisableInput,
+  BulkUpdateChannelAutoDisablePayload,
+  bulkUpdateChannelAutoDisablePayloadSchema,
+  ChannelAutoDisableCopySource,
+  channelAutoDisableCopySourceSchema,
+  channelSummaryConnectionSchema,
   ChannelSettings,
+  ProxyConfig,
   ChannelPolicies,
   ChannelModelPrice,
   SaveChannelModelPriceInput,
   channelModelPriceSchema,
+  TestChannelAPIKeysPayload,
+  testChannelAPIKeysPayloadSchema,
+  TestAPIKeyResult,
+  testAPIKeyResultSchema,
+  DetectedChannelEndpoint,
+  detectedChannelEndpointSchema,
 } from './schema';
 
 const QUERY_CHANNEL_NAMES_QUERY = `
@@ -65,40 +83,179 @@ const CREATE_CHANNEL_MUTATION = `
       type
       createdAt
       updatedAt
-      type
       baseURL
       name
       status
       policies {
         stream
+        apiKeyAutoDisableMode
+        apiKeyAutoDisableRules {
+          statusCodes
+          keywordPatterns
+          times
+          action
+          disableDurationMinutes
+          disableUntilCron
+          disableUntilTimezone
+        }
       }
       supportedModels
       autoSyncSupportedModels
+      autoSyncModelPattern
+      manualModels
       tags
       defaultTestModel
-        settings {
-          extraModelPrefix
-          modelMappings {
-            from
-            to
+      settings {
+        extraModelPrefix
+        modelMappings {
+          from
+          to
+        }
+        autoTrimedModelPrefixes
+        hideOriginalModels
+        hideMappedModels
+        lowercaseModelId
+        quotaRoutingMode
+        proxy {
+          type
+          url
+          username
+          password
+          disableConnectionReuse
+        }
+        transformOptions {
+          forceArrayInstructions
+          forceArrayInputs
+          replaceDeveloperRoleWithSystem
+          reasoningEffortMapping { from to }
+        }
+        passThroughUserAgent
+        passThroughBody
+        retryableStatusCodes
+        retryableErrorPatterns {
+          pattern
+          regex
+        }
+        modelProtocols {
+          model
+          apiFormats
+          enabled
+        }
+        providerQuota {
+          commandCode {
+            authCookie
           }
-          autoTrimedModelPrefixes
-          hideOriginalModels
-          hideMappedModels
-          proxy {
-            type
-            url
-            username
-            password
-          }
-          transformOptions {
-            forceArrayInstructions
-            forceArrayInputs
-            replaceDeveloperRoleWithSystem
+          ollama {
+            authCookie
           }
         }
+      }
       orderingWeight
       remark
+      defaultEndpoints {
+        apiFormat
+        path
+        baseURL
+        transport
+      }
+      endpoints {
+        apiFormat
+        path
+        baseURL
+        transport
+      }
+    }
+  }
+`;
+
+const DUPLICATE_CHANNEL_MUTATION = `
+  mutation DuplicateChannel($sourceID: ID!, $input: CreateChannelInput!) {
+    duplicateChannel(sourceID: $sourceID, input: $input) {
+      id
+      type
+      createdAt
+      updatedAt
+      baseURL
+      name
+      status
+      policies {
+        stream
+        apiKeyAutoDisableMode
+        apiKeyAutoDisableRules {
+          statusCodes
+          keywordPatterns
+          times
+          action
+          disableDurationMinutes
+          disableUntilCron
+          disableUntilTimezone
+        }
+      }
+      supportedModels
+      autoSyncSupportedModels
+      autoSyncModelPattern
+      manualModels
+      tags
+      defaultTestModel
+      settings {
+        extraModelPrefix
+        modelMappings {
+          from
+          to
+        }
+        autoTrimedModelPrefixes
+        hideOriginalModels
+        hideMappedModels
+        lowercaseModelId
+        quotaRoutingMode
+        proxy {
+          type
+          url
+          username
+          password
+          disableConnectionReuse
+        }
+        transformOptions {
+          forceArrayInstructions
+          forceArrayInputs
+          replaceDeveloperRoleWithSystem
+          reasoningEffortMapping { from to }
+        }
+        passThroughUserAgent
+        passThroughBody
+        retryableStatusCodes
+        retryableErrorPatterns {
+          pattern
+          regex
+        }
+        modelProtocols {
+          model
+          apiFormats
+          enabled
+        }
+        providerQuota {
+          commandCode {
+            authCookie
+          }
+          ollama {
+            authCookie
+          }
+        }
+      }
+      orderingWeight
+      remark
+      defaultEndpoints {
+        apiFormat
+        path
+        baseURL
+        transport
+      }
+      endpoints {
+        apiFormat
+        path
+        baseURL
+        transport
+      }
     }
   }
 `;
@@ -115,34 +272,82 @@ const BULK_CREATE_CHANNELS_MUTATION = `
       status
       policies {
         stream
+        apiKeyAutoDisableMode
+        apiKeyAutoDisableRules {
+          statusCodes
+          keywordPatterns
+          times
+          action
+          disableDurationMinutes
+          disableUntilCron
+          disableUntilTimezone
+        }
       }
       supportedModels
       autoSyncSupportedModels
+      autoSyncModelPattern
+      manualModels
       tags
       defaultTestModel
-        settings {
-          extraModelPrefix
-          modelMappings {
-            from
-            to
+      settings {
+        extraModelPrefix
+        modelMappings {
+          from
+          to
+        }
+        autoTrimedModelPrefixes
+        hideOriginalModels
+        hideMappedModels
+        lowercaseModelId
+        quotaRoutingMode
+        proxy {
+          type
+          url
+          username
+          password
+          disableConnectionReuse
+        }
+        transformOptions {
+          forceArrayInstructions
+          forceArrayInputs
+          replaceDeveloperRoleWithSystem
+          reasoningEffortMapping { from to }
+        }
+        passThroughUserAgent
+        passThroughBody
+        retryableStatusCodes
+        retryableErrorPatterns {
+          pattern
+          regex
+        }
+        modelProtocols {
+          model
+          apiFormats
+          enabled
+        }
+        providerQuota {
+          commandCode {
+            authCookie
           }
-          autoTrimedModelPrefixes
-          hideOriginalModels
-          hideMappedModels
-          proxy {
-            type
-            url
-            username
-            password
-          }
-          transformOptions {
-            forceArrayInstructions
-            forceArrayInputs
-            replaceDeveloperRoleWithSystem
+          ollama {
+            authCookie
           }
         }
+      }
       orderingWeight
       remark
+      defaultEndpoints {
+        apiFormat
+        path
+        baseURL
+        transport
+      }
+      endpoints {
+        apiFormat
+        path
+        baseURL
+        transport
+      }
     }
   }
 `;
@@ -159,35 +364,83 @@ const UPDATE_CHANNEL_MUTATION = `
       status
       policies {
         stream
+        apiKeyAutoDisableMode
+        apiKeyAutoDisableRules {
+          statusCodes
+          keywordPatterns
+          times
+          action
+          disableDurationMinutes
+          disableUntilCron
+          disableUntilTimezone
+        }
       }
       supportedModels
       autoSyncSupportedModels
+      autoSyncModelPattern
+      manualModels
       tags
       defaultTestModel
-        settings {
-          extraModelPrefix
-          modelMappings {
-            from
-            to
+      settings {
+        extraModelPrefix
+        modelMappings {
+          from
+          to
+        }
+        autoTrimedModelPrefixes
+        hideOriginalModels
+        hideMappedModels
+        lowercaseModelId
+        quotaRoutingMode
+        proxy {
+          type
+          url
+          username
+          password
+          disableConnectionReuse
+        }
+        transformOptions {
+          forceArrayInstructions
+          forceArrayInputs
+          replaceDeveloperRoleWithSystem
+          reasoningEffortMapping { from to }
+        }
+        passThroughUserAgent
+        passThroughBody
+        retryableStatusCodes
+        retryableErrorPatterns {
+          pattern
+          regex
+        }
+        modelProtocols {
+          model
+          apiFormats
+          enabled
+        }
+        providerQuota {
+          commandCode {
+            authCookie
           }
-          autoTrimedModelPrefixes
-          hideOriginalModels
-          hideMappedModels
-          proxy {
-            type
-            url
-            username
-            password
-          }
-          transformOptions {
-            forceArrayInstructions
-            forceArrayInputs
-            replaceDeveloperRoleWithSystem
+          ollama {
+            authCookie
           }
         }
+      }
       orderingWeight
       errorMessage
       remark
+      defaultEndpoints {
+        apiFormat
+        path
+        baseURL
+        transport
+      }
+      endpoints {
+        apiFormat
+        path
+        baseURL
+        transport
+      }
     }
   }
 `;
@@ -219,6 +472,12 @@ const BULK_ENABLE_CHANNELS_MUTATION = `
   }
 `;
 
+const BULK_RECOVER_CHANNELS_MUTATION = `
+  mutation BulkRecoverChannels($ids: [ID!]!) {
+    bulkRecoverChannels(ids: $ids)
+  }
+`;
+
 const DELETE_CHANNEL_MUTATION = `
   mutation DeleteChannel($id: ID!) {
     deleteChannel(id: $id)
@@ -231,6 +490,34 @@ const BULK_DELETE_CHANNELS_MUTATION = `
   }
 `;
 
+const BULK_MANAGE_CHANNEL_TAGS_MUTATION = `
+  mutation BulkManageChannelTags($ids: [ID!]!, $addTags: [String!]!, $removeTags: [String!]!) {
+    bulkManageChannelTags(ids: $ids, addTags: $addTags, removeTags: $removeTags)
+  }
+`;
+
+const SAVE_CHANNEL_ENDPOINTS_MUTATION = `
+  mutation SaveChannelEndpoints($input: SaveChannelEndpointsInput!) {
+    saveChannelEndpoints(input: $input) {
+      id
+      type
+      name
+      defaultEndpoints {
+        apiFormat
+        path
+        baseURL
+        transport
+      }
+      endpoints {
+        apiFormat
+        path
+        baseURL
+        transport
+      }
+    }
+  }
+`;
+
 const TEST_CHANNEL_MUTATION = `
   mutation TestChannel($input: TestChannelInput!) {
     testChannel(input: $input) {
@@ -238,6 +525,49 @@ const TEST_CHANNEL_MUTATION = `
       success
       error
       message
+    }
+  }
+`;
+
+const DETECT_CHANNEL_ENDPOINTS_MUTATION = `
+  mutation DetectChannelEndpoints($input: DetectChannelEndpointsInput!) {
+    detectChannelEndpoints(input: $input) {
+      endpoints {
+        apiFormat
+        supported
+        statusCode
+        reason
+      }
+    }
+  }
+`;
+
+const TEST_CHANNEL_API_KEYS_MUTATION = `
+  mutation TestChannelAPIKeys($channelID: ID!, $modelID: String) {
+    testChannelAPIKeys(channelID: $channelID, modelID: $modelID) {
+      channelID
+      total
+      successCount
+      failedCount
+      results {
+        keyPrefix
+        success
+        latency
+        error
+        disabled
+      }
+    }
+  }
+`;
+
+const TEST_CHANNEL_API_KEY_MUTATION = `
+  mutation TestChannelAPIKey($channelID: ID!, $key: String!, $modelID: String) {
+    testChannelAPIKey(channelID: $channelID, key: $key, modelID: $modelID) {
+      keyPrefix
+      success
+      latency
+      error
+      disabled
     }
   }
 `;
@@ -257,10 +587,24 @@ const BULK_IMPORT_CHANNELS_MUTATION = `
         baseURL
         name
         status
-        supportedModels
+          supportedModels
         autoSyncSupportedModels
+        autoSyncModelPattern
+        manualModels
         tags
         defaultTestModel
+        defaultEndpoints {
+          apiFormat
+          path
+          baseURL
+          transport
+        }
+        endpoints {
+          apiFormat
+          path
+          baseURL
+          transport
+        }
         settings {
           extraModelPrefix
           modelMappings {
@@ -270,10 +614,33 @@ const BULK_IMPORT_CHANNELS_MUTATION = `
           autoTrimedModelPrefixes
           hideOriginalModels
           hideMappedModels
+          lowercaseModelId
+          quotaRoutingMode
           transformOptions {
             forceArrayInstructions
             forceArrayInputs
             replaceDeveloperRoleWithSystem
+            reasoningEffortMapping { from to }
+          }
+          passThroughUserAgent
+          passThroughBody
+          retryableStatusCodes
+          retryableErrorPatterns {
+            pattern
+            regex
+          }
+          modelProtocols {
+            model
+            apiFormats
+            enabled
+          }
+          providerQuota {
+            commandCode {
+              authCookie
+            }
+            ollama {
+              authCookie
+            }
           }
         }
       }
@@ -282,6 +649,12 @@ const BULK_IMPORT_CHANNELS_MUTATION = `
 `;
 
 // Channel API Key Management Mutations
+const DISABLE_CHANNEL_API_KEY_MUTATION = `
+  mutation DisableChannelAPIKey($channelID: ID!, $key: String!) {
+    disableChannelAPIKey(channelID: $channelID, key: $key)
+  }
+`;
+
 const ENABLE_CHANNEL_API_KEY_MUTATION = `
   mutation EnableChannelAPIKey($channelID: ID!, $key: String!) {
     enableChannelAPIKey(channelID: $channelID, key: $key)
@@ -319,6 +692,7 @@ const GET_CHANNEL_DISABLED_API_KEYS_QUERY = `
           disabledAt
           errorCode
           reason
+          expiresAt
         }
       }
     }
@@ -357,6 +731,38 @@ const GET_CHANNEL_MODEL_PRICES_QUERY = `
                   tiers {
                     upTo
                     pricePerUnit
+                  }
+                }
+              }
+            }
+          }
+          schedule {
+            timezone
+            overrides {
+              name
+              priority
+              when {
+                dailyTime {
+                  start
+                  end
+                }
+                weekdays
+                dateRange {
+                  start
+                  end
+                }
+              }
+              items {
+                itemCode
+                pricing {
+                  mode
+                  flatFee
+                  usagePerUnit
+                  usageTiered {
+                    tiers {
+                      upTo
+                      pricePerUnit
+                    }
                   }
                 }
               }
@@ -423,8 +829,21 @@ const BULK_UPDATE_CHANNEL_ORDERING_MUTATION = `
         status
         supportedModels
         autoSyncSupportedModels
+        manualModels
         defaultTestModel
         orderingWeight
+        defaultEndpoints {
+          apiFormat
+          path
+          baseURL
+          transport
+        }
+        endpoints {
+          apiFormat
+          path
+          baseURL
+          transport
+        }
         settings {
           extraModelPrefix
           modelMappings {
@@ -434,10 +853,33 @@ const BULK_UPDATE_CHANNEL_ORDERING_MUTATION = `
           autoTrimedModelPrefixes
           hideOriginalModels
           hideMappedModels
+          lowercaseModelId
+          quotaRoutingMode
           transformOptions {
             forceArrayInstructions
             forceArrayInputs
             replaceDeveloperRoleWithSystem
+            reasoningEffortMapping { from to }
+          }
+          passThroughUserAgent
+          passThroughBody
+          retryableStatusCodes
+          retryableErrorPatterns {
+            pattern
+            regex
+          }
+          modelProtocols {
+            model
+            apiFormats
+            enabled
+          }
+          providerQuota {
+            commandCode {
+              authCookie
+            }
+            ollama {
+              authCookie
+            }
           }
         }
       }
@@ -445,32 +887,72 @@ const BULK_UPDATE_CHANNEL_ORDERING_MUTATION = `
   }
 `;
 
-const ALL_CHANNELS_QUERY = `
-  query GetAllChannels {
-    channels(
-      first: 1000,
-      orderBy: { field: ORDERING_WEIGHT, direction: DESC }
-      where: { statusIn: [enabled, disabled] }
-    ) {
-      totalCount
-      edges {
-        node {
-          id
-          name
-          type
-          status
-          policies {
-            stream
-          }
-          baseURL
-          orderingWeight
-          tags
-          supportedModels
-          autoSyncSupportedModels
-          allModelEntries {
-            requestModel
-            actualModel
-            source
+const ALL_CHANNEL_SUMMARYS_QUERY = `
+  query GetAllChannelSummarys($includeArchived: Boolean) {
+    allChannelSummarys(includeArchived: $includeArchived) {
+      id
+      name
+      type
+      status
+      baseURL
+      orderingWeight
+      tags
+      endpoints {
+        apiFormat
+        path
+        baseURL
+        transport
+      }
+      allModelEntries {
+        requestModel
+        actualModel
+        source
+      }
+    }
+  }
+`;
+
+const CHANNEL_AUTO_DISABLE_COPY_SOURCES_QUERY = `
+  query ChannelAutoDisableCopySources {
+    allChannelSummarys {
+      id
+      name
+      policies {
+        apiKeyAutoDisableMode
+        apiKeyAutoDisableRules {
+          statusCodes
+          keywordPatterns
+          times
+          action
+          disableDurationMinutes
+          disableUntilCron
+          disableUntilTimezone
+        }
+      }
+    }
+  }
+`;
+
+// Bulk auto-disable actions: write_rules, inherit, off
+const BULK_UPDATE_CHANNEL_AUTO_DISABLE_MUTATION = `
+  mutation BulkUpdateChannelAutoDisable($input: BulkUpdateChannelAutoDisableInput!) {
+    bulkUpdateChannelAutoDisable(input: $input) {
+      success
+      updated
+      channels {
+        id
+        name
+        policies {
+          stream
+          apiKeyAutoDisableMode
+          apiKeyAutoDisableRules {
+            statusCodes
+            keywordPatterns
+            times
+            action
+            disableDurationMinutes
+            disableUntilCron
+            disableUntilTimezone
           }
         }
       }
@@ -504,11 +986,49 @@ const ALL_CHANNEL_TAGS_QUERY = `
   }
 `;
 
-const QUERY_CHANNELS_QUERY = `
-  query QueryChannels($input: QueryChannelInput!) {
+const SELECTED_CHANNEL_TAGS_QUERY = `
+  query SelectedChannelTags($input: QueryChannelInput!) {
     queryChannels(input: $input) {
       edges {
         node {
+          id
+          tags
+        }
+      }
+    }
+  }
+`;
+
+const selectedChannelTagsResponseSchema = z.object({
+  queryChannels: z.object({
+    edges: z.array(
+      z.object({
+        node: z.object({
+          id: z.string(),
+          tags: z.array(z.string()).optional().nullable(),
+        }),
+      })
+    ),
+  }),
+});
+
+export type ChannelListColumnVisibility = Record<string, boolean>;
+
+export const DEFAULT_CHANNEL_COLUMN_VISIBILITY: ChannelListColumnVisibility = {
+  model: false,
+  tags: false,
+  proxy: false,
+  endpointProtocols: true,
+};
+
+const channelListColumnVisibilitySchema = z.record(z.string(), z.boolean());
+
+export function parseChannelColumnVisibility(value: unknown): ChannelListColumnVisibility {
+  const parsed = channelListColumnVisibilitySchema.safeParse(value);
+  return parsed.success ? { ...DEFAULT_CHANNEL_COLUMN_VISIBILITY, ...parsed.data, model: false } : DEFAULT_CHANNEL_COLUMN_VISIBILITY;
+}
+
+const CHANNEL_QUERY_FULL_NODE_SELECTION = `
           id
           createdAt
           updatedAt
@@ -518,6 +1038,16 @@ const QUERY_CHANNELS_QUERY = `
           status
           policies {
             stream
+            apiKeyAutoDisableMode
+            apiKeyAutoDisableRules {
+              statusCodes
+              keywordPatterns
+              times
+              action
+              disableDurationMinutes
+              disableUntilCron
+              disableUntilTimezone
+            }
           }
           credentials {
             apiKey
@@ -530,6 +1060,8 @@ const QUERY_CHANNELS_QUERY = `
           }
           supportedModels
           autoSyncSupportedModels
+          autoSyncModelPattern
+          manualModels
           tags
           defaultTestModel
           settings {
@@ -541,6 +1073,8 @@ const QUERY_CHANNELS_QUERY = `
             autoTrimedModelPrefixes
             hideOriginalModels
             hideMappedModels
+            lowercaseModelId
+            quotaRoutingMode
             bodyOverrideOperations {
               op
               path
@@ -548,6 +1082,12 @@ const QUERY_CHANNELS_QUERY = `
               to
               value
               condition
+              match {
+                path
+                eq
+              }
+              index
+              splat
             }
             headerOverrideOperations {
               op
@@ -556,28 +1096,208 @@ const QUERY_CHANNELS_QUERY = `
               to
               value
               condition
+              match {
+                path
+                eq
+              }
+              index
+              splat
             }
             proxy {
               type
               url
               username
               password
+              disableConnectionReuse
             }
             transformOptions {
               forceArrayInstructions
               forceArrayInputs
               replaceDeveloperRoleWithSystem
+              reasoningEffortMapping { from to }
+            }
+            passThroughUserAgent
+            passThroughBody
+            rateLimit {
+              rpm
+              tpm
+              maxConcurrent
+              queueSize
+              queueTimeoutMs
+            }
+            retryableStatusCodes
+            retryableErrorPatterns {
+              pattern
+              regex
+            }
+            modelProtocols {
+              model
+              apiFormats
+              enabled
+            }
+            providerQuota {
+              commandCode {
+                authCookie
+              }
+              ollama {
+                authCookie
+              }
             }
           }
           orderingWeight
           errorMessage
           remark
+          defaultEndpoints {
+            apiFormat
+            path
+            baseURL
+            transport
+          }
+          endpoints {
+            apiFormat
+            path
+            baseURL
+            transport
+          }
           disabledAPIKeys {
             key
             disabledAt
             errorCode
             reason
+            expiresAt
           }
+          liveLimiterStats {
+            inFlight
+            waiting
+            capacity
+            queueSize
+          }
+          providerQuotaStatus {
+            status
+            nextResetAt
+            ready
+            quotaData
+            providerType
+            accountKey
+          }
+`;
+
+const CHANNEL_QUERY_LIST_NODE_BASE_SELECTION = `
+           id
+          createdAt
+          updatedAt
+          type
+          baseURL
+          name
+          status
+          defaultTestModel
+          errorMessage
+          disabledAPIKeys {
+            key
+            disabledAt
+            errorCode
+            reason
+            expiresAt
+           }
+`;
+
+const CHANNEL_QUERY_ROUTING_STATUS_SELECTION = `
+           settings {
+             quotaRoutingMode
+           }
+           providerQuotaStatus {
+             status
+             ready
+             quotaData
+             providerType
+           }
+`;
+
+const CHANNEL_QUERY_SUPPORTED_MODELS_SELECTION = `
+          supportedModels
+`;
+
+const CHANNEL_QUERY_TAGS_SELECTION = `
+          tags
+`;
+
+const CHANNEL_QUERY_PROXY_SELECTION = `
+          settings {
+            quotaRoutingMode
+            proxy {
+              type
+              url
+              username
+              password
+              disableConnectionReuse
+            }
+          }
+`;
+
+const CHANNEL_QUERY_ORDERING_WEIGHT_SELECTION = `
+          orderingWeight
+`;
+
+const CHANNEL_QUERY_HEALTH_SELECTION = `
+          liveLimiterStats {
+            inFlight
+            waiting
+            capacity
+            queueSize
+          }
+`;
+
+const CHANNEL_QUERY_QUOTA_SELECTION = `
+          providerQuotaStatus {
+            status
+            nextResetAt
+            ready
+            quotaData
+            providerType
+            accountKey
+          }
+`;
+
+const CHANNEL_QUERY_ENDPOINTS_SELECTION = `
+          defaultEndpoints {
+            apiFormat
+            path
+            baseURL
+            transport
+          }
+          endpoints {
+            apiFormat
+            path
+            baseURL
+            transport
+          }
+`;
+
+function isChannelColumnVisible(columnVisibility: ChannelListColumnVisibility | undefined, columnID: string): boolean {
+  return columnVisibility?.[columnID] !== false;
+}
+
+export function buildQueryChannelsQuery(columnVisibility?: ChannelListColumnVisibility, options?: { full?: boolean }): string {
+  const nodeSelection = options?.full
+    ? CHANNEL_QUERY_FULL_NODE_SELECTION
+    : [
+        CHANNEL_QUERY_LIST_NODE_BASE_SELECTION,
+        CHANNEL_QUERY_ROUTING_STATUS_SELECTION,
+        isChannelColumnVisible(columnVisibility, 'supportedModels') ? CHANNEL_QUERY_SUPPORTED_MODELS_SELECTION : '',
+        isChannelColumnVisible(columnVisibility, 'tags') ? CHANNEL_QUERY_TAGS_SELECTION : '',
+        isChannelColumnVisible(columnVisibility, 'proxy') ? CHANNEL_QUERY_PROXY_SELECTION : '',
+        isChannelColumnVisible(columnVisibility, 'orderingWeight') ? CHANNEL_QUERY_ORDERING_WEIGHT_SELECTION : '',
+        isChannelColumnVisible(columnVisibility, 'health') ? CHANNEL_QUERY_HEALTH_SELECTION : '',
+        isChannelColumnVisible(columnVisibility, 'quota') ? CHANNEL_QUERY_QUOTA_SELECTION : '',
+        isChannelColumnVisible(columnVisibility, 'endpointProtocols') ? CHANNEL_QUERY_ENDPOINTS_SELECTION : '',
+      ].join('');
+
+  return `
+  query QueryChannels($input: QueryChannelInput!) {
+    queryChannels(input: $input) {
+      edges {
+        node {
+${nodeSelection}
         }
         cursor
       }
@@ -591,6 +1311,10 @@ const QUERY_CHANNELS_QUERY = `
     }
   }
 `;
+}
+
+// Retain a full-field document for callers that do not have column state yet.
+const QUERY_CHANNELS_QUERY = buildQueryChannelsQuery(undefined, { full: true });
 
 export function useChannelModelPrices(channelId: string) {
   const { handleError } = useErrorHandler();
@@ -606,7 +1330,7 @@ export function useChannelModelPrices(channelId: string) {
         const node = data.node as { channelModelPrices: ChannelModelPrice[] };
         return (node?.channelModelPrices || []).map((p) => channelModelPriceSchema.parse(p));
       } catch (error) {
-        handleError(error, t('channels.errors.fetchPrices'));
+        handleError(error, t('common.errors.internalServerError'));
         throw error;
       }
     },
@@ -617,21 +1341,24 @@ export function useChannelModelPrices(channelId: string) {
 export function useSaveChannelModelPrices() {
   const queryClient = useQueryClient();
   const { t } = useTranslation();
+  const { handleError } = useErrorHandler();
 
   return useMutation({
     mutationFn: async ({ channelId, input }: { channelId: string; input: SaveChannelModelPriceInput[] }) => {
-      const data = await graphqlRequest<{ saveChannelModelPrices: ChannelModelPrice[] }>(SAVE_CHANNEL_MODEL_PRICES_MUTATION, {
-        channelId,
-        input,
-      });
-      return data.saveChannelModelPrices.map((p) => channelModelPriceSchema.parse(p));
+      try {
+        const data = await graphqlRequest<{ saveChannelModelPrices: ChannelModelPrice[] }>(SAVE_CHANNEL_MODEL_PRICES_MUTATION, {
+          channelId,
+          input,
+        });
+        return data.saveChannelModelPrices.map((p) => channelModelPriceSchema.parse(p));
+      } catch (error) {
+        handleError(error, { context: 'Save Channel Model Prices' });
+        throw error;
+      }
     },
     onSuccess: (_, variables) => {
       queryClient.invalidateQueries({ queryKey: ['channelModelPrices', variables.channelId] });
       toast.success(t('channels.messages.savePricesSuccess'));
-    },
-    onError: (error) => {
-      toast.error(t('channels.messages.savePricesError', { error: error.message }));
     },
   });
 }
@@ -652,6 +1379,7 @@ export function useQueryChannels(
     };
     hasTag?: string;
     model?: string;
+    columnVisibility?: ChannelListColumnVisibility;
   },
   options?: {
     disableAutoFetch?: boolean;
@@ -659,11 +1387,16 @@ export function useQueryChannels(
 ) {
   const { handleError } = useErrorHandler();
   const { t } = useTranslation();
+  const { columnVisibility, ...queryInput } = variables ?? {};
+  const query = buildQueryChannelsQuery(columnVisibility);
+  const columnVisibilityKey = JSON.stringify(columnVisibility ?? {});
 
-  return useQuery({
+  const result = useQuery({
     enabled: !options?.disableAutoFetch,
     queryKey: [
       'channels',
+      query,
+      queryInput,
       variables?.where,
       variables?.orderBy?.field,
       variables?.orderBy?.direction,
@@ -673,16 +1406,36 @@ export function useQueryChannels(
       variables?.last,
       variables?.after,
       variables?.before,
+      columnVisibilityKey,
     ],
     queryFn: async () => {
-      try {
-        const data = await graphqlRequest<{ queryChannels: ChannelConnection }>(QUERY_CHANNELS_QUERY, { input: variables });
-        return channelConnectionSchema.parse(data?.queryChannels);
-      } catch (error) {
-        handleError(error, t('channels.errors.fetchList'));
-        throw error;
-      }
+      const data = await graphqlRequest<{ queryChannels: ChannelConnection }>(query, { input: queryInput });
+      return channelConnectionSchema.parse(data?.queryChannels);
     },
+    // Poll so the live limiter snapshot (in-flight / queue) stays roughly fresh.
+    // 5s is light traffic; pause when the tab is hidden.
+    refetchInterval: 5000,
+    refetchIntervalInBackground: false,
+    // Keep showing the previous data while a refetch is in-flight or fails,
+    // so the component never renders with data = undefined and crashes.
+    placeholderData: keepPreviousData,
+  });
+
+  useEffect(() => {
+    if (shouldNotifyChannelQueryError(result.error, result.data !== undefined, result.isPlaceholderData)) {
+      handleError(result.error, t('common.errors.internalServerError'));
+    }
+  }, [handleError, result.data, result.error, result.isPlaceholderData, t]);
+
+  return result;
+}
+
+export function useChannelDetails(channelID?: string, options?: { enabled?: boolean }) {
+  return useQuery({
+    queryKey: ['channel', channelID],
+    queryFn: () => fetchLatestChannel(channelID as string),
+    enabled: Boolean(channelID) && (options?.enabled ?? true),
+    staleTime: 0,
   });
 }
 
@@ -721,7 +1474,7 @@ export function useAllChannelNames(options?: { enabled?: boolean }) {
 
         return names;
       } catch (error) {
-        handleError(error, t('channels.errors.fetchNames'));
+        handleError(error, t('common.errors.internalServerError'));
         throw error;
       }
     },
@@ -733,6 +1486,7 @@ export function useAllChannelNames(options?: { enabled?: boolean }) {
 export function useCreateChannel() {
   const queryClient = useQueryClient();
   const { t } = useTranslation();
+  const { handleError } = useErrorHandler();
 
   return useMutation({
     mutationFn: async (input: CreateChannelInput) => {
@@ -744,7 +1498,27 @@ export function useCreateChannel() {
       toast.success(t('channels.messages.createSuccess'));
     },
     onError: (error) => {
-      toast.error(t('channels.messages.createError', { error: error.message }));
+      handleError(error, { context: t('channels.dialogs.create.title') });
+    },
+  });
+}
+
+export function useDuplicateChannel() {
+  const queryClient = useQueryClient();
+  const { t } = useTranslation();
+  const { handleError } = useErrorHandler();
+
+  return useMutation({
+    mutationFn: async ({ sourceID, input }: { sourceID: string; input: CreateChannelInput }) => {
+      const data = await graphqlRequest<{ duplicateChannel: Channel }>(DUPLICATE_CHANNEL_MUTATION, { sourceID, input });
+      return channelSchema.parse(data.duplicateChannel);
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['channels'] });
+      toast.success(t('common.success.duplicated'));
+    },
+    onError: (error) => {
+      handleError(error, { context: t('common.actions.duplicate') });
     },
   });
 }
@@ -767,30 +1541,72 @@ export interface BulkCreateChannelsInput {
 export function useBulkCreateChannels() {
   const queryClient = useQueryClient();
   const { t } = useTranslation();
+  const { handleError } = useErrorHandler();
 
   return useMutation({
     mutationFn: async (input: BulkCreateChannelsInput) => {
-      const data = await graphqlRequest<{ bulkCreateChannels: Channel[] }>(BULK_CREATE_CHANNELS_MUTATION, { input });
-      return data.bulkCreateChannels.map((ch) => channelSchema.parse(ch));
+      try {
+        const data = await graphqlRequest<{ bulkCreateChannels: Channel[] }>(BULK_CREATE_CHANNELS_MUTATION, { input });
+        return data.bulkCreateChannels.map((ch) => channelSchema.parse(ch));
+      } catch (error) {
+        handleError(error, { context: 'Batch Create Channels' });
+        throw error;
+      }
     },
     onSuccess: (channels) => {
       queryClient.invalidateQueries({ queryKey: ['channels'] });
       toast.success(t('channels.messages.batchCreateSuccess', { count: channels.length }));
     },
-    onError: (error) => {
-      toast.error(t('channels.messages.batchCreateError', { error: error.message }));
+  });
+}
+
+async function updateChannelRequest(id: string, input: UpdateChannelInput): Promise<Channel> {
+  const data = await graphqlRequest<{ updateChannel: Channel }>(UPDATE_CHANNEL_MUTATION, { id, input });
+  return channelSchema.parse(data.updateChannel);
+}
+
+async function fetchLatestChannel(channelID: string): Promise<Channel> {
+  const data = await graphqlRequest<{ queryChannels: ChannelConnection }>(QUERY_CHANNELS_QUERY, {
+    input: {
+      first: 1,
+      where: { id: channelID },
     },
+  });
+  const channels = channelConnectionSchema.parse(data.queryChannels);
+  const channel = channels.edges[0]?.node;
+  if (!channel) {
+    throw new Error(`Channel ${channelID} was not found`);
+  }
+  return channel;
+}
+
+const channelSettingsUpdateQueues = new Map<string, Promise<void>>();
+
+function enqueueChannelSettingsUpdate<T>(channelID: string, operation: () => Promise<T>): Promise<T> {
+  const previous = channelSettingsUpdateQueues.get(channelID) ?? Promise.resolve();
+  let release: () => void = () => {};
+  const completion = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  channelSettingsUpdateQueues.set(channelID, completion);
+
+  const queued = previous.then(operation);
+  return queued.finally(() => {
+    release();
+    if (channelSettingsUpdateQueues.get(channelID) === completion) {
+      channelSettingsUpdateQueues.delete(channelID);
+    }
   });
 }
 
 export function useUpdateChannel() {
   const queryClient = useQueryClient();
   const { t } = useTranslation();
+  const { handleError } = useErrorHandler();
 
   return useMutation({
     mutationFn: async ({ id, input }: { id: string; input: UpdateChannelInput }) => {
-      const data = await graphqlRequest<{ updateChannel: Channel }>(UPDATE_CHANNEL_MUTATION, { id, input });
-      return channelSchema.parse(data.updateChannel);
+      return updateChannelRequest(id, input);
     },
     onSuccess: (data) => {
       queryClient.invalidateQueries({ queryKey: ['channels'] });
@@ -798,7 +1614,98 @@ export function useUpdateChannel() {
       toast.success(t('channels.messages.updateSuccess'));
     },
     onError: (error) => {
-      toast.error(t('channels.messages.updateError', { error: error.message }));
+      handleError(error, { context: t('channels.dialogs.edit.title') });
+    },
+  });
+}
+
+export interface UpdateChannelSettingsMutationInput {
+  id: string;
+  patch: Partial<ChannelSettings>;
+  input?: Omit<UpdateChannelInput, 'settings'>;
+}
+
+/**
+ * Updates one settings patch against the latest server snapshot. Mutations for
+ * the same channel are serialized so a stale dialog cannot overwrite a patch
+ * that was committed immediately before it.
+ */
+export function useUpdateChannelSettings() {
+  const queryClient = useQueryClient();
+  const { t } = useTranslation();
+  const { handleError } = useErrorHandler();
+
+  return useMutation({
+    mutationFn: ({ id, patch, input }: UpdateChannelSettingsMutationInput) =>
+      enqueueChannelSettingsUpdate(id, async () => {
+        const latest = await fetchLatestChannel(id);
+        return updateChannelRequest(id, {
+          ...input,
+          settings: mergeChannelSettingsForUpdate(latest.settings, patch),
+        });
+      }),
+    onSuccess: (data) => {
+      queryClient.invalidateQueries({ queryKey: ['channels'] });
+      queryClient.invalidateQueries({ queryKey: ['channel', data.id] });
+      queryClient.invalidateQueries({ queryKey: ['provider-quotas'] });
+    },
+    onError: (error) => {
+      handleError(error, { context: t('channels.dialogs.edit.title') });
+    },
+  });
+}
+
+export interface SaveChannelEndpointsInput {
+  channelID: string;
+  endpoints: Array<{ apiFormat: string; path?: string; baseURL?: string; transport?: string }>;
+}
+
+export function useSaveChannelEndpoints() {
+  const queryClient = useQueryClient();
+  const { t } = useTranslation();
+  const { handleError } = useErrorHandler();
+
+  return useMutation({
+    mutationFn: async (input: SaveChannelEndpointsInput) => {
+      const data = await graphqlRequest<{ saveChannelEndpoints: Channel }>(SAVE_CHANNEL_ENDPOINTS_MUTATION, { input });
+      return channelEndpointsResponseSchema.parse(data.saveChannelEndpoints);
+    },
+    onSuccess: (_data, variables) => {
+      queryClient.invalidateQueries({ queryKey: ['channels'] });
+      queryClient.invalidateQueries({ queryKey: ['channel', variables.channelID] });
+      toast.success(t('channels.messages.updateSuccess'));
+    },
+    onError: (error) => {
+      handleError(error, { context: t('channels.dialogs.edit.title') });
+    },
+  });
+}
+
+export interface DetectChannelEndpointsInput {
+  channelID: string;
+  model?: string;
+}
+
+/**
+ * Probes a channel upstream for the relay protocols it exposes. This is a
+ * read-only detection: nothing is persisted until the caller saves the
+ * detected endpoints.
+ */
+export function useDetectChannelEndpoints() {
+  const { t } = useTranslation();
+  const { handleError } = useErrorHandler();
+
+  return useMutation({
+    mutationFn: async (input: DetectChannelEndpointsInput) => {
+      const data = await graphqlRequest<{ detectChannelEndpoints: { endpoints: DetectedChannelEndpoint[] } }>(
+        DETECT_CHANNEL_ENDPOINTS_MUTATION,
+        { input }
+      );
+
+      return (data.detectChannelEndpoints?.endpoints ?? []).map((endpoint) => detectedChannelEndpointSchema.parse(endpoint));
+    },
+    onError: (error) => {
+      handleError(error, { context: t('channels.endpoints.detect.title') });
     },
   });
 }
@@ -806,14 +1713,20 @@ export function useUpdateChannel() {
 export function useClearChannelErrorMessage() {
   const queryClient = useQueryClient();
   const { t } = useTranslation();
+  const { handleError } = useErrorHandler();
 
   return useMutation({
     mutationFn: async ({ id }: { id: string }) => {
-      const data = await graphqlRequest<{ updateChannel: Channel }>(UPDATE_CHANNEL_MUTATION, {
-        id,
-        input: { clearErrorMessage: true },
-      });
-      return channelSchema.parse(data.updateChannel);
+      try {
+        const data = await graphqlRequest<{ updateChannel: Channel }>(UPDATE_CHANNEL_MUTATION, {
+          id,
+          input: { clearErrorMessage: true },
+        });
+        return channelSchema.parse(data.updateChannel);
+      } catch (error) {
+        handleError(error, { context: 'Clear Channel Error' });
+        throw error;
+      }
     },
     onSuccess: (data) => {
       queryClient.invalidateQueries({ queryKey: ['channels'] });
@@ -821,23 +1734,26 @@ export function useClearChannelErrorMessage() {
       queryClient.invalidateQueries({ queryKey: ['errorChannelsCount'] });
       toast.success(t('channels.messages.errorResolvedSuccess'));
     },
-    onError: (error) => {
-      toast.error(t('channels.messages.errorResolvedError', { error: error.message }));
-    },
   });
 }
 
 export function useUpdateChannelStatus() {
   const queryClient = useQueryClient();
   const { t } = useTranslation();
+  const { handleError } = useErrorHandler();
 
   return useMutation({
     mutationFn: async ({ id, status }: { id: string; status: 'enabled' | 'disabled' | 'archived' }) => {
-      const data = await graphqlRequest<{ updateChannelStatus: boolean }>(UPDATE_CHANNEL_STATUS_MUTATION, {
-        id,
-        status,
-      });
-      return data.updateChannelStatus;
+      try {
+        const data = await graphqlRequest<{ updateChannelStatus: boolean }>(UPDATE_CHANNEL_STATUS_MUTATION, {
+          id,
+          status,
+        });
+        return data.updateChannelStatus;
+      } catch (error) {
+        handleError(error, { context: 'Update Channel Status' });
+        throw error;
+      }
     },
     onSuccess: (_data, variables) => {
       queryClient.invalidateQueries({ queryKey: ['channels'] });
@@ -852,28 +1768,27 @@ export function useUpdateChannelStatus() {
 
       toast.success(variables.status === 'archived' ? t(messageKey) : t(messageKey, { status: statusText }));
     },
-    onError: (error, variables) => {
-      const errorKey = variables.status === 'archived' ? 'channels.messages.archiveError' : 'channels.messages.statusUpdateError';
-      toast.error(t(errorKey, { error: error.message }));
-    },
   });
 }
 
 export function useBulkArchiveChannels() {
   const queryClient = useQueryClient();
   const { t } = useTranslation();
+  const { handleError } = useErrorHandler();
 
   return useMutation({
     mutationFn: async (ids: string[]) => {
-      const data = await graphqlRequest<{ bulkArchiveChannels: boolean }>(BULK_ARCHIVE_CHANNELS_MUTATION, { ids });
-      return data.bulkArchiveChannels;
+      try {
+        const data = await graphqlRequest<{ bulkArchiveChannels: boolean }>(BULK_ARCHIVE_CHANNELS_MUTATION, { ids });
+        return data.bulkArchiveChannels;
+      } catch (error) {
+        handleError(error, { context: 'Bulk Archive Channels' });
+        throw error;
+      }
     },
     onSuccess: (_data, variables) => {
       queryClient.invalidateQueries({ queryKey: ['channels'] });
       toast.success(t('channels.messages.bulkArchiveSuccess', { count: variables.length }));
-    },
-    onError: (error) => {
-      toast.error(t('channels.messages.bulkArchiveError', { error: error.message }));
     },
   });
 }
@@ -881,18 +1796,21 @@ export function useBulkArchiveChannels() {
 export function useBulkDisableChannels() {
   const queryClient = useQueryClient();
   const { t } = useTranslation();
+  const { handleError } = useErrorHandler();
 
   return useMutation({
     mutationFn: async (ids: string[]) => {
-      const data = await graphqlRequest<{ bulkDisableChannels: boolean }>(BULK_DISABLE_CHANNELS_MUTATION, { ids });
-      return data.bulkDisableChannels;
+      try {
+        const data = await graphqlRequest<{ bulkDisableChannels: boolean }>(BULK_DISABLE_CHANNELS_MUTATION, { ids });
+        return data.bulkDisableChannels;
+      } catch (error) {
+        handleError(error, { context: 'Bulk Disable Channels' });
+        throw error;
+      }
     },
     onSuccess: (_data, variables) => {
       queryClient.invalidateQueries({ queryKey: ['channels'] });
       toast.success(t('channels.messages.bulkDisableSuccess', { count: variables.length }));
-    },
-    onError: (error) => {
-      toast.error(t('channels.messages.bulkDisableError', { error: error.message }));
     },
   });
 }
@@ -900,18 +1818,44 @@ export function useBulkDisableChannels() {
 export function useBulkEnableChannels() {
   const queryClient = useQueryClient();
   const { t } = useTranslation();
+  const { handleError } = useErrorHandler();
 
   return useMutation({
     mutationFn: async (ids: string[]) => {
-      const data = await graphqlRequest<{ bulkEnableChannels: boolean }>(BULK_ENABLE_CHANNELS_MUTATION, { ids });
-      return data.bulkEnableChannels;
+      try {
+        const data = await graphqlRequest<{ bulkEnableChannels: boolean }>(BULK_ENABLE_CHANNELS_MUTATION, { ids });
+        return data.bulkEnableChannels;
+      } catch (error) {
+        handleError(error, { context: 'Bulk Enable Channels' });
+        throw error;
+      }
     },
     onSuccess: (_data, variables) => {
       queryClient.invalidateQueries({ queryKey: ['channels'] });
       toast.success(t('channels.messages.bulkEnableSuccess', { count: variables.length }));
     },
-    onError: (error) => {
-      toast.error(t('channels.messages.bulkEnableError', { error: error.message }));
+  });
+}
+
+export function useBulkRecoverChannels() {
+  const queryClient = useQueryClient();
+  const { t } = useTranslation();
+  const { handleError } = useErrorHandler();
+
+  return useMutation({
+    mutationFn: async (ids: string[]) => {
+      try {
+        const data = await graphqlRequest<{ bulkRecoverChannels: boolean }>(BULK_RECOVER_CHANNELS_MUTATION, { ids });
+        return data.bulkRecoverChannels;
+      } catch (error) {
+        handleError(error, { context: 'Bulk Recover Channels' });
+        throw error;
+      }
+    },
+    onSuccess: (_data, variables) => {
+      queryClient.invalidateQueries({ queryKey: ['channels'] });
+      queryClient.invalidateQueries({ queryKey: ['errorChannelsCount'] });
+      toast.success(t('channels.messages.bulkRecoverSuccess', { count: variables.length }));
     },
   });
 }
@@ -919,18 +1863,21 @@ export function useBulkEnableChannels() {
 export function useDeleteChannel() {
   const queryClient = useQueryClient();
   const { t } = useTranslation();
+  const { handleError } = useErrorHandler();
 
   return useMutation({
     mutationFn: async (id: string) => {
-      const data = await graphqlRequest<{ deleteChannel: boolean }>(DELETE_CHANNEL_MUTATION, { id });
-      return data.deleteChannel;
+      try {
+        const data = await graphqlRequest<{ deleteChannel: boolean }>(DELETE_CHANNEL_MUTATION, { id });
+        return data.deleteChannel;
+      } catch (error) {
+        handleError(error, { context: 'Delete Channel' });
+        throw error;
+      }
     },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['channels'] });
       toast.success(t('channels.messages.deleteSuccess'));
-    },
-    onError: (error) => {
-      toast.error(t('channels.messages.deleteError', { error: error.message }));
     },
   });
 }
@@ -938,26 +1885,64 @@ export function useDeleteChannel() {
 export function useBulkDeleteChannels() {
   const queryClient = useQueryClient();
   const { t } = useTranslation();
+  const { handleError } = useErrorHandler();
 
   return useMutation({
     mutationFn: async (ids: string[]) => {
-      const data = await graphqlRequest<{ bulkDeleteChannels: boolean }>(BULK_DELETE_CHANNELS_MUTATION, { ids });
-      return data.bulkDeleteChannels;
+      try {
+        const data = await graphqlRequest<{ bulkDeleteChannels: boolean }>(BULK_DELETE_CHANNELS_MUTATION, { ids });
+        return data.bulkDeleteChannels;
+      } catch (error) {
+        handleError(error, { context: 'Bulk Delete Channels' });
+        throw error;
+      }
     },
     onSuccess: (_data, variables) => {
       queryClient.invalidateQueries({ queryKey: ['channels'] });
       toast.success(t('channels.messages.bulkDeleteSuccess', { count: variables.length }));
     },
-    onError: (error) => {
-      toast.error(t('channels.messages.bulkDeleteError', { error: error.message }));
+  });
+}
+
+export function useBulkManageChannelTags() {
+  const queryClient = useQueryClient();
+  const { t } = useTranslation();
+  const { handleError } = useErrorHandler();
+
+  return useMutation({
+    mutationFn: async ({ ids, addTags, removeTags }: { ids: string[]; addTags: string[]; removeTags: string[] }) => {
+      try {
+        const data = await graphqlRequest<{ bulkManageChannelTags: boolean }>(BULK_MANAGE_CHANNEL_TAGS_MUTATION, {
+          ids,
+          addTags,
+          removeTags,
+        });
+        return data.bulkManageChannelTags;
+      } catch (error) {
+        handleError(error, { context: 'Bulk Manage Channel Tags' });
+        throw error;
+      }
+    },
+    onSuccess: (_data, variables) => {
+      queryClient.invalidateQueries({ queryKey: ['channels'] });
+      queryClient.invalidateQueries({ queryKey: ['allChannelSummarys'] });
+      queryClient.invalidateQueries({ queryKey: ['allChannelTags'] });
+      queryClient.invalidateQueries({ queryKey: ['selectedChannelTags'] });
+      toast.success(t('channels.messages.bulkManageTagsSuccess', { count: variables.ids.length }));
+    },
+    onError: () => {
+      queryClient.invalidateQueries({ queryKey: ['selectedChannelTags'] });
     },
   });
 }
 
-export function useTestChannel() {
+export function useTestChannel(options?: { silent?: boolean }) {
   const { t } = useTranslation();
+  const { handleError } = useErrorHandler();
+  const silent = options?.silent ?? false;
 
   return useMutation({
+    // prettier-ignore
     mutationFn: async ({
       channelID,
       modelID,
@@ -965,30 +1950,85 @@ export function useTestChannel() {
     }: {
       channelID: string;
       modelID?: string;
-      proxy?: { type: string; url?: string; username?: string; password?: string };
+      proxy?: ProxyConfig;
     }) => {
-      const data = await graphqlRequest<{
-        testChannel: {
-          latency: number;
-          success: boolean;
-          message?: string | null;
-          error?: string | null;
-        };
-      }>(TEST_CHANNEL_MUTATION, { input: { channelID, modelID, proxy } });
-      return data.testChannel;
+      try {
+        const data = await graphqlRequest<{
+          testChannel: {
+            latency: number;
+            success: boolean;
+            message?: string | null;
+            error?: string | null;
+          };
+        }>(TEST_CHANNEL_MUTATION, { input: { channelID, modelID, proxy } });
+        return data.testChannel;
+      } catch (error) {
+        if (!silent) {
+          handleError(error, { context: 'Test Channel' });
+        }
+        throw error;
+      }
     },
     onSuccess: (data) => {
+      if (silent) {
+        return;
+      }
+
       if (data.success) {
         toast.success(t('channels.messages.testSuccess', { latency: data.latency.toFixed(2) }));
       } else {
         // Handle case where GraphQL request succeeds but test fails
-        const errorMsg = data.error || t('channels.messages.testUnknownError');
-        toast.error(t('channels.messages.testError', { error: errorMsg }));
+        const errorMsg = data.error || t('common.errors.internalServerError');
+        toast.error(errorMsg);
       }
     },
-    onError: (error) => {
-      // Handle GraphQL/network errors
-      toast.error(t('channels.messages.testError', { error: error.message }));
+  });
+}
+
+export function useTestChannelAPIKeys(options?: { silent?: boolean }) {
+  const { t } = useTranslation();
+  const { handleError } = useErrorHandler();
+  const silent = options?.silent ?? false;
+
+  return useMutation({
+    mutationFn: async ({ channelID, modelID }: { channelID: string; modelID?: string }) => {
+      try {
+        const data = await graphqlRequest<{ testChannelAPIKeys: TestChannelAPIKeysPayload }>(TEST_CHANNEL_API_KEYS_MUTATION, {
+          channelID,
+          modelID,
+        });
+        return testChannelAPIKeysPayloadSchema.parse(data.testChannelAPIKeys);
+      } catch (error) {
+        if (!silent) {
+          handleError(error, { context: 'Test Channel API Keys' });
+        }
+        throw error;
+      }
+    },
+    onSuccess: (data) => {
+      if (silent) {
+        return;
+      }
+
+      if (data.failedCount === 0) {
+        toast.success(t('channels.dialogs.testAPIKeys.successSummary', { success: data.successCount, total: data.total }));
+        return;
+      }
+
+      toast.error(t('channels.dialogs.testAPIKeys.successSummary', { success: data.successCount, total: data.total }));
+    },
+  });
+}
+
+export function useTestChannelAPIKey() {
+  return useMutation({
+    mutationFn: async ({ channelID, key, modelID }: { channelID: string; key: string; modelID?: string }) => {
+      const data = await graphqlRequest<{ testChannelAPIKey: TestAPIKeyResult }>(TEST_CHANNEL_API_KEY_MUTATION, {
+        channelID,
+        key,
+        modelID,
+      });
+      return testAPIKeyResultSchema.parse(data.testChannelAPIKey);
     },
   });
 }
@@ -996,11 +2036,17 @@ export function useTestChannel() {
 export function useBulkImportChannels() {
   const queryClient = useQueryClient();
   const { t } = useTranslation();
+  const { handleError } = useErrorHandler();
 
   return useMutation({
     mutationFn: async (input: BulkImportChannelsInput) => {
-      const data = await graphqlRequest<{ bulkImportChannels: BulkImportChannelsResult }>(BULK_IMPORT_CHANNELS_MUTATION, { input });
-      return bulkImportChannelsResultSchema.parse(data.bulkImportChannels);
+      try {
+        const data = await graphqlRequest<{ bulkImportChannels: BulkImportChannelsResult }>(BULK_IMPORT_CHANNELS_MUTATION, { input });
+        return bulkImportChannelsResultSchema.parse(data.bulkImportChannels);
+      } catch (error) {
+        handleError(error, { context: 'Bulk Import Channels' });
+        throw error;
+      }
     },
     onSuccess: (data) => {
       queryClient.invalidateQueries({ queryKey: ['channels'] });
@@ -1020,74 +2066,178 @@ export function useBulkImportChannels() {
         );
       }
     },
-    onError: (error) => {
-      toast.error(t('channels.messages.bulkImportError', { error: error.message }));
-    },
   });
 }
 
-export function useAllChannelsForOrdering(options?: { enabled?: boolean }) {
+export function useAllChannelSummarys(projectId?: string | null, options?: { enabled?: boolean; includeArchived?: boolean }) {
   const { handleError } = useErrorHandler();
   const { t } = useTranslation();
 
   return useQuery({
-    queryKey: ['allChannelsForOrdering'],
+    queryKey: ['allChannelSummarys', projectId, options?.includeArchived],
     queryFn: async () => {
       try {
-        const data = await graphqlRequest<{ channels: ChannelConnection }>(ALL_CHANNELS_QUERY);
-        return channelOrderingConnectionSchema.parse(data?.channels);
+        const headers = projectId ? { 'X-Project-ID': projectId } : undefined;
+        const data = await graphqlRequest<{ allChannelSummarys: ChannelSummaryConnection['edges'][number]['node'][] }>(
+          ALL_CHANNEL_SUMMARYS_QUERY,
+          { includeArchived: options?.includeArchived },
+          headers
+        );
+        return channelSummaryConnectionSchema.parse({
+          edges: (data?.allChannelSummarys || []).map((node) => ({ node })),
+          totalCount: data?.allChannelSummarys?.length || 0,
+        });
       } catch (error) {
-        handleError(error, t('channels.errors.fetchOrdering'));
+        handleError(error, t('common.errors.internalServerError'));
         throw error;
       }
     },
-    enabled: options?.enabled !== false, // Default to true, only disable if explicitly set to false
+    enabled: options?.enabled !== false,
+  });
+}
+
+export function useChannelAutoDisableCopySources(options?: { enabled?: boolean }) {
+  const { handleError } = useErrorHandler();
+  const { t } = useTranslation();
+  const projectId = useSelectedProjectId();
+
+  return useQuery({
+    queryKey: ['channelAutoDisableCopySources', projectId],
+    queryFn: async () => {
+      try {
+        const headers = projectId ? { 'X-Project-ID': projectId } : undefined;
+        const data = await graphqlRequest<{ allChannelSummarys: ChannelAutoDisableCopySource[] }>(
+          CHANNEL_AUTO_DISABLE_COPY_SOURCES_QUERY,
+          undefined,
+          headers
+        );
+        return z.array(channelAutoDisableCopySourceSchema).parse(data.allChannelSummarys ?? []);
+      } catch (error) {
+        handleError(error, t('common.errors.internalServerError'));
+        throw error;
+      }
+    },
+    enabled: options?.enabled === true,
+  });
+}
+
+export function useBulkUpdateChannelAutoDisable() {
+  const queryClient = useQueryClient();
+  const { t } = useTranslation();
+  const { handleError } = useErrorHandler();
+
+  return useMutation({
+    mutationFn: async (input: BulkUpdateChannelAutoDisableInput) => {
+      try {
+        const data = await graphqlRequest<{ bulkUpdateChannelAutoDisable: BulkUpdateChannelAutoDisablePayload }>(
+          BULK_UPDATE_CHANNEL_AUTO_DISABLE_MUTATION,
+          { input }
+        );
+        return bulkUpdateChannelAutoDisablePayloadSchema.parse(data.bulkUpdateChannelAutoDisable);
+      } catch (error) {
+        handleError(error, { context: 'Bulk Update Channel Auto Disable' });
+        throw error;
+      }
+    },
+    onSuccess: (data) => {
+      queryClient.invalidateQueries({ queryKey: ['channels'] });
+      queryClient.invalidateQueries({ queryKey: ['allChannelSummarys'] });
+      queryClient.invalidateQueries({ queryKey: ['channelAutoDisableCopySources'] });
+      toast.success(t('channels.bulkAutoDisable.success', { count: data.updated }));
+    },
   });
 }
 
 export function useBulkUpdateChannelOrdering() {
   const queryClient = useQueryClient();
   const { t } = useTranslation();
+  const { handleError } = useErrorHandler();
 
   return useMutation({
     mutationFn: async (input: BulkUpdateChannelOrderingInput) => {
-      const data = await graphqlRequest<{ bulkUpdateChannelOrdering: BulkUpdateChannelOrderingResult }>(
-        BULK_UPDATE_CHANNEL_ORDERING_MUTATION,
-        { input }
-      );
-      return bulkUpdateChannelOrderingResultSchema.parse(data.bulkUpdateChannelOrdering);
+      try {
+        const data = await graphqlRequest<{ bulkUpdateChannelOrdering: BulkUpdateChannelOrderingResult }>(
+          BULK_UPDATE_CHANNEL_ORDERING_MUTATION,
+          { input }
+        );
+        return bulkUpdateChannelOrderingResultSchema.parse(data.bulkUpdateChannelOrdering);
+      } catch (error) {
+        handleError(error, { context: 'Update Channel Ordering' });
+        throw error;
+      }
     },
     onSuccess: (data) => {
       queryClient.invalidateQueries({ queryKey: ['channels'] });
-      queryClient.invalidateQueries({ queryKey: ['allChannelsForOrdering'] });
+      queryClient.invalidateQueries({ queryKey: ['allChannelSummarys'] });
       toast.success(
         t('channels.messages.orderingUpdateSuccess', {
           updated: data.updated,
         })
       );
     },
-    onError: (error) => {
-      toast.error(t('channels.messages.orderingUpdateError', { error: error.message }));
+  });
+}
+
+const SYNC_CHANNEL_MODELS_MUTATION = `
+  mutation SyncChannelModels($channelID: ID!, $pattern: String) {
+    syncChannelModels(channelID: $channelID, pattern: $pattern) {
+      channelID
+      supportedModels
+      manualModels
+    }
+  }
+`;
+
+const syncChannelModelsPayloadSchema = z.object({
+  channelID: z.string(),
+  supportedModels: z.array(z.string()),
+  manualModels: z.array(z.string()),
+});
+
+export function useSyncChannelModels() {
+  const queryClient = useQueryClient();
+  const { t } = useTranslation();
+  const { handleError } = useErrorHandler();
+
+  return useMutation({
+    mutationFn: async (input: { channelID: string; pattern?: string }) => {
+      try {
+        const data = await graphqlRequest<{ syncChannelModels: unknown }>(SYNC_CHANNEL_MODELS_MUTATION, input);
+        return syncChannelModelsPayloadSchema.parse(data.syncChannelModels);
+      } catch (error) {
+        handleError(error, { context: 'Sync Channel Models' });
+        throw error;
+      }
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['channels'] });
+      toast.success(t('channels.messages.syncModelsSuccess'));
     },
   });
 }
 
 export function useFetchModels() {
   const { t } = useTranslation();
+  const { handleError } = useErrorHandler();
 
   return useMutation({
     mutationFn: async (input: { channelType: string; baseURL: string; apiKey?: string; channelID?: string }) => {
-      const data = await graphqlRequest<{
-        fetchModels: {
-          models: Array<{ id: string }>;
-          error?: string | null;
-        };
-      }>(FETCH_MODELS_QUERY, { input });
-      return data.fetchModels;
+      try {
+        const data = await graphqlRequest<{
+          fetchModels: {
+            models: Array<{ id: string }>;
+            error?: string | null;
+          };
+        }>(FETCH_MODELS_QUERY, { input });
+        return data.fetchModels;
+      } catch (error) {
+        handleError(error, { context: 'Fetch Models' });
+        throw error;
+      }
     },
     onSuccess: (data) => {
       if (data.error) {
-        toast.error(t('channels.messages.fetchModelsError', { error: data.error }));
+        toast.error(t('common.errors.internalServerError'));
       } else {
         const count = data.models.length;
         if (count > 100) {
@@ -1096,9 +2246,6 @@ export function useFetchModels() {
           toast.success(t('channels.messages.fetchModelsSuccess', { count }));
         }
       }
-    },
-    onError: (error) => {
-      toast.error(t('channels.messages.fetchModelsError', { error: error.message }));
     },
   });
 }
@@ -1123,7 +2270,7 @@ export function useChannelTypes(statusIn?: string[]) {
         const data = await graphqlRequest<{ countChannelsByType: ChannelTypeCount[] }>(CHANNEL_TYPES_QUERY, { input });
         return data.countChannelsByType || [];
       } catch (error) {
-        handleError(error, t('channels.errors.fetchTypes'));
+        handleError(error, t('common.errors.internalServerError'));
         throw error;
       }
     },
@@ -1153,7 +2300,7 @@ export function useErrorChannelsCount() {
         const data = await graphqlRequest<{ channels: { totalCount: number } }>(ERROR_CHANNELS_COUNT_QUERY);
         return data.channels.totalCount;
       } catch (error) {
-        handleError(error, t('channels.errors.fetchList'));
+        handleError(error, t('common.errors.internalServerError'));
         throw error;
       }
     },
@@ -1161,22 +2308,52 @@ export function useErrorChannelsCount() {
   });
 }
 
-export function useAllChannelTags() {
+export function useAllChannelTags(projectId?: string | null) {
   const { handleError } = useErrorHandler();
   const { t } = useTranslation();
 
   return useQuery({
-    queryKey: ['allChannelTags'],
+    queryKey: ['allChannelTags', projectId],
     queryFn: async () => {
       try {
-        const data = await graphqlRequest<{ allChannelTags: string[] }>(ALL_CHANNEL_TAGS_QUERY);
+        const headers = projectId ? { 'X-Project-ID': projectId } : undefined;
+        const data = await graphqlRequest<{ allChannelTags: string[] }>(ALL_CHANNEL_TAGS_QUERY, undefined, headers);
         return data.allChannelTags || [];
       } catch (error) {
-        handleError(error, t('channels.errors.fetchTags'));
+        handleError(error, t('common.errors.internalServerError'));
         throw error;
       }
     },
     staleTime: 5 * 60 * 1000, // 5 minutes
+  });
+}
+
+export function useSelectedChannelTags(channelIDs: string[], options?: { enabled?: boolean }) {
+  const { handleError } = useErrorHandler();
+  const { t } = useTranslation();
+  const sortedChannelIDs = [...channelIDs].sort();
+
+  return useQuery({
+    queryKey: ['selectedChannelTags', sortedChannelIDs],
+    queryFn: async () => {
+      try {
+        const data = await graphqlRequest<unknown>(SELECTED_CHANNEL_TAGS_QUERY, {
+          input: {
+            first: sortedChannelIDs.length,
+            where: { idIn: sortedChannelIDs },
+          },
+        });
+        const parsed = selectedChannelTagsResponseSchema.parse(data);
+        return parsed.queryChannels.edges.map(({ node }) => ({
+          id: node.id,
+          tags: node.tags ?? [],
+        }));
+      } catch (error) {
+        handleError(error, t('common.errors.internalServerError'));
+        throw error;
+      }
+    },
+    enabled: options?.enabled !== false && sortedChannelIDs.length > 0,
   });
 }
 
@@ -1208,7 +2385,7 @@ export function useChannelProbeData(channelIDs: string[], options?: { enabled?: 
         });
         return data.channelProbeData || [];
       } catch (error) {
-        handleError(error, t('channels.errors.fetchProbeData'));
+        handleError(error, t('common.errors.internalServerError'));
         return [];
       }
     },
@@ -1234,12 +2411,13 @@ export function useChannelDisabledAPIKeys(channelId: string, options?: { enabled
               disabledAt: string;
               errorCode: number;
               reason?: string | null;
+              expiresAt?: string | null;
             }>;
           };
         }>(GET_CHANNEL_DISABLED_API_KEYS_QUERY, { id: channelId });
         return data.node?.disabledAPIKeys || [];
       } catch (error) {
-        handleError(error, t('channels.errors.fetchDisabledAPIKeys'));
+        handleError(error, t('common.errors.internalServerError'));
         return [];
       }
     },
@@ -1247,25 +2425,54 @@ export function useChannelDisabledAPIKeys(channelId: string, options?: { enabled
   });
 }
 
-export function useEnableChannelAPIKey() {
+export function useDisableChannelAPIKey() {
   const queryClient = useQueryClient();
   const { t } = useTranslation();
+  const { handleError } = useErrorHandler();
 
   return useMutation({
     mutationFn: async ({ channelID, key }: { channelID: string; key: string }) => {
-      const data = await graphqlRequest<{ enableChannelAPIKey: boolean }>(ENABLE_CHANNEL_API_KEY_MUTATION, {
-        channelID,
-        key,
-      });
-      return data.enableChannelAPIKey;
+      try {
+        const data = await graphqlRequest<{ disableChannelAPIKey: boolean }>(DISABLE_CHANNEL_API_KEY_MUTATION, {
+          channelID,
+          key,
+        });
+        return data.disableChannelAPIKey;
+      } catch (error) {
+        handleError(error, { context: 'Disable Channel API Key' });
+        throw error;
+      }
+    },
+    onSuccess: (_data, variables) => {
+      queryClient.invalidateQueries({ queryKey: ['channelDisabledAPIKeys', variables.channelID] });
+      queryClient.invalidateQueries({ queryKey: ['channels'] });
+      toast.success(t('channels.messages.disableAPIKeySuccess'));
+    },
+  });
+}
+
+export function useEnableChannelAPIKey() {
+  const queryClient = useQueryClient();
+  const { t } = useTranslation();
+  const { handleError } = useErrorHandler();
+
+  return useMutation({
+    mutationFn: async ({ channelID, key }: { channelID: string; key: string }) => {
+      try {
+        const data = await graphqlRequest<{ enableChannelAPIKey: boolean }>(ENABLE_CHANNEL_API_KEY_MUTATION, {
+          channelID,
+          key,
+        });
+        return data.enableChannelAPIKey;
+      } catch (error) {
+        handleError(error, { context: 'Enable Channel API Key' });
+        throw error;
+      }
     },
     onSuccess: (_data, variables) => {
       queryClient.invalidateQueries({ queryKey: ['channelDisabledAPIKeys', variables.channelID] });
       queryClient.invalidateQueries({ queryKey: ['channels'] });
       toast.success(t('channels.messages.enableAPIKeySuccess'));
-    },
-    onError: (error) => {
-      toast.error(t('channels.messages.enableAPIKeyError', { error: error.message }));
     },
   });
 }
@@ -1273,21 +2480,24 @@ export function useEnableChannelAPIKey() {
 export function useEnableAllChannelAPIKeys() {
   const queryClient = useQueryClient();
   const { t } = useTranslation();
+  const { handleError } = useErrorHandler();
 
   return useMutation({
     mutationFn: async ({ channelID }: { channelID: string }) => {
-      const data = await graphqlRequest<{ enableAllChannelAPIKeys: boolean }>(ENABLE_ALL_CHANNEL_API_KEYS_MUTATION, {
-        channelID,
-      });
-      return data.enableAllChannelAPIKeys;
+      try {
+        const data = await graphqlRequest<{ enableAllChannelAPIKeys: boolean }>(ENABLE_ALL_CHANNEL_API_KEYS_MUTATION, {
+          channelID,
+        });
+        return data.enableAllChannelAPIKeys;
+      } catch (error) {
+        handleError(error, { context: 'Enable All Channel API Keys' });
+        throw error;
+      }
     },
     onSuccess: (_data, variables) => {
       queryClient.invalidateQueries({ queryKey: ['channelDisabledAPIKeys', variables.channelID] });
       queryClient.invalidateQueries({ queryKey: ['channels'] });
       toast.success(t('channels.messages.enableAllAPIKeysSuccess'));
-    },
-    onError: (error) => {
-      toast.error(t('channels.messages.enableAllAPIKeysError', { error: error.message }));
     },
   });
 }
@@ -1295,22 +2505,25 @@ export function useEnableAllChannelAPIKeys() {
 export function useEnableSelectedChannelAPIKeys() {
   const queryClient = useQueryClient();
   const { t } = useTranslation();
+  const { handleError } = useErrorHandler();
 
   return useMutation({
     mutationFn: async ({ channelID, keys }: { channelID: string; keys: string[] }) => {
-      const data = await graphqlRequest<{ enableSelectedChannelAPIKeys: boolean }>(
-        ENABLE_SELECTED_CHANNEL_API_KEYS_MUTATION,
-        { channelID, keys }
-      );
-      return data.enableSelectedChannelAPIKeys;
+      try {
+        const data = await graphqlRequest<{ enableSelectedChannelAPIKeys: boolean }>(ENABLE_SELECTED_CHANNEL_API_KEYS_MUTATION, {
+          channelID,
+          keys,
+        });
+        return data.enableSelectedChannelAPIKeys;
+      } catch (error) {
+        handleError(error, { context: 'Enable Selected API Keys' });
+        throw error;
+      }
     },
     onSuccess: (_data, variables) => {
       queryClient.invalidateQueries({ queryKey: ['channelDisabledAPIKeys', variables.channelID] });
       queryClient.invalidateQueries({ queryKey: ['channels'] });
       toast.success(t('channels.messages.enableSelectedAPIKeysSuccess'));
-    },
-    onError: (error) => {
-      toast.error(t('channels.messages.enableSelectedAPIKeysError', { error: error.message }));
     },
   });
 }
@@ -1318,28 +2531,31 @@ export function useEnableSelectedChannelAPIKeys() {
 export function useDeleteDisabledChannelAPIKeys() {
   const queryClient = useQueryClient();
   const { t } = useTranslation();
+  const { handleError } = useErrorHandler();
 
   return useMutation({
     mutationFn: async ({ channelID, keys }: { channelID: string; keys: string[] }) => {
-      const data = await graphqlRequest<{ deleteDisabledChannelAPIKeys: { success: boolean; message?: string } }>(
-        DELETE_DISABLED_CHANNEL_API_KEYS_MUTATION,
-        { channelID, keys }
-      );
-      return data.deleteDisabledChannelAPIKeys;
+      try {
+        const data = await graphqlRequest<{ deleteDisabledChannelAPIKeys: { success: boolean; message?: string } }>(
+          DELETE_DISABLED_CHANNEL_API_KEYS_MUTATION,
+          { channelID, keys }
+        );
+        return data.deleteDisabledChannelAPIKeys;
+      } catch (error) {
+        handleError(error, { context: 'Delete Disabled API Keys' });
+        throw error;
+      }
     },
     onSuccess: (data, variables) => {
       queryClient.invalidateQueries({ queryKey: ['channelDisabledAPIKeys', variables.channelID] });
       queryClient.invalidateQueries({ queryKey: ['channels'] });
-      
+
       // Show appropriate message based on the result
       if (data.message === 'ONE_KEY_PRESERVED') {
         toast.success(t('channels.messages.deleteDisabledAPIKeysPreserved'));
       } else {
         toast.success(t('channels.messages.deleteDisabledAPIKeysSuccess'));
       }
-    },
-    onError: (error) => {
-      toast.error(t('channels.messages.deleteDisabledAPIKeysError', { error: error.message }));
     },
   });
 }

@@ -1,53 +1,16 @@
 package shared
 
 import (
+	"encoding/base64"
 	"testing"
 
 	"github.com/stretchr/testify/require"
 )
 
-func TestIsGeminiThoughtSignature(t *testing.T) {
-	tests := []struct {
-		name      string
-		signature *string
-		expected  bool
-	}{
-		{
-			name:      "nil signature",
-			signature: nil,
-			expected:  false,
-		},
-		{
-			name:      "empty string",
-			signature: stringPtr(""),
-			expected:  false,
-		},
-		{
-			name:      "valid signature",
-			signature: stringPtr(GeminiThoughtSignaturePrefix + "some-signature"),
-			expected:  true,
-		},
-		{
-			name:      "invalid prefix",
-			signature: stringPtr("some-signature"),
-			expected:  false,
-		},
-		{
-			name:      "only prefix",
-			signature: stringPtr(GeminiThoughtSignaturePrefix),
-			expected:  true,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result := IsGeminiThoughtSignature(tt.signature)
-			require.Equal(t, tt.expected, result)
-		})
-	}
-}
-
 func TestDecodeGeminiThoughtSignature(t *testing.T) {
+	protoBytes := []byte{0x0a, 0x04, 0x74, 0x65, 0x73, 0x74}
+	protoB64 := base64.StdEncoding.EncodeToString(protoBytes)
+
 	tests := []struct {
 		name      string
 		signature *string
@@ -60,23 +23,28 @@ func TestDecodeGeminiThoughtSignature(t *testing.T) {
 		},
 		{
 			name:      "empty string",
-			signature: stringPtr(""),
+			signature: new(""),
 			expected:  nil,
 		},
 		{
-			name:      "valid signature",
-			signature: stringPtr(GeminiThoughtSignaturePrefix + "some-signature"),
-			expected:  stringPtr("some-signature"),
+			name:      "protobuf-like base64 (gemini)",
+			signature: new(protoB64),
+			expected:  new(protoB64),
 		},
 		{
-			name:      "invalid prefix",
-			signature: stringPtr("some-signature"),
+			name:      "openai-like signature (gAAA prefix) - rejected",
+			signature: new("gAAAAABpg2hk4yLqQUPBKlNLPwYE5lSfBmhv0"),
 			expected:  nil,
 		},
 		{
-			name:      "only prefix returns empty string",
-			signature: stringPtr(GeminiThoughtSignaturePrefix),
-			expected:  stringPtr(""),
+			name:      "anthropic-like signature (Eq prefix) - rejected",
+			signature: new("EqQBCAEDEgQIAhAEGAAgAigBMOzOAg=="),
+			expected:  nil,
+		},
+		{
+			name:      "unknown standard base64 with + char",
+			signature: new("+AA="),
+			expected:  nil,
 		},
 	}
 
@@ -105,14 +73,9 @@ func TestEncodeGeminiThoughtSignature(t *testing.T) {
 			expected:  nil,
 		},
 		{
-			name:      "only prefix",
-			signature: stringPtr(""),
-			expected:  stringPtr(GeminiThoughtSignaturePrefix),
-		},
-		{
 			name:      "valid signature",
-			signature: stringPtr("some-signature"),
-			expected:  stringPtr(GeminiThoughtSignaturePrefix + "some-signature"),
+			signature: new("some-signature"),
+			expected:  new("some-signature"),
 		},
 	}
 
@@ -130,14 +93,13 @@ func TestEncodeGeminiThoughtSignature(t *testing.T) {
 }
 
 func TestGeminiEncodeDecodeRoundTrip(t *testing.T) {
-	original := stringPtr("some-random-signature-data")
+	protoBytes := []byte{0x0a, 0x04, 0x74, 0x65, 0x73, 0x74}
+	original := new(base64.StdEncoding.EncodeToString(protoBytes))
 
-	// Encode
 	encoded := EncodeGeminiThoughtSignature(original)
 	require.NotNil(t, encoded)
-	require.True(t, IsGeminiThoughtSignature(encoded))
+	require.Equal(t, *original, *encoded)
 
-	// Decode
 	decoded := DecodeGeminiThoughtSignature(encoded)
 	require.NotNil(t, decoded)
 	require.Equal(t, *original, *decoded)

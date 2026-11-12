@@ -16,15 +16,19 @@ import (
 	"entgo.io/ent/dialect/sql"
 	"entgo.io/ent/dialect/sql/sqlgraph"
 	"github.com/looplj/axonhub/internal/ent/apikey"
+	"github.com/looplj/axonhub/internal/ent/apikeyprofiletemplate"
 	"github.com/looplj/axonhub/internal/ent/channel"
 	"github.com/looplj/axonhub/internal/ent/channelmodelprice"
 	"github.com/looplj/axonhub/internal/ent/channelmodelpriceversion"
 	"github.com/looplj/axonhub/internal/ent/channeloverridetemplate"
 	"github.com/looplj/axonhub/internal/ent/channelprobe"
 	"github.com/looplj/axonhub/internal/ent/datastorage"
+	"github.com/looplj/axonhub/internal/ent/invitation"
 	"github.com/looplj/axonhub/internal/ent/model"
+	"github.com/looplj/axonhub/internal/ent/oidcidentity"
 	"github.com/looplj/axonhub/internal/ent/project"
 	"github.com/looplj/axonhub/internal/ent/prompt"
+	"github.com/looplj/axonhub/internal/ent/promptprotectionrule"
 	"github.com/looplj/axonhub/internal/ent/providerquotastatus"
 	"github.com/looplj/axonhub/internal/ent/request"
 	"github.com/looplj/axonhub/internal/ent/requestexecution"
@@ -45,6 +49,8 @@ type Client struct {
 	Schema *migrate.Schema
 	// APIKey is the client for interacting with the APIKey builders.
 	APIKey *APIKeyClient
+	// APIKeyProfileTemplate is the client for interacting with the APIKeyProfileTemplate builders.
+	APIKeyProfileTemplate *APIKeyProfileTemplateClient
 	// Channel is the client for interacting with the Channel builders.
 	Channel *ChannelClient
 	// ChannelModelPrice is the client for interacting with the ChannelModelPrice builders.
@@ -57,12 +63,18 @@ type Client struct {
 	ChannelProbe *ChannelProbeClient
 	// DataStorage is the client for interacting with the DataStorage builders.
 	DataStorage *DataStorageClient
+	// Invitation is the client for interacting with the Invitation builders.
+	Invitation *InvitationClient
 	// Model is the client for interacting with the Model builders.
 	Model *ModelClient
+	// OIDCIdentity is the client for interacting with the OIDCIdentity builders.
+	OIDCIdentity *OIDCIdentityClient
 	// Project is the client for interacting with the Project builders.
 	Project *ProjectClient
 	// Prompt is the client for interacting with the Prompt builders.
 	Prompt *PromptClient
+	// PromptProtectionRule is the client for interacting with the PromptProtectionRule builders.
+	PromptProtectionRule *PromptProtectionRuleClient
 	// ProviderQuotaStatus is the client for interacting with the ProviderQuotaStatus builders.
 	ProviderQuotaStatus *ProviderQuotaStatusClient
 	// Request is the client for interacting with the Request builders.
@@ -99,15 +111,19 @@ func NewClient(opts ...Option) *Client {
 func (c *Client) init() {
 	c.Schema = migrate.NewSchema(c.driver)
 	c.APIKey = NewAPIKeyClient(c.config)
+	c.APIKeyProfileTemplate = NewAPIKeyProfileTemplateClient(c.config)
 	c.Channel = NewChannelClient(c.config)
 	c.ChannelModelPrice = NewChannelModelPriceClient(c.config)
 	c.ChannelModelPriceVersion = NewChannelModelPriceVersionClient(c.config)
 	c.ChannelOverrideTemplate = NewChannelOverrideTemplateClient(c.config)
 	c.ChannelProbe = NewChannelProbeClient(c.config)
 	c.DataStorage = NewDataStorageClient(c.config)
+	c.Invitation = NewInvitationClient(c.config)
 	c.Model = NewModelClient(c.config)
+	c.OIDCIdentity = NewOIDCIdentityClient(c.config)
 	c.Project = NewProjectClient(c.config)
 	c.Prompt = NewPromptClient(c.config)
+	c.PromptProtectionRule = NewPromptProtectionRuleClient(c.config)
 	c.ProviderQuotaStatus = NewProviderQuotaStatusClient(c.config)
 	c.Request = NewRequestClient(c.config)
 	c.RequestExecution = NewRequestExecutionClient(c.config)
@@ -212,15 +228,19 @@ func (c *Client) Tx(ctx context.Context) (*Tx, error) {
 		ctx:                      ctx,
 		config:                   cfg,
 		APIKey:                   NewAPIKeyClient(cfg),
+		APIKeyProfileTemplate:    NewAPIKeyProfileTemplateClient(cfg),
 		Channel:                  NewChannelClient(cfg),
 		ChannelModelPrice:        NewChannelModelPriceClient(cfg),
 		ChannelModelPriceVersion: NewChannelModelPriceVersionClient(cfg),
 		ChannelOverrideTemplate:  NewChannelOverrideTemplateClient(cfg),
 		ChannelProbe:             NewChannelProbeClient(cfg),
 		DataStorage:              NewDataStorageClient(cfg),
+		Invitation:               NewInvitationClient(cfg),
 		Model:                    NewModelClient(cfg),
+		OIDCIdentity:             NewOIDCIdentityClient(cfg),
 		Project:                  NewProjectClient(cfg),
 		Prompt:                   NewPromptClient(cfg),
+		PromptProtectionRule:     NewPromptProtectionRuleClient(cfg),
 		ProviderQuotaStatus:      NewProviderQuotaStatusClient(cfg),
 		Request:                  NewRequestClient(cfg),
 		RequestExecution:         NewRequestExecutionClient(cfg),
@@ -252,15 +272,19 @@ func (c *Client) BeginTx(ctx context.Context, opts *sql.TxOptions) (*Tx, error) 
 		ctx:                      ctx,
 		config:                   cfg,
 		APIKey:                   NewAPIKeyClient(cfg),
+		APIKeyProfileTemplate:    NewAPIKeyProfileTemplateClient(cfg),
 		Channel:                  NewChannelClient(cfg),
 		ChannelModelPrice:        NewChannelModelPriceClient(cfg),
 		ChannelModelPriceVersion: NewChannelModelPriceVersionClient(cfg),
 		ChannelOverrideTemplate:  NewChannelOverrideTemplateClient(cfg),
 		ChannelProbe:             NewChannelProbeClient(cfg),
 		DataStorage:              NewDataStorageClient(cfg),
+		Invitation:               NewInvitationClient(cfg),
 		Model:                    NewModelClient(cfg),
+		OIDCIdentity:             NewOIDCIdentityClient(cfg),
 		Project:                  NewProjectClient(cfg),
 		Prompt:                   NewPromptClient(cfg),
+		PromptProtectionRule:     NewPromptProtectionRuleClient(cfg),
 		ProviderQuotaStatus:      NewProviderQuotaStatusClient(cfg),
 		Request:                  NewRequestClient(cfg),
 		RequestExecution:         NewRequestExecutionClient(cfg),
@@ -301,10 +325,12 @@ func (c *Client) Close() error {
 // In order to add hooks to a specific client, call: `client.Node.Use(...)`.
 func (c *Client) Use(hooks ...Hook) {
 	for _, n := range []interface{ Use(...Hook) }{
-		c.APIKey, c.Channel, c.ChannelModelPrice, c.ChannelModelPriceVersion,
-		c.ChannelOverrideTemplate, c.ChannelProbe, c.DataStorage, c.Model, c.Project,
-		c.Prompt, c.ProviderQuotaStatus, c.Request, c.RequestExecution, c.Role,
-		c.System, c.Thread, c.Trace, c.UsageLog, c.User, c.UserProject, c.UserRole,
+		c.APIKey, c.APIKeyProfileTemplate, c.Channel, c.ChannelModelPrice,
+		c.ChannelModelPriceVersion, c.ChannelOverrideTemplate, c.ChannelProbe,
+		c.DataStorage, c.Invitation, c.Model, c.OIDCIdentity, c.Project, c.Prompt,
+		c.PromptProtectionRule, c.ProviderQuotaStatus, c.Request, c.RequestExecution,
+		c.Role, c.System, c.Thread, c.Trace, c.UsageLog, c.User, c.UserProject,
+		c.UserRole,
 	} {
 		n.Use(hooks...)
 	}
@@ -314,10 +340,12 @@ func (c *Client) Use(hooks ...Hook) {
 // In order to add interceptors to a specific client, call: `client.Node.Intercept(...)`.
 func (c *Client) Intercept(interceptors ...Interceptor) {
 	for _, n := range []interface{ Intercept(...Interceptor) }{
-		c.APIKey, c.Channel, c.ChannelModelPrice, c.ChannelModelPriceVersion,
-		c.ChannelOverrideTemplate, c.ChannelProbe, c.DataStorage, c.Model, c.Project,
-		c.Prompt, c.ProviderQuotaStatus, c.Request, c.RequestExecution, c.Role,
-		c.System, c.Thread, c.Trace, c.UsageLog, c.User, c.UserProject, c.UserRole,
+		c.APIKey, c.APIKeyProfileTemplate, c.Channel, c.ChannelModelPrice,
+		c.ChannelModelPriceVersion, c.ChannelOverrideTemplate, c.ChannelProbe,
+		c.DataStorage, c.Invitation, c.Model, c.OIDCIdentity, c.Project, c.Prompt,
+		c.PromptProtectionRule, c.ProviderQuotaStatus, c.Request, c.RequestExecution,
+		c.Role, c.System, c.Thread, c.Trace, c.UsageLog, c.User, c.UserProject,
+		c.UserRole,
 	} {
 		n.Intercept(interceptors...)
 	}
@@ -328,6 +356,8 @@ func (c *Client) Mutate(ctx context.Context, m Mutation) (Value, error) {
 	switch m := m.(type) {
 	case *APIKeyMutation:
 		return c.APIKey.mutate(ctx, m)
+	case *APIKeyProfileTemplateMutation:
+		return c.APIKeyProfileTemplate.mutate(ctx, m)
 	case *ChannelMutation:
 		return c.Channel.mutate(ctx, m)
 	case *ChannelModelPriceMutation:
@@ -340,12 +370,18 @@ func (c *Client) Mutate(ctx context.Context, m Mutation) (Value, error) {
 		return c.ChannelProbe.mutate(ctx, m)
 	case *DataStorageMutation:
 		return c.DataStorage.mutate(ctx, m)
+	case *InvitationMutation:
+		return c.Invitation.mutate(ctx, m)
 	case *ModelMutation:
 		return c.Model.mutate(ctx, m)
+	case *OIDCIdentityMutation:
+		return c.OIDCIdentity.mutate(ctx, m)
 	case *ProjectMutation:
 		return c.Project.mutate(ctx, m)
 	case *PromptMutation:
 		return c.Prompt.mutate(ctx, m)
+	case *PromptProtectionRuleMutation:
+		return c.PromptProtectionRule.mutate(ctx, m)
 	case *ProviderQuotaStatusMutation:
 		return c.ProviderQuotaStatus.mutate(ctx, m)
 	case *RequestMutation:
@@ -553,6 +589,157 @@ func (c *APIKeyClient) mutate(ctx context.Context, m *APIKeyMutation) (Value, er
 		return (&APIKeyDelete{config: c.config, hooks: c.Hooks(), mutation: m}).Exec(ctx)
 	default:
 		return nil, fmt.Errorf("ent: unknown APIKey mutation op: %q", m.Op())
+	}
+}
+
+// APIKeyProfileTemplateClient is a client for the APIKeyProfileTemplate schema.
+type APIKeyProfileTemplateClient struct {
+	config
+}
+
+// NewAPIKeyProfileTemplateClient returns a client for the APIKeyProfileTemplate from the given config.
+func NewAPIKeyProfileTemplateClient(c config) *APIKeyProfileTemplateClient {
+	return &APIKeyProfileTemplateClient{config: c}
+}
+
+// Use adds a list of mutation hooks to the hooks stack.
+// A call to `Use(f, g, h)` equals to `apikeyprofiletemplate.Hooks(f(g(h())))`.
+func (c *APIKeyProfileTemplateClient) Use(hooks ...Hook) {
+	c.hooks.APIKeyProfileTemplate = append(c.hooks.APIKeyProfileTemplate, hooks...)
+}
+
+// Intercept adds a list of query interceptors to the interceptors stack.
+// A call to `Intercept(f, g, h)` equals to `apikeyprofiletemplate.Intercept(f(g(h())))`.
+func (c *APIKeyProfileTemplateClient) Intercept(interceptors ...Interceptor) {
+	c.inters.APIKeyProfileTemplate = append(c.inters.APIKeyProfileTemplate, interceptors...)
+}
+
+// Create returns a builder for creating a APIKeyProfileTemplate entity.
+func (c *APIKeyProfileTemplateClient) Create() *APIKeyProfileTemplateCreate {
+	mutation := newAPIKeyProfileTemplateMutation(c.config, OpCreate)
+	return &APIKeyProfileTemplateCreate{config: c.config, hooks: c.Hooks(), mutation: mutation}
+}
+
+// CreateBulk returns a builder for creating a bulk of APIKeyProfileTemplate entities.
+func (c *APIKeyProfileTemplateClient) CreateBulk(builders ...*APIKeyProfileTemplateCreate) *APIKeyProfileTemplateCreateBulk {
+	return &APIKeyProfileTemplateCreateBulk{config: c.config, builders: builders}
+}
+
+// MapCreateBulk creates a bulk creation builder from the given slice. For each item in the slice, the function creates
+// a builder and applies setFunc on it.
+func (c *APIKeyProfileTemplateClient) MapCreateBulk(slice any, setFunc func(*APIKeyProfileTemplateCreate, int)) *APIKeyProfileTemplateCreateBulk {
+	rv := reflect.ValueOf(slice)
+	if rv.Kind() != reflect.Slice {
+		return &APIKeyProfileTemplateCreateBulk{err: fmt.Errorf("calling to APIKeyProfileTemplateClient.MapCreateBulk with wrong type %T, need slice", slice)}
+	}
+	builders := make([]*APIKeyProfileTemplateCreate, rv.Len())
+	for i := 0; i < rv.Len(); i++ {
+		builders[i] = c.Create()
+		setFunc(builders[i], i)
+	}
+	return &APIKeyProfileTemplateCreateBulk{config: c.config, builders: builders}
+}
+
+// Update returns an update builder for APIKeyProfileTemplate.
+func (c *APIKeyProfileTemplateClient) Update() *APIKeyProfileTemplateUpdate {
+	mutation := newAPIKeyProfileTemplateMutation(c.config, OpUpdate)
+	return &APIKeyProfileTemplateUpdate{config: c.config, hooks: c.Hooks(), mutation: mutation}
+}
+
+// UpdateOne returns an update builder for the given entity.
+func (c *APIKeyProfileTemplateClient) UpdateOne(_m *APIKeyProfileTemplate) *APIKeyProfileTemplateUpdateOne {
+	mutation := newAPIKeyProfileTemplateMutation(c.config, OpUpdateOne, withAPIKeyProfileTemplate(_m))
+	return &APIKeyProfileTemplateUpdateOne{config: c.config, hooks: c.Hooks(), mutation: mutation}
+}
+
+// UpdateOneID returns an update builder for the given id.
+func (c *APIKeyProfileTemplateClient) UpdateOneID(id int) *APIKeyProfileTemplateUpdateOne {
+	mutation := newAPIKeyProfileTemplateMutation(c.config, OpUpdateOne, withAPIKeyProfileTemplateID(id))
+	return &APIKeyProfileTemplateUpdateOne{config: c.config, hooks: c.Hooks(), mutation: mutation}
+}
+
+// Delete returns a delete builder for APIKeyProfileTemplate.
+func (c *APIKeyProfileTemplateClient) Delete() *APIKeyProfileTemplateDelete {
+	mutation := newAPIKeyProfileTemplateMutation(c.config, OpDelete)
+	return &APIKeyProfileTemplateDelete{config: c.config, hooks: c.Hooks(), mutation: mutation}
+}
+
+// DeleteOne returns a builder for deleting the given entity.
+func (c *APIKeyProfileTemplateClient) DeleteOne(_m *APIKeyProfileTemplate) *APIKeyProfileTemplateDeleteOne {
+	return c.DeleteOneID(_m.ID)
+}
+
+// DeleteOneID returns a builder for deleting the given entity by its id.
+func (c *APIKeyProfileTemplateClient) DeleteOneID(id int) *APIKeyProfileTemplateDeleteOne {
+	builder := c.Delete().Where(apikeyprofiletemplate.ID(id))
+	builder.mutation.id = &id
+	builder.mutation.op = OpDeleteOne
+	return &APIKeyProfileTemplateDeleteOne{builder}
+}
+
+// Query returns a query builder for APIKeyProfileTemplate.
+func (c *APIKeyProfileTemplateClient) Query() *APIKeyProfileTemplateQuery {
+	return &APIKeyProfileTemplateQuery{
+		config: c.config,
+		ctx:    &QueryContext{Type: TypeAPIKeyProfileTemplate},
+		inters: c.Interceptors(),
+	}
+}
+
+// Get returns a APIKeyProfileTemplate entity by its id.
+func (c *APIKeyProfileTemplateClient) Get(ctx context.Context, id int) (*APIKeyProfileTemplate, error) {
+	return c.Query().Where(apikeyprofiletemplate.ID(id)).Only(ctx)
+}
+
+// GetX is like Get, but panics if an error occurs.
+func (c *APIKeyProfileTemplateClient) GetX(ctx context.Context, id int) *APIKeyProfileTemplate {
+	obj, err := c.Get(ctx, id)
+	if err != nil {
+		panic(err)
+	}
+	return obj
+}
+
+// QueryProject queries the project edge of a APIKeyProfileTemplate.
+func (c *APIKeyProfileTemplateClient) QueryProject(_m *APIKeyProfileTemplate) *ProjectQuery {
+	query := (&ProjectClient{config: c.config}).Query()
+	query.path = func(context.Context) (fromV *sql.Selector, _ error) {
+		id := _m.ID
+		step := sqlgraph.NewStep(
+			sqlgraph.From(apikeyprofiletemplate.Table, apikeyprofiletemplate.FieldID, id),
+			sqlgraph.To(project.Table, project.FieldID),
+			sqlgraph.Edge(sqlgraph.M2O, true, apikeyprofiletemplate.ProjectTable, apikeyprofiletemplate.ProjectColumn),
+		)
+		fromV = sqlgraph.Neighbors(_m.driver.Dialect(), step)
+		return fromV, nil
+	}
+	return query
+}
+
+// Hooks returns the client hooks.
+func (c *APIKeyProfileTemplateClient) Hooks() []Hook {
+	hooks := c.hooks.APIKeyProfileTemplate
+	return append(hooks[:len(hooks):len(hooks)], apikeyprofiletemplate.Hooks[:]...)
+}
+
+// Interceptors returns the client interceptors.
+func (c *APIKeyProfileTemplateClient) Interceptors() []Interceptor {
+	inters := c.inters.APIKeyProfileTemplate
+	return append(inters[:len(inters):len(inters)], apikeyprofiletemplate.Interceptors[:]...)
+}
+
+func (c *APIKeyProfileTemplateClient) mutate(ctx context.Context, m *APIKeyProfileTemplateMutation) (Value, error) {
+	switch m.Op() {
+	case OpCreate:
+		return (&APIKeyProfileTemplateCreate{config: c.config, hooks: c.Hooks(), mutation: m}).Save(ctx)
+	case OpUpdate:
+		return (&APIKeyProfileTemplateUpdate{config: c.config, hooks: c.Hooks(), mutation: m}).Save(ctx)
+	case OpUpdateOne:
+		return (&APIKeyProfileTemplateUpdateOne{config: c.config, hooks: c.Hooks(), mutation: m}).Save(ctx)
+	case OpDelete, OpDeleteOne:
+		return (&APIKeyProfileTemplateDelete{config: c.config, hooks: c.Hooks(), mutation: m}).Exec(ctx)
+	default:
+		return nil, fmt.Errorf("ent: unknown APIKeyProfileTemplate mutation op: %q", m.Op())
 	}
 }
 
@@ -1571,6 +1758,157 @@ func (c *DataStorageClient) mutate(ctx context.Context, m *DataStorageMutation) 
 	}
 }
 
+// InvitationClient is a client for the Invitation schema.
+type InvitationClient struct {
+	config
+}
+
+// NewInvitationClient returns a client for the Invitation from the given config.
+func NewInvitationClient(c config) *InvitationClient {
+	return &InvitationClient{config: c}
+}
+
+// Use adds a list of mutation hooks to the hooks stack.
+// A call to `Use(f, g, h)` equals to `invitation.Hooks(f(g(h())))`.
+func (c *InvitationClient) Use(hooks ...Hook) {
+	c.hooks.Invitation = append(c.hooks.Invitation, hooks...)
+}
+
+// Intercept adds a list of query interceptors to the interceptors stack.
+// A call to `Intercept(f, g, h)` equals to `invitation.Intercept(f(g(h())))`.
+func (c *InvitationClient) Intercept(interceptors ...Interceptor) {
+	c.inters.Invitation = append(c.inters.Invitation, interceptors...)
+}
+
+// Create returns a builder for creating a Invitation entity.
+func (c *InvitationClient) Create() *InvitationCreate {
+	mutation := newInvitationMutation(c.config, OpCreate)
+	return &InvitationCreate{config: c.config, hooks: c.Hooks(), mutation: mutation}
+}
+
+// CreateBulk returns a builder for creating a bulk of Invitation entities.
+func (c *InvitationClient) CreateBulk(builders ...*InvitationCreate) *InvitationCreateBulk {
+	return &InvitationCreateBulk{config: c.config, builders: builders}
+}
+
+// MapCreateBulk creates a bulk creation builder from the given slice. For each item in the slice, the function creates
+// a builder and applies setFunc on it.
+func (c *InvitationClient) MapCreateBulk(slice any, setFunc func(*InvitationCreate, int)) *InvitationCreateBulk {
+	rv := reflect.ValueOf(slice)
+	if rv.Kind() != reflect.Slice {
+		return &InvitationCreateBulk{err: fmt.Errorf("calling to InvitationClient.MapCreateBulk with wrong type %T, need slice", slice)}
+	}
+	builders := make([]*InvitationCreate, rv.Len())
+	for i := 0; i < rv.Len(); i++ {
+		builders[i] = c.Create()
+		setFunc(builders[i], i)
+	}
+	return &InvitationCreateBulk{config: c.config, builders: builders}
+}
+
+// Update returns an update builder for Invitation.
+func (c *InvitationClient) Update() *InvitationUpdate {
+	mutation := newInvitationMutation(c.config, OpUpdate)
+	return &InvitationUpdate{config: c.config, hooks: c.Hooks(), mutation: mutation}
+}
+
+// UpdateOne returns an update builder for the given entity.
+func (c *InvitationClient) UpdateOne(_m *Invitation) *InvitationUpdateOne {
+	mutation := newInvitationMutation(c.config, OpUpdateOne, withInvitation(_m))
+	return &InvitationUpdateOne{config: c.config, hooks: c.Hooks(), mutation: mutation}
+}
+
+// UpdateOneID returns an update builder for the given id.
+func (c *InvitationClient) UpdateOneID(id int) *InvitationUpdateOne {
+	mutation := newInvitationMutation(c.config, OpUpdateOne, withInvitationID(id))
+	return &InvitationUpdateOne{config: c.config, hooks: c.Hooks(), mutation: mutation}
+}
+
+// Delete returns a delete builder for Invitation.
+func (c *InvitationClient) Delete() *InvitationDelete {
+	mutation := newInvitationMutation(c.config, OpDelete)
+	return &InvitationDelete{config: c.config, hooks: c.Hooks(), mutation: mutation}
+}
+
+// DeleteOne returns a builder for deleting the given entity.
+func (c *InvitationClient) DeleteOne(_m *Invitation) *InvitationDeleteOne {
+	return c.DeleteOneID(_m.ID)
+}
+
+// DeleteOneID returns a builder for deleting the given entity by its id.
+func (c *InvitationClient) DeleteOneID(id int) *InvitationDeleteOne {
+	builder := c.Delete().Where(invitation.ID(id))
+	builder.mutation.id = &id
+	builder.mutation.op = OpDeleteOne
+	return &InvitationDeleteOne{builder}
+}
+
+// Query returns a query builder for Invitation.
+func (c *InvitationClient) Query() *InvitationQuery {
+	return &InvitationQuery{
+		config: c.config,
+		ctx:    &QueryContext{Type: TypeInvitation},
+		inters: c.Interceptors(),
+	}
+}
+
+// Get returns a Invitation entity by its id.
+func (c *InvitationClient) Get(ctx context.Context, id int) (*Invitation, error) {
+	return c.Query().Where(invitation.ID(id)).Only(ctx)
+}
+
+// GetX is like Get, but panics if an error occurs.
+func (c *InvitationClient) GetX(ctx context.Context, id int) *Invitation {
+	obj, err := c.Get(ctx, id)
+	if err != nil {
+		panic(err)
+	}
+	return obj
+}
+
+// QueryProject queries the project edge of a Invitation.
+func (c *InvitationClient) QueryProject(_m *Invitation) *ProjectQuery {
+	query := (&ProjectClient{config: c.config}).Query()
+	query.path = func(context.Context) (fromV *sql.Selector, _ error) {
+		id := _m.ID
+		step := sqlgraph.NewStep(
+			sqlgraph.From(invitation.Table, invitation.FieldID, id),
+			sqlgraph.To(project.Table, project.FieldID),
+			sqlgraph.Edge(sqlgraph.M2O, true, invitation.ProjectTable, invitation.ProjectColumn),
+		)
+		fromV = sqlgraph.Neighbors(_m.driver.Dialect(), step)
+		return fromV, nil
+	}
+	return query
+}
+
+// Hooks returns the client hooks.
+func (c *InvitationClient) Hooks() []Hook {
+	hooks := c.hooks.Invitation
+	return append(hooks[:len(hooks):len(hooks)], invitation.Hooks[:]...)
+}
+
+// Interceptors returns the client interceptors.
+func (c *InvitationClient) Interceptors() []Interceptor {
+	inters := c.inters.Invitation
+	return append(inters[:len(inters):len(inters)], invitation.Interceptors[:]...)
+}
+
+func (c *InvitationClient) mutate(ctx context.Context, m *InvitationMutation) (Value, error) {
+	switch m.Op() {
+	case OpCreate:
+		return (&InvitationCreate{config: c.config, hooks: c.Hooks(), mutation: m}).Save(ctx)
+	case OpUpdate:
+		return (&InvitationUpdate{config: c.config, hooks: c.Hooks(), mutation: m}).Save(ctx)
+	case OpUpdateOne:
+		return (&InvitationUpdateOne{config: c.config, hooks: c.Hooks(), mutation: m}).Save(ctx)
+	case OpDelete, OpDeleteOne:
+		return (&InvitationDelete{config: c.config, hooks: c.Hooks(), mutation: m}).Exec(ctx)
+	default:
+		return nil, fmt.Errorf("ent: unknown Invitation mutation op: %q", m.Op())
+	}
+}
+
 // ModelClient is a client for the Model schema.
 type ModelClient struct {
 	config
@@ -1706,6 +2044,157 @@ func (c *ModelClient) mutate(ctx context.Context, m *ModelMutation) (Value, erro
 	}
 }
 
+// OIDCIdentityClient is a client for the OIDCIdentity schema.
+type OIDCIdentityClient struct {
+	config
+}
+
+// NewOIDCIdentityClient returns a client for the OIDCIdentity from the given config.
+func NewOIDCIdentityClient(c config) *OIDCIdentityClient {
+	return &OIDCIdentityClient{config: c}
+}
+
+// Use adds a list of mutation hooks to the hooks stack.
+// A call to `Use(f, g, h)` equals to `oidcidentity.Hooks(f(g(h())))`.
+func (c *OIDCIdentityClient) Use(hooks ...Hook) {
+	c.hooks.OIDCIdentity = append(c.hooks.OIDCIdentity, hooks...)
+}
+
+// Intercept adds a list of query interceptors to the interceptors stack.
+// A call to `Intercept(f, g, h)` equals to `oidcidentity.Intercept(f(g(h())))`.
+func (c *OIDCIdentityClient) Intercept(interceptors ...Interceptor) {
+	c.inters.OIDCIdentity = append(c.inters.OIDCIdentity, interceptors...)
+}
+
+// Create returns a builder for creating a OIDCIdentity entity.
+func (c *OIDCIdentityClient) Create() *OIDCIdentityCreate {
+	mutation := newOIDCIdentityMutation(c.config, OpCreate)
+	return &OIDCIdentityCreate{config: c.config, hooks: c.Hooks(), mutation: mutation}
+}
+
+// CreateBulk returns a builder for creating a bulk of OIDCIdentity entities.
+func (c *OIDCIdentityClient) CreateBulk(builders ...*OIDCIdentityCreate) *OIDCIdentityCreateBulk {
+	return &OIDCIdentityCreateBulk{config: c.config, builders: builders}
+}
+
+// MapCreateBulk creates a bulk creation builder from the given slice. For each item in the slice, the function creates
+// a builder and applies setFunc on it.
+func (c *OIDCIdentityClient) MapCreateBulk(slice any, setFunc func(*OIDCIdentityCreate, int)) *OIDCIdentityCreateBulk {
+	rv := reflect.ValueOf(slice)
+	if rv.Kind() != reflect.Slice {
+		return &OIDCIdentityCreateBulk{err: fmt.Errorf("calling to OIDCIdentityClient.MapCreateBulk with wrong type %T, need slice", slice)}
+	}
+	builders := make([]*OIDCIdentityCreate, rv.Len())
+	for i := 0; i < rv.Len(); i++ {
+		builders[i] = c.Create()
+		setFunc(builders[i], i)
+	}
+	return &OIDCIdentityCreateBulk{config: c.config, builders: builders}
+}
+
+// Update returns an update builder for OIDCIdentity.
+func (c *OIDCIdentityClient) Update() *OIDCIdentityUpdate {
+	mutation := newOIDCIdentityMutation(c.config, OpUpdate)
+	return &OIDCIdentityUpdate{config: c.config, hooks: c.Hooks(), mutation: mutation}
+}
+
+// UpdateOne returns an update builder for the given entity.
+func (c *OIDCIdentityClient) UpdateOne(_m *OIDCIdentity) *OIDCIdentityUpdateOne {
+	mutation := newOIDCIdentityMutation(c.config, OpUpdateOne, withOIDCIdentity(_m))
+	return &OIDCIdentityUpdateOne{config: c.config, hooks: c.Hooks(), mutation: mutation}
+}
+
+// UpdateOneID returns an update builder for the given id.
+func (c *OIDCIdentityClient) UpdateOneID(id int) *OIDCIdentityUpdateOne {
+	mutation := newOIDCIdentityMutation(c.config, OpUpdateOne, withOIDCIdentityID(id))
+	return &OIDCIdentityUpdateOne{config: c.config, hooks: c.Hooks(), mutation: mutation}
+}
+
+// Delete returns a delete builder for OIDCIdentity.
+func (c *OIDCIdentityClient) Delete() *OIDCIdentityDelete {
+	mutation := newOIDCIdentityMutation(c.config, OpDelete)
+	return &OIDCIdentityDelete{config: c.config, hooks: c.Hooks(), mutation: mutation}
+}
+
+// DeleteOne returns a builder for deleting the given entity.
+func (c *OIDCIdentityClient) DeleteOne(_m *OIDCIdentity) *OIDCIdentityDeleteOne {
+	return c.DeleteOneID(_m.ID)
+}
+
+// DeleteOneID returns a builder for deleting the given entity by its id.
+func (c *OIDCIdentityClient) DeleteOneID(id int) *OIDCIdentityDeleteOne {
+	builder := c.Delete().Where(oidcidentity.ID(id))
+	builder.mutation.id = &id
+	builder.mutation.op = OpDeleteOne
+	return &OIDCIdentityDeleteOne{builder}
+}
+
+// Query returns a query builder for OIDCIdentity.
+func (c *OIDCIdentityClient) Query() *OIDCIdentityQuery {
+	return &OIDCIdentityQuery{
+		config: c.config,
+		ctx:    &QueryContext{Type: TypeOIDCIdentity},
+		inters: c.Interceptors(),
+	}
+}
+
+// Get returns a OIDCIdentity entity by its id.
+func (c *OIDCIdentityClient) Get(ctx context.Context, id int) (*OIDCIdentity, error) {
+	return c.Query().Where(oidcidentity.ID(id)).Only(ctx)
+}
+
+// GetX is like Get, but panics if an error occurs.
+func (c *OIDCIdentityClient) GetX(ctx context.Context, id int) *OIDCIdentity {
+	obj, err := c.Get(ctx, id)
+	if err != nil {
+		panic(err)
+	}
+	return obj
+}
+
+// QueryUser queries the user edge of a OIDCIdentity.
+func (c *OIDCIdentityClient) QueryUser(_m *OIDCIdentity) *UserQuery {
+	query := (&UserClient{config: c.config}).Query()
+	query.path = func(context.Context) (fromV *sql.Selector, _ error) {
+		id := _m.ID
+		step := sqlgraph.NewStep(
+			sqlgraph.From(oidcidentity.Table, oidcidentity.FieldID, id),
+			sqlgraph.To(user.Table, user.FieldID),
+			sqlgraph.Edge(sqlgraph.M2O, false, oidcidentity.UserTable, oidcidentity.UserColumn),
+		)
+		fromV = sqlgraph.Neighbors(_m.driver.Dialect(), step)
+		return fromV, nil
+	}
+	return query
+}
+
+// Hooks returns the client hooks.
+func (c *OIDCIdentityClient) Hooks() []Hook {
+	hooks := c.hooks.OIDCIdentity
+	return append(hooks[:len(hooks):len(hooks)], oidcidentity.Hooks[:]...)
+}
+
+// Interceptors returns the client interceptors.
+func (c *OIDCIdentityClient) Interceptors() []Interceptor {
+	inters := c.inters.OIDCIdentity
+	return append(inters[:len(inters):len(inters)], oidcidentity.Interceptors[:]...)
+}
+
+func (c *OIDCIdentityClient) mutate(ctx context.Context, m *OIDCIdentityMutation) (Value, error) {
+	switch m.Op() {
+	case OpCreate:
+		return (&OIDCIdentityCreate{config: c.config, hooks: c.Hooks(), mutation: m}).Save(ctx)
+	case OpUpdate:
+		return (&OIDCIdentityUpdate{config: c.config, hooks: c.Hooks(), mutation: m}).Save(ctx)
+	case OpUpdateOne:
+		return (&OIDCIdentityUpdateOne{config: c.config, hooks: c.Hooks(), mutation: m}).Save(ctx)
+	case OpDelete, OpDeleteOne:
+		return (&OIDCIdentityDelete{config: c.config, hooks: c.Hooks(), mutation: m}).Exec(ctx)
+	default:
+		return nil, fmt.Errorf("ent: unknown OIDCIdentity mutation op: %q", m.Op())
+	}
+}
+
 // ProjectClient is a client for the Project schema.
 type ProjectClient struct {
 	config
@@ -1830,6 +2319,22 @@ func (c *ProjectClient) QueryUsers(_m *Project) *UserQuery {
 	return query
 }
 
+// QueryInvitations queries the invitations edge of a Project.
+func (c *ProjectClient) QueryInvitations(_m *Project) *InvitationQuery {
+	query := (&InvitationClient{config: c.config}).Query()
+	query.path = func(context.Context) (fromV *sql.Selector, _ error) {
+		id := _m.ID
+		step := sqlgraph.NewStep(
+			sqlgraph.From(project.Table, project.FieldID, id),
+			sqlgraph.To(invitation.Table, invitation.FieldID),
+			sqlgraph.Edge(sqlgraph.O2M, false, project.InvitationsTable, project.InvitationsColumn),
+		)
+		fromV = sqlgraph.Neighbors(_m.driver.Dialect(), step)
+		return fromV, nil
+	}
+	return query
+}
+
 // QueryRoles queries the roles edge of a Project.
 func (c *ProjectClient) QueryRoles(_m *Project) *RoleQuery {
 	query := (&RoleClient{config: c.config}).Query()
@@ -1934,7 +2439,23 @@ func (c *ProjectClient) QueryPrompts(_m *Project) *PromptQuery {
 		step := sqlgraph.NewStep(
 			sqlgraph.From(project.Table, project.FieldID, id),
 			sqlgraph.To(prompt.Table, prompt.FieldID),
-			sqlgraph.Edge(sqlgraph.M2M, false, project.PromptsTable, project.PromptsPrimaryKey...),
+			sqlgraph.Edge(sqlgraph.O2M, false, project.PromptsTable, project.PromptsColumn),
+		)
+		fromV = sqlgraph.Neighbors(_m.driver.Dialect(), step)
+		return fromV, nil
+	}
+	return query
+}
+
+// QueryAPIKeyProfileTemplates queries the api_key_profile_templates edge of a Project.
+func (c *ProjectClient) QueryAPIKeyProfileTemplates(_m *Project) *APIKeyProfileTemplateQuery {
+	query := (&APIKeyProfileTemplateClient{config: c.config}).Query()
+	query.path = func(context.Context) (fromV *sql.Selector, _ error) {
+		id := _m.ID
+		step := sqlgraph.NewStep(
+			sqlgraph.From(project.Table, project.FieldID, id),
+			sqlgraph.To(apikeyprofiletemplate.Table, apikeyprofiletemplate.FieldID),
+			sqlgraph.Edge(sqlgraph.O2M, false, project.APIKeyProfileTemplatesTable, project.APIKeyProfileTemplatesColumn),
 		)
 		fromV = sqlgraph.Neighbors(_m.driver.Dialect(), step)
 		return fromV, nil
@@ -2093,15 +2614,15 @@ func (c *PromptClient) GetX(ctx context.Context, id int) *Prompt {
 	return obj
 }
 
-// QueryProjects queries the projects edge of a Prompt.
-func (c *PromptClient) QueryProjects(_m *Prompt) *ProjectQuery {
+// QueryProject queries the project edge of a Prompt.
+func (c *PromptClient) QueryProject(_m *Prompt) *ProjectQuery {
 	query := (&ProjectClient{config: c.config}).Query()
 	query.path = func(context.Context) (fromV *sql.Selector, _ error) {
 		id := _m.ID
 		step := sqlgraph.NewStep(
 			sqlgraph.From(prompt.Table, prompt.FieldID, id),
 			sqlgraph.To(project.Table, project.FieldID),
-			sqlgraph.Edge(sqlgraph.M2M, true, prompt.ProjectsTable, prompt.ProjectsPrimaryKey...),
+			sqlgraph.Edge(sqlgraph.M2O, true, prompt.ProjectTable, prompt.ProjectColumn),
 		)
 		fromV = sqlgraph.Neighbors(_m.driver.Dialect(), step)
 		return fromV, nil
@@ -2133,6 +2654,141 @@ func (c *PromptClient) mutate(ctx context.Context, m *PromptMutation) (Value, er
 		return (&PromptDelete{config: c.config, hooks: c.Hooks(), mutation: m}).Exec(ctx)
 	default:
 		return nil, fmt.Errorf("ent: unknown Prompt mutation op: %q", m.Op())
+	}
+}
+
+// PromptProtectionRuleClient is a client for the PromptProtectionRule schema.
+type PromptProtectionRuleClient struct {
+	config
+}
+
+// NewPromptProtectionRuleClient returns a client for the PromptProtectionRule from the given config.
+func NewPromptProtectionRuleClient(c config) *PromptProtectionRuleClient {
+	return &PromptProtectionRuleClient{config: c}
+}
+
+// Use adds a list of mutation hooks to the hooks stack.
+// A call to `Use(f, g, h)` equals to `promptprotectionrule.Hooks(f(g(h())))`.
+func (c *PromptProtectionRuleClient) Use(hooks ...Hook) {
+	c.hooks.PromptProtectionRule = append(c.hooks.PromptProtectionRule, hooks...)
+}
+
+// Intercept adds a list of query interceptors to the interceptors stack.
+// A call to `Intercept(f, g, h)` equals to `promptprotectionrule.Intercept(f(g(h())))`.
+func (c *PromptProtectionRuleClient) Intercept(interceptors ...Interceptor) {
+	c.inters.PromptProtectionRule = append(c.inters.PromptProtectionRule, interceptors...)
+}
+
+// Create returns a builder for creating a PromptProtectionRule entity.
+func (c *PromptProtectionRuleClient) Create() *PromptProtectionRuleCreate {
+	mutation := newPromptProtectionRuleMutation(c.config, OpCreate)
+	return &PromptProtectionRuleCreate{config: c.config, hooks: c.Hooks(), mutation: mutation}
+}
+
+// CreateBulk returns a builder for creating a bulk of PromptProtectionRule entities.
+func (c *PromptProtectionRuleClient) CreateBulk(builders ...*PromptProtectionRuleCreate) *PromptProtectionRuleCreateBulk {
+	return &PromptProtectionRuleCreateBulk{config: c.config, builders: builders}
+}
+
+// MapCreateBulk creates a bulk creation builder from the given slice. For each item in the slice, the function creates
+// a builder and applies setFunc on it.
+func (c *PromptProtectionRuleClient) MapCreateBulk(slice any, setFunc func(*PromptProtectionRuleCreate, int)) *PromptProtectionRuleCreateBulk {
+	rv := reflect.ValueOf(slice)
+	if rv.Kind() != reflect.Slice {
+		return &PromptProtectionRuleCreateBulk{err: fmt.Errorf("calling to PromptProtectionRuleClient.MapCreateBulk with wrong type %T, need slice", slice)}
+	}
+	builders := make([]*PromptProtectionRuleCreate, rv.Len())
+	for i := 0; i < rv.Len(); i++ {
+		builders[i] = c.Create()
+		setFunc(builders[i], i)
+	}
+	return &PromptProtectionRuleCreateBulk{config: c.config, builders: builders}
+}
+
+// Update returns an update builder for PromptProtectionRule.
+func (c *PromptProtectionRuleClient) Update() *PromptProtectionRuleUpdate {
+	mutation := newPromptProtectionRuleMutation(c.config, OpUpdate)
+	return &PromptProtectionRuleUpdate{config: c.config, hooks: c.Hooks(), mutation: mutation}
+}
+
+// UpdateOne returns an update builder for the given entity.
+func (c *PromptProtectionRuleClient) UpdateOne(_m *PromptProtectionRule) *PromptProtectionRuleUpdateOne {
+	mutation := newPromptProtectionRuleMutation(c.config, OpUpdateOne, withPromptProtectionRule(_m))
+	return &PromptProtectionRuleUpdateOne{config: c.config, hooks: c.Hooks(), mutation: mutation}
+}
+
+// UpdateOneID returns an update builder for the given id.
+func (c *PromptProtectionRuleClient) UpdateOneID(id int) *PromptProtectionRuleUpdateOne {
+	mutation := newPromptProtectionRuleMutation(c.config, OpUpdateOne, withPromptProtectionRuleID(id))
+	return &PromptProtectionRuleUpdateOne{config: c.config, hooks: c.Hooks(), mutation: mutation}
+}
+
+// Delete returns a delete builder for PromptProtectionRule.
+func (c *PromptProtectionRuleClient) Delete() *PromptProtectionRuleDelete {
+	mutation := newPromptProtectionRuleMutation(c.config, OpDelete)
+	return &PromptProtectionRuleDelete{config: c.config, hooks: c.Hooks(), mutation: mutation}
+}
+
+// DeleteOne returns a builder for deleting the given entity.
+func (c *PromptProtectionRuleClient) DeleteOne(_m *PromptProtectionRule) *PromptProtectionRuleDeleteOne {
+	return c.DeleteOneID(_m.ID)
+}
+
+// DeleteOneID returns a builder for deleting the given entity by its id.
+func (c *PromptProtectionRuleClient) DeleteOneID(id int) *PromptProtectionRuleDeleteOne {
+	builder := c.Delete().Where(promptprotectionrule.ID(id))
+	builder.mutation.id = &id
+	builder.mutation.op = OpDeleteOne
+	return &PromptProtectionRuleDeleteOne{builder}
+}
+
+// Query returns a query builder for PromptProtectionRule.
+func (c *PromptProtectionRuleClient) Query() *PromptProtectionRuleQuery {
+	return &PromptProtectionRuleQuery{
+		config: c.config,
+		ctx:    &QueryContext{Type: TypePromptProtectionRule},
+		inters: c.Interceptors(),
+	}
+}
+
+// Get returns a PromptProtectionRule entity by its id.
+func (c *PromptProtectionRuleClient) Get(ctx context.Context, id int) (*PromptProtectionRule, error) {
+	return c.Query().Where(promptprotectionrule.ID(id)).Only(ctx)
+}
+
+// GetX is like Get, but panics if an error occurs.
+func (c *PromptProtectionRuleClient) GetX(ctx context.Context, id int) *PromptProtectionRule {
+	obj, err := c.Get(ctx, id)
+	if err != nil {
+		panic(err)
+	}
+	return obj
+}
+
+// Hooks returns the client hooks.
+func (c *PromptProtectionRuleClient) Hooks() []Hook {
+	hooks := c.hooks.PromptProtectionRule
+	return append(hooks[:len(hooks):len(hooks)], promptprotectionrule.Hooks[:]...)
+}
+
+// Interceptors returns the client interceptors.
+func (c *PromptProtectionRuleClient) Interceptors() []Interceptor {
+	inters := c.inters.PromptProtectionRule
+	return append(inters[:len(inters):len(inters)], promptprotectionrule.Interceptors[:]...)
+}
+
+func (c *PromptProtectionRuleClient) mutate(ctx context.Context, m *PromptProtectionRuleMutation) (Value, error) {
+	switch m.Op() {
+	case OpCreate:
+		return (&PromptProtectionRuleCreate{config: c.config, hooks: c.Hooks(), mutation: m}).Save(ctx)
+	case OpUpdate:
+		return (&PromptProtectionRuleUpdate{config: c.config, hooks: c.Hooks(), mutation: m}).Save(ctx)
+	case OpUpdateOne:
+		return (&PromptProtectionRuleUpdateOne{config: c.config, hooks: c.Hooks(), mutation: m}).Save(ctx)
+	case OpDelete, OpDeleteOne:
+		return (&PromptProtectionRuleDelete{config: c.config, hooks: c.Hooks(), mutation: m}).Exec(ctx)
+	default:
+		return nil, fmt.Errorf("ent: unknown PromptProtectionRule mutation op: %q", m.Op())
 	}
 }
 
@@ -3734,6 +4390,22 @@ func (c *UserClient) QueryChannelOverrideTemplates(_m *User) *ChannelOverrideTem
 	return query
 }
 
+// QueryOidcIdentities queries the oidc_identities edge of a User.
+func (c *UserClient) QueryOidcIdentities(_m *User) *OIDCIdentityQuery {
+	query := (&OIDCIdentityClient{config: c.config}).Query()
+	query.path = func(context.Context) (fromV *sql.Selector, _ error) {
+		id := _m.ID
+		step := sqlgraph.NewStep(
+			sqlgraph.From(user.Table, user.FieldID, id),
+			sqlgraph.To(oidcidentity.Table, oidcidentity.FieldID),
+			sqlgraph.Edge(sqlgraph.O2M, true, user.OidcIdentitiesTable, user.OidcIdentitiesColumn),
+		)
+		fromV = sqlgraph.Neighbors(_m.driver.Dialect(), step)
+		return fromV, nil
+	}
+	return query
+}
+
 // QueryProjectUsers queries the project_users edge of a User.
 func (c *UserClient) QueryProjectUsers(_m *User) *UserProjectQuery {
 	query := (&UserProjectClient{config: c.config}).Query()
@@ -4127,14 +4799,16 @@ func (c *UserRoleClient) mutate(ctx context.Context, m *UserRoleMutation) (Value
 // hooks and interceptors per client, for fast access.
 type (
 	hooks struct {
-		APIKey, Channel, ChannelModelPrice, ChannelModelPriceVersion,
-		ChannelOverrideTemplate, ChannelProbe, DataStorage, Model, Project, Prompt,
+		APIKey, APIKeyProfileTemplate, Channel, ChannelModelPrice,
+		ChannelModelPriceVersion, ChannelOverrideTemplate, ChannelProbe, DataStorage,
+		Invitation, Model, OIDCIdentity, Project, Prompt, PromptProtectionRule,
 		ProviderQuotaStatus, Request, RequestExecution, Role, System, Thread, Trace,
 		UsageLog, User, UserProject, UserRole []ent.Hook
 	}
 	inters struct {
-		APIKey, Channel, ChannelModelPrice, ChannelModelPriceVersion,
-		ChannelOverrideTemplate, ChannelProbe, DataStorage, Model, Project, Prompt,
+		APIKey, APIKeyProfileTemplate, Channel, ChannelModelPrice,
+		ChannelModelPriceVersion, ChannelOverrideTemplate, ChannelProbe, DataStorage,
+		Invitation, Model, OIDCIdentity, Project, Prompt, PromptProtectionRule,
 		ProviderQuotaStatus, Request, RequestExecution, Role, System, Thread, Trace,
 		UsageLog, User, UserProject, UserRole []ent.Interceptor
 	}

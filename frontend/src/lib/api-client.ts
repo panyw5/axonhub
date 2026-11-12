@@ -1,9 +1,8 @@
-import { AuthUser, getTokenFromStorage } from '@/stores/authStore';
+import { ensureFreshAccessToken } from '@/lib/auth-session';
+import type { AuthUser } from '@/stores/authStore';
 
 // Same domain, no need to add baseURL.
 export const API_BASE_URL = '';
-
-type JsonValue = string | number | boolean | null | JsonValue[] | { [key: string]: JsonValue };
 
 type ErrorResponseBody = {
   message?: string;
@@ -33,7 +32,7 @@ const isErrorResponseBody = (value: unknown): value is ErrorResponseBody => {
 interface ApiRequestOptions {
   method?: 'GET' | 'POST' | 'PUT' | 'DELETE' | 'PATCH';
   headers?: Record<string, string>;
-  body?: JsonValue;
+  body?: any;
   requireAuth?: boolean;
 }
 
@@ -60,7 +59,7 @@ export async function apiRequest<T>(endpoint: string, options: ApiRequestOptions
 
   // Add Authorization header if auth is required
   if (requireAuth) {
-    const token = getTokenFromStorage();
+    const token = await ensureFreshAccessToken();
     if (token) {
       requestHeaders['Authorization'] = `Bearer ${token}`;
     }
@@ -125,6 +124,7 @@ export const systemApi = {
     ownerFirstName: string;
     ownerLastName: string;
     brandName: string;
+    preferLanguage?: string;
   }): Promise<{ success: boolean; message: string }> =>
     apiRequest('/admin/system/initialize', {
       method: 'POST',
@@ -145,30 +145,53 @@ export const authApi = {
       method: 'POST',
       body: data,
     }),
-};
 
-// Rerank API endpoints
-export const rerankApi = {
-  rerank: (data: {
-    model: string;
-    query: string;
-    documents: string[];
-    top_n?: number;
-  }): Promise<{
-    results: Array<{
-      index: number;
-      relevance_score: number;
-      document?: string;
-    }>;
-    usage?: {
-      prompt_tokens: number;
-      completion_tokens: number;
-      total_tokens: number;
-    };
-  }> =>
-    apiRequest('/v1/rerank', {
+  getInvitation: (token: string): Promise<{
+    projectName: string;
+    expiresAt: string | null;
+    maxUses: number;
+    remainingUses: number;
+  }> => apiRequest(`/auth/invitations/${encodeURIComponent(token)}`),
+
+  registerInvitation: (
+    token: string,
+    data: { email: string; password: string; firstName: string; lastName: string }
+  ): Promise<{ user: AuthUser; token: string }> =>
+    apiRequest(`/auth/invitations/${encodeURIComponent(token)}/register`, {
       method: 'POST',
       body: data,
-      requireAuth: true,
+    }),
+
+  getOIDCProviders: (): Promise<{
+    data: {
+      id: string;
+      name: string;
+      display_name: string;
+      jit_enabled: boolean;
+      icon_url: string;
+      button_color: string;
+      active?: boolean;
+      oidc_login_only: boolean;
+      is_linked: boolean;
+      linked_identity_id?: string;
+      linked_email?: string;
+    }[];
+  }> => apiRequest('/oauth/oidc/providers', { requireAuth: true }),
+
+  getOIDCAuthorizeURL: (provider: string): Promise<{ data: { url: string; state: string } }> =>
+    apiRequest(`/oauth/oidc/authorize/${provider}`),
+
+  getOIDCLinkAuthorizeURL: (provider: string): Promise<{ data: { url: string; state: string } }> =>
+    apiRequest(`/admin/oidc/link/${provider}`, { requireAuth: true }),
+
+  exchangeOIDCCode: (code: string): Promise<{
+    data: {
+      user: AuthUser;
+      token: string;
+    }
+  }> =>
+    apiRequest('/oauth/oidc/exchange', {
+      method: 'POST',
+      body: { code },
     }),
 };

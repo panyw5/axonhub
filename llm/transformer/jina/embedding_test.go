@@ -439,9 +439,9 @@ func TestOutboundTransformer_TransformResponse_Embedding(t *testing.T) {
 		require.NotNil(t, llmResp)
 		require.Equal(t, "list", llmResp.Embedding.Object)
 		require.Equal(t, "jina-embeddings-v3", llmResp.Model)
-		require.NotNil(t, llmResp.Embedding.Usage)
-		require.Equal(t, int64(5), llmResp.Embedding.Usage.PromptTokens)
-		require.Equal(t, int64(5), llmResp.Embedding.Usage.TotalTokens)
+		require.NotNil(t, llmResp.Usage)
+		require.Equal(t, int64(5), llmResp.Usage.PromptTokens)
+		require.Equal(t, int64(5), llmResp.Usage.TotalTokens)
 	})
 
 	t.Run("embedding response nil http response", func(t *testing.T) {
@@ -508,10 +508,10 @@ func TestEmbeddingInboundTransformer_TransformResponse(t *testing.T) {
 						Index:     0,
 					},
 				},
-				Usage: &llm.EmbeddingUsage{
-					PromptTokens: 5,
-					TotalTokens:  5,
-				},
+			},
+			Usage: &llm.Usage{
+				PromptTokens: 5,
+				TotalTokens:  5,
 			},
 		}
 
@@ -538,9 +538,6 @@ func TestEmbeddingInboundTransformer_TransformResponse(t *testing.T) {
 }
 
 func TestEmbeddingTransformers_APIFormat(t *testing.T) {
-	inbound := NewEmbeddingInboundTransformer()
-	require.Equal(t, llm.APIFormatJinaEmbedding, inbound.APIFormat())
-
 	config := &Config{
 		BaseURL:        "https://api.jina.ai/v1",
 		APIKeyProvider: auth.NewStaticKeyProvider("test-key"),
@@ -597,13 +594,13 @@ func TestOutboundTransformer_StreamNotSupported_Embedding(t *testing.T) {
 	require.NoError(t, err)
 
 	t.Run("transform stream returns error", func(t *testing.T) {
-		_, err := transformer.TransformStream(context.Background(), nil)
+		_, err := transformer.TransformStream(context.Background(), nil, nil)
 		require.Error(t, err)
 		require.Contains(t, err.Error(), "does not support streaming")
 	})
 
 	t.Run("aggregate stream chunks returns error", func(t *testing.T) {
-		_, _, err := transformer.AggregateStreamChunks(context.Background(), nil)
+		_, _, err := transformer.AggregateStreamChunks(context.Background(), nil, nil)
 		require.Error(t, err)
 		require.Contains(t, err.Error(), "does not support streaming")
 	})

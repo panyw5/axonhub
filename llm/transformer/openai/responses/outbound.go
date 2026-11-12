@@ -4,32 +4,58 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"net/http"
+	"reflect"
 	"strings"
+	"sync"
 
 	"github.com/samber/lo"
 
-	"github.com/looplj/axonhub/internal/pkg/xmap"
 	"github.com/looplj/axonhub/llm"
 	"github.com/looplj/axonhub/llm/auth"
 	"github.com/looplj/axonhub/llm/httpclient"
+	"github.com/looplj/axonhub/llm/internal/pkg/xmap"
+	"github.com/looplj/axonhub/llm/pipeline"
 	"github.com/looplj/axonhub/llm/transformer"
 	"github.com/looplj/axonhub/llm/transformer/shared"
 )
 
-var _ transformer.Outbound = (*OutboundTransformer)(nil)
+var (
+	_ transformer.Outbound                  = (*OutboundTransformer)(nil)
+	_ transformer.TransportRequestFinalizer = (*OutboundTransformer)(nil)
+	_ pipeline.ChannelCustomizedExecutor    = (*OutboundTransformer)(nil)
+)
 
 // Config holds all configuration for the OpenAI Responses outbound transformer.
+const (
+	TransportHTTP      = "http"
+	TransportWebSocket = "websocket"
+	// ResponsesLiteHeader is the Codex Responses Lite signal. It uses the
+	// canonical spelling ("Openai"): http.Header canonicalizes keys, so lookups
+	// match whatever case a Codex client sends.
+	ResponsesLiteHeader = "X-Openai-Internal-Codex-Responses-Lite"
+)
+
 type Config struct {
 	// BaseURL is the base URL for the OpenAI API, required.
 	BaseURL string `json:"base_url,omitempty"`
 
 	// RawURL is whether to use raw URL for requests, default is false.
-	// If true, the base URL will be used as is, without appending the version.
+	// If true, the request URL will be used as is, without appending the response endpoint.
 	RawURL bool `json:"raw_url,omitempty"`
+
+	// EndpointPath is an optional custom path override for this endpoint.
+	// When set, it replaces the default API path (e.g., "/responses").
+	// Must start with "/". Skips default version normalization when set.
+	EndpointPath string `json:"endpoint_path,omitempty"`
 
 	// APIKeyProvider provides API keys for authentication, required.
 	APIKeyProvider auth.APIKeyProvider `json:"-"`
+
+	// Transport selects the upstream transport for Responses API requests.
+	// Empty and "http" use the existing HTTP/SSE transport; "websocket" uses Responses WebSocket mode.
+	Transport string `json:"transport,omitempty"`
 }
 
 func NewOutboundTransformer(baseURL, apiKey string) (*OutboundTransformer, error) {
@@ -54,19 +80,89 @@ func NewOutboundTransformerWithConfig(config *Config) (*OutboundTransformer, err
 		return nil, fmt.Errorf("API key provider is required")
 	}
 
-	if strings.HasSuffix(config.BaseURL, "#") {
+	if strings.HasSuffix(config.BaseURL, "##") {
 		config.RawURL = true
+		config.BaseURL = strings.TrimSuffix(config.BaseURL, "##")
+	} else {
+		if config.EndpointPath != "" {
+			config.BaseURL = transformer.NormalizeBaseURL(config.BaseURL, "")
+		} else {
+			config.BaseURL = transformer.NormalizeBaseURL(config.BaseURL, "v1")
+		}
 	}
-
-	config.BaseURL = transformer.NormalizeBaseURL(config.BaseURL, "v1")
 
 	return &OutboundTransformer{
 		config: config,
 	}, nil
 }
 
+func (t *OutboundTransformer) CustomizeExecutor(executor pipeline.Executor) pipeline.Executor {
+	if t == nil || t.config == nil {
+		return executor
+	}
+	if t.config.Transport != TransportWebSocket {
+		return &httpTransportExecutor{inner: executor, finalize: t.FinalizeTransportRequest}
+	}
+
+	if !ExecutorComparable(executor) {
+		return NewWebSocketExecutor(executor)
+	}
+
+	t.executorMu.Lock()
+	defer t.executorMu.Unlock()
+
+	if t.webSocketExecutors == nil {
+		t.webSocketExecutors = make(map[pipeline.Executor]*WebSocketExecutor)
+	}
+	if cached, ok := t.webSocketExecutors[executor]; ok {
+		return cached
+	}
+
+	webSocketExecutor := NewWebSocketExecutor(executor)
+	t.webSocketExecutors[executor] = webSocketExecutor
+
+	return webSocketExecutor
+}
+
+func (t *OutboundTransformer) FinalizeTransportRequest(request *httpclient.Request) *httpclient.Request {
+	if t == nil || t.config == nil || t.config.Transport == TransportWebSocket {
+		return request
+	}
+
+	return PrepareHTTPTransportRequest(request, false)
+}
+
+func (t *OutboundTransformer) Stop() {
+	if t == nil {
+		return
+	}
+
+	t.executorMu.Lock()
+	executors := make([]*WebSocketExecutor, 0, len(t.webSocketExecutors))
+	for _, executor := range t.webSocketExecutors {
+		executors = append(executors, executor)
+	}
+	t.webSocketExecutors = nil
+	t.executorMu.Unlock()
+
+	for _, executor := range executors {
+		_ = executor.Close()
+	}
+}
+
+func ExecutorComparable(executor pipeline.Executor) bool {
+	if executor == nil {
+		return true
+	}
+
+	return reflect.TypeOf(executor).Comparable()
+}
+
 type OutboundTransformer struct {
 	config *Config
+
+	executorMu         sync.Mutex
+	webSocketExecutors map[pipeline.Executor]*WebSocketExecutor
 }
 
 func (t *OutboundTransformer) APIFormat() llm.APIFormat {
@@ -113,8 +209,20 @@ func (t *OutboundTransformer) TransformRequest(ctx context.Context, llmReq *llm.
 		return nil, fmt.Errorf("chat request is nil")
 	}
 
+	originalRequestType := llmReq.RequestType
+	isImageRequest := originalRequestType == llm.RequestTypeImage
+
 	//nolint:exhaustive // Checked.
 	switch llmReq.RequestType {
+	case llm.RequestTypeCompact:
+		return t.transformCompactRequest(ctx, llmReq)
+	case llm.RequestTypeImage:
+		imageReq, err := buildImageToolRequest(llmReq)
+		if err != nil {
+			return nil, err
+		}
+
+		llmReq = imageReq
 	case llm.RequestTypeChat, "":
 		// continue
 	default:
@@ -126,18 +234,39 @@ func (t *OutboundTransformer) TransformRequest(ctx context.Context, llmReq *llm.
 		llmReq.TransformerMetadata = map[string]any{}
 	}
 
+	apiKey := t.config.APIKeyProvider.Get(ctx)
+
 	var tools []Tool
+	namespaceIndexes := make(map[string]int)
 	// Convert tools to Responses API format
 	for _, item := range llmReq.Tools {
 		switch item.Type {
 		case llm.ToolTypeImageGeneration:
 			tool := convertImageGenerationToTool(item)
+			if action := xmap.GetStringPtr(llmReq.TransformerMetadata, "image_generation_action"); action != nil {
+				tool.Action = *action
+			}
 			tools = append(tools, tool)
 			// Store image output format in TransformerMetadata
 			llmReq.TransformerMetadata["image_output_format"] = tool.OutputFormat
+		case llm.ToolTypeWebSearch, llm.ToolTypeGoogleSearch:
+			tool := convertWebSearchToTool(item)
+			tools = append(tools, tool)
+		case llm.ToolTypeResponsesCustomTool:
+			tool := convertCustomToTool(item)
+			tools = append(tools, tool)
 		case "function":
 			tool := convertFunctionToTool(item)
-			tools = append(tools, tool)
+			if namespace := item.Function.Namespace; namespace != "" {
+				if index, ok := namespaceIndexes[namespace]; ok {
+					tools[index].Tools = append(tools[index].Tools, tool)
+				} else {
+					namespaceIndexes[namespace] = len(tools)
+					tools = append(tools, Tool{Type: "namespace", Name: namespace, Tools: []Tool{tool}})
+				}
+			} else {
+				tools = append(tools, tool)
+			}
 		default:
 			// Skip unsupported tool types
 			continue
@@ -164,14 +293,31 @@ func (t *OutboundTransformer) TransformRequest(ctx context.Context, llmReq *llm.
 		StreamOptions:        convertStreamOptions(llmReq.StreamOptions, llmReq.TransformerMetadata),
 		Reasoning:            convertReasoning(llmReq),
 		PromptCacheKey:       llmReq.PromptCacheKey,
+		PreviousResponseID:   llmReq.PreviousResponseID,
 		Include:              xmap.GetStringSlice(llmReq.TransformerMetadata, "include"),
 		MaxToolCalls:         xmap.GetInt64Ptr(llmReq.TransformerMetadata, "max_tool_calls"),
 		PromptCacheRetention: xmap.GetStringPtr(llmReq.TransformerMetadata, "prompt_cache_retention"),
 		Truncation:           xmap.GetStringPtr(llmReq.TransformerMetadata, "truncation"),
 	}
 
-	// Clear `parallel_tool_calls` when no tools are sent (Responses API compatibility).
-	if len(payload.Tools) == 0 {
+	if lo.FromPtr(payload.PromptCacheKey) == "" {
+		if sessionID, ok := shared.GetSessionID(ctx); ok {
+			// A session may multiplex several concurrent conversations
+			// (e.g. Claude Code subagents); scope the cache key to the
+			// conversation so they do not evict each other upstream.
+			if anchor := conversationAnchor(llmReq.Messages); anchor != "" {
+				sessionID = sessionID + "-" + anchor
+			}
+
+			payload.PromptCacheKey = lo.ToPtr(sessionID)
+		}
+	}
+
+	// Responses Lite requires an explicit false value, even when no top-level tools are sent.
+	if llmReq.RawRequest != nil && strings.EqualFold(strings.TrimSpace(llmReq.RawRequest.Headers.Get(ResponsesLiteHeader)), "true") {
+		payload.ParallelToolCalls = lo.ToPtr(false)
+	} else if len(payload.Tools) == 0 {
+		// Other Responses providers may reject parallel_tool_calls when tools are absent.
 		payload.ParallelToolCalls = nil
 	}
 
@@ -180,7 +326,7 @@ func (t *OutboundTransformer) TransformRequest(ctx context.Context, llmReq *llm.
 		payload.MaxOutputTokens = llmReq.MaxTokens
 	}
 
-	body, err := json.Marshal(payload)
+	body, err := marshalRequestPayload(payload, llmReq)
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal responses api request: %w", err)
 	}
@@ -194,23 +340,38 @@ func (t *OutboundTransformer) TransformRequest(ctx context.Context, llmReq *llm.
 		return nil, err
 	}
 
-	return &httpclient.Request{
+	httpReq := &httpclient.Request{
 		Method:  http.MethodPost,
 		URL:     fullURL,
 		Headers: headers,
 		Body:    body,
 		Auth: &httpclient.AuthConfig{
 			Type:   "bearer",
-			APIKey: t.config.APIKeyProvider.Get(ctx),
+			APIKey: apiKey,
 		},
+		APIFormat:             string(llm.APIFormatOpenAIResponse),
 		TransformerMetadata:   llmReq.TransformerMetadata,
 		SkipInboundQueryMerge: true,
-	}, nil
+		Metadata:              nil,
+	}
+
+	if isImageRequest {
+		httpReq.RequestType = originalRequestType.String()
+	}
+
+	return httpReq, nil
 }
 
 // buildFullRequestURL constructs the appropriate URL based on the platform.
 func (t *OutboundTransformer) buildFullRequestURL(_ *llm.Request) (string, error) {
-	// BaseURL is already normalized with version in NewOutboundTransformerWithConfig
+	if t.config.RawURL {
+		return t.config.BaseURL, nil
+	}
+
+	if t.config.EndpointPath != "" {
+		return t.config.BaseURL + t.config.EndpointPath, nil
+	}
+
 	return t.config.BaseURL + "/responses", nil
 }
 
@@ -225,8 +386,46 @@ func (t *OutboundTransformer) TransformResponse(
 		return nil, fmt.Errorf("http response is nil")
 	}
 
+	// Route compact responses to specialized handler
+	if httpResp.Request != nil && httpResp.Request.RequestType == string(llm.RequestTypeCompact) {
+		return t.transformCompactResponse(ctx, httpResp)
+	}
+
+	if httpResp.Request != nil && httpResp.Request.RequestType == llm.RequestTypeImage.String() {
+		return t.transformImageResponse(httpResp)
+	}
+
+	return t.transformStandardResponse(ctx, httpResp)
+}
+
+func (t *OutboundTransformer) transformImageResponse(httpResp *httpclient.Response) (*llm.Response, error) {
+	if httpResp.StatusCode >= http.StatusBadRequest {
+		return nil, fmt.Errorf("HTTP error %d: %s", httpResp.StatusCode, strings.TrimSpace(string(httpResp.Body)))
+	}
+
+	var upstream Response
+	if err := json.Unmarshal(httpResp.Body, &upstream); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal responses api image response: %w", err)
+	}
+
+	metadata := map[string]any{}
+	if httpResp.Request.TransformerMetadata != nil {
+		metadata = httpResp.Request.TransformerMetadata
+	}
+
+	return BuildImageResponse(&upstream, metadata)
+}
+
+func (t *OutboundTransformer) transformStandardResponse(
+	ctx context.Context,
+	httpResp *httpclient.Response,
+) (*llm.Response, error) {
+	if httpResp == nil {
+		return nil, fmt.Errorf("http response is nil")
+	}
+
 	if httpResp.StatusCode >= 400 {
-		return nil, fmt.Errorf("HTTP error %d", httpResp.StatusCode)
+		return nil, fmt.Errorf("HTTP error %d: %s", httpResp.StatusCode, strings.TrimSpace(string(httpResp.Body)))
 	}
 
 	if len(httpResp.Body) == 0 {
@@ -238,13 +437,19 @@ func (t *OutboundTransformer) TransformResponse(
 		return nil, fmt.Errorf("failed to unmarshal responses api response: %w", err)
 	}
 
-	// Convert to unified llm.Response format
+	// Validate that we got a valid response
+	if resp.ID == "" && resp.Model == "" && len(resp.Output) == 0 {
+		return nil, fmt.Errorf("responses api returned empty response: body=%s", string(httpResp.Body))
+	}
+
 	llmResp := &llm.Response{
-		Object:  "chat.completion",
-		ID:      resp.ID,
-		Model:   resp.Model,
-		Created: resp.CreatedAt,
-		Choices: make([]llm.Choice, 0),
+		Object:              "chat.completion",
+		ID:                  resp.ID,
+		Model:               resp.Model,
+		Created:             resp.CreatedAt,
+		PreviousResponseID:  resp.PreviousResponseID,
+		Choices:             make([]llm.Choice, 0),
+		TransformerMetadata: map[string]any{},
 	}
 
 	// Convert usage if present
@@ -252,129 +457,18 @@ func (t *OutboundTransformer) TransformResponse(
 		llmResp.Usage = resp.Usage.ToUsage()
 	}
 
-	// Process output items - aggregate all into a single choice (Chat Completions format)
-	var (
-		contentParts       []llm.MessageContentPart
-		textContent        strings.Builder
-		reasoningContent   strings.Builder
-		reasoningSignature *string
-		toolCalls          []llm.ToolCall
-	)
-
-	for _, outputItem := range resp.Output {
-		switch outputItem.Type {
-		case "message":
-			// Extract text content from message content array
-			for _, contentItem := range outputItem.GetContentItems() {
-				if contentItem.Type == "output_text" {
-					textContent.WriteString(contentItem.Text)
-				}
-			}
-		case "output_text":
-			// Direct text output
-			if outputItem.Text != nil {
-				textContent.WriteString(*outputItem.Text)
-			}
-		case "function_call":
-			// Function call output - aggregate all tool calls
-			toolCalls = append(toolCalls, llm.ToolCall{
-				ID:   outputItem.CallID,
-				Type: "function",
-				Function: llm.FunctionCall{
-					Name:      outputItem.Name,
-					Arguments: outputItem.Arguments,
-				},
-			})
-		case "reasoning":
-			// Handle reasoning output - convert to ReasoningContent
-			for _, summary := range outputItem.Summary {
-				reasoningContent.WriteString(summary.Text)
-			}
-			// Preserve encrypted reasoning content in ReasoningSignature.
-			if outputItem.EncryptedContent != nil && *outputItem.EncryptedContent != "" {
-				reasoningSignature = shared.EncodeOpenAIEncryptedContent(outputItem.EncryptedContent)
-			}
-		case "image_generation_call":
-			imageOutputFormat := "png"
-
-			if httpResp.Request != nil && httpResp.Request.TransformerMetadata != nil {
-				if fmt, ok := httpResp.Request.TransformerMetadata["image_output_format"].(string); ok && fmt != "" {
-					imageOutputFormat = fmt
-				}
-			}
-			// Image generation result
-			if outputItem.Result != nil && *outputItem.Result != "" {
-				contentParts = append(contentParts, llm.MessageContentPart{
-					Type: "image_url",
-					ImageURL: &llm.ImageURL{
-						URL: `data:image/` + imageOutputFormat + `;base64,` + *outputItem.Result,
-					},
-					TransformerMetadata: map[string]any{
-						"background":    outputItem.Background,
-						"output_format": outputItem.OutputFormat,
-						"quality":       outputItem.Quality,
-						"size":          outputItem.Size,
-					},
-				})
-			}
-		case "input_image":
-			// Input image (for reference)
-			if outputItem.ImageURL != nil && *outputItem.ImageURL != "" {
-				contentParts = append(contentParts, llm.MessageContentPart{
-					Type: "image_url",
-					ImageURL: &llm.ImageURL{
-						URL: *outputItem.ImageURL,
-					},
-				})
-			}
-		}
+	if httpResp.Request != nil && httpResp.Request.TransformerMetadata != nil {
+		llmResp.TransformerMetadata = maps.Clone(httpResp.Request.TransformerMetadata)
 	}
 
-	// Build the single choice
+	msg := convertOutputToMessage(resp.Output, llmResp.TransformerMetadata)
+
 	choice := llm.Choice{
-		Index: 0,
-		Message: &llm.Message{
-			Role:      "assistant",
-			ToolCalls: toolCalls,
-		},
+		Index:   0,
+		Message: &msg,
 	}
 
-	// Set reasoning content if present
-	if reasoningContent.Len() > 0 {
-		choice.Message.ReasoningContent = lo.ToPtr(reasoningContent.String())
-	}
-
-	if reasoningSignature != nil {
-		choice.Message.ReasoningSignature = reasoningSignature
-	}
-
-	// Set message content
-	if textContent.Len() > 0 {
-		if len(contentParts) > 0 {
-			// Mixed content: text + images
-			textPart := llm.MessageContentPart{
-				Type: "text",
-				Text: lo.ToPtr(textContent.String()),
-			}
-			contentParts = append([]llm.MessageContentPart{textPart}, contentParts...)
-			choice.Message.Content = llm.MessageContent{
-				MultipleContent: contentParts,
-			}
-		} else {
-			// Text only
-			choice.Message.Content = llm.MessageContent{
-				Content: lo.ToPtr(textContent.String()),
-			}
-		}
-	} else if len(contentParts) > 0 {
-		// Images only
-		choice.Message.Content = llm.MessageContent{
-			MultipleContent: contentParts,
-		}
-	}
-
-	// Set finish reason based on status and content
-	if len(toolCalls) > 0 {
+	if len(msg.ToolCalls) > 0 {
 		choice.FinishReason = lo.ToPtr("tool_calls")
 	} else if resp.Status != nil {
 		switch *resp.Status {
@@ -384,6 +478,8 @@ func (t *OutboundTransformer) TransformResponse(
 			choice.FinishReason = lo.ToPtr("error")
 		case "incomplete":
 			choice.FinishReason = lo.ToPtr("length")
+		case "canceled", "cancelled":
+			choice.FinishReason = lo.ToPtr("cancelled")
 		}
 	}
 

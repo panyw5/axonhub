@@ -3,8 +3,10 @@ package httpclient
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"maps"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -73,6 +75,27 @@ func newMockReadCloser(data []byte) *mockReadCloser {
 	}
 }
 
+type readChunkThenError struct {
+	data []byte
+	err  error
+	read bool
+}
+
+func (r *readChunkThenError) Read(p []byte) (int, error) {
+	if r.read {
+		return 0, io.EOF
+	}
+
+	r.read = true
+	n := copy(p, r.data)
+
+	return n, r.err
+}
+
+func (r *readChunkThenError) Close() error {
+	return nil
+}
+
 func TestRegisterDecoder(t *testing.T) {
 	// Save original state
 	originalDecoders := make(map[string]StreamDecoderFactory)
@@ -116,6 +139,39 @@ func TestGetDecoder(t *testing.T) {
 	factory, exists = GetDecoder("application/non-existent")
 	require.False(t, exists)
 	require.Nil(t, factory)
+}
+
+func TestDefaultSSEDecoder_LastEventAtEOFDoesNotPanicOnRepeatedNext(t *testing.T) {
+	decoder := NewDefaultSSEDecoder(t.Context(), newMockReadCloser([]byte("data: trailing-event\n")))
+
+	require.True(t, decoder.Next())
+	require.Equal(t, []byte("trailing-event"), decoder.Current().Data)
+
+	for range 3 {
+		require.NotPanics(t, func() {
+			require.False(t, decoder.Next())
+		})
+		require.NoError(t, decoder.Err())
+	}
+}
+
+func TestDefaultSSEDecoder_RejectsOversizedEventAtParserBoundary(t *testing.T) {
+	const limit = 1024
+	raw := "data: " + strings.Repeat("x", limit+1) + "\n\n"
+	decoder := NewSSEDecoderWithMaxEventSize(t.Context(), newMockReadCloser([]byte(raw)), limit)
+
+	require.False(t, decoder.Next())
+	require.Nil(t, decoder.Current())
+	require.ErrorIs(t, decoder.Err(), ErrStreamEventTooLarge)
+}
+
+func TestDefaultSSEDecoder_DoesNotClassifyErrorTextAsOversizedEvent(t *testing.T) {
+	wantErr := errors.New("upstream token too long due proxy")
+	decoder := NewSSEDecoderWithMaxEventSize(t.Context(), &readChunkThenError{err: wantErr}, 1024)
+
+	require.False(t, decoder.Next())
+	require.ErrorIs(t, decoder.Err(), wantErr)
+	require.NotErrorIs(t, decoder.Err(), ErrStreamEventTooLarge)
 }
 
 func TestDefaultSSEDecoder(t *testing.T) {
@@ -178,6 +234,48 @@ func TestDefaultSSEDecoder_NextAfterClose(t *testing.T) {
 	hasNext := decoder.Next()
 	require.False(t, hasNext)
 	require.NoError(t, decoder.Err())
+}
+
+func TestBinaryChunkDecoder(t *testing.T) {
+	ctx := context.Background()
+	rc := newMockReadCloser([]byte("abcdefgh"))
+	decoder := NewBinaryChunkDecoder("audio/mpeg")(ctx, rc)
+
+	require.True(t, decoder.Next())
+	first := decoder.Current()
+	require.NotNil(t, first)
+	require.Equal(t, "audio/mpeg", first.Type)
+	require.Equal(t, []byte("abcdefgh"), first.Data)
+
+	require.True(t, decoder.Next())
+	done := decoder.Current()
+	require.NotNil(t, done)
+	require.Equal(t, BinaryStreamDoneEventType, done.Type)
+	require.Empty(t, done.Data)
+
+	require.False(t, decoder.Next())
+	require.NoError(t, decoder.Err())
+	require.NoError(t, decoder.Close())
+	require.True(t, rc.closed)
+}
+
+func TestBinaryChunkDecoder_PreservesReadErrorAfterChunk(t *testing.T) {
+	ctx := context.Background()
+	streamErr := errors.New("truncated audio stream")
+	decoder := NewBinaryChunkDecoder("audio/mpeg")(ctx, &readChunkThenError{
+		data: []byte("abc"),
+		err:  streamErr,
+	})
+
+	require.True(t, decoder.Next())
+	chunk := decoder.Current()
+	require.NotNil(t, chunk)
+	require.Equal(t, "audio/mpeg", chunk.Type)
+	require.Equal(t, []byte("abc"), chunk.Data)
+	require.NoError(t, decoder.Err())
+
+	require.False(t, decoder.Next())
+	require.ErrorIs(t, decoder.Err(), streamErr)
 }
 
 func TestStreamDecoderInterface(t *testing.T) {

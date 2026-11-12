@@ -10,7 +10,6 @@ import (
 
 	"github.com/google/uuid"
 
-	"github.com/looplj/axonhub/internal/pkg/xerrors"
 	"github.com/looplj/axonhub/llm"
 	"github.com/looplj/axonhub/llm/httpclient"
 	transformer "github.com/looplj/axonhub/llm/transformer"
@@ -22,10 +21,6 @@ type DataStreamTransformer struct{}
 // NewDataStreamTransformer creates a new AI SDK data stream transformer.
 func NewDataStreamTransformer() *DataStreamTransformer {
 	return &DataStreamTransformer{}
-}
-
-func (t *DataStreamTransformer) APIFormat() llm.APIFormat {
-	return llm.APIFormatAiSDKDataStream
 }
 
 // TransformRequest transforms AI SDK request to LLM request.
@@ -41,7 +36,7 @@ func (t *DataStreamTransformer) TransformRequest(
 		return nil, fmt.Errorf("%w: failed to parse AI SDK request: %w", transformer.ErrInvalidRequest, err)
 	}
 
-	return convertToLLMRequest(&aiSDKReq)
+	return convertToLLMRequestWithAPIFormat(&aiSDKReq, nil, llm.APIFormatAiSDKDataStream)
 }
 
 // TransformResponse transforms LLM response to AI SDK response.
@@ -183,7 +178,7 @@ func (t *DataStreamTransformer) TransformError(ctx context.Context, rawErr error
 		}
 	}
 
-	if httpErr, ok := xerrors.As[*httpclient.Error](rawErr); ok {
+	if httpErr, ok := errors.AsType[*httpclient.Error](rawErr); ok {
 		return httpErr
 	}
 
@@ -196,7 +191,7 @@ func (t *DataStreamTransformer) TransformError(ctx context.Context, rawErr error
 		}
 	}
 
-	if llmErr, ok := xerrors.As[*llm.ResponseError](rawErr); ok {
+	if llmErr, ok := errors.AsType[*llm.ResponseError](rawErr); ok {
 		return &httpclient.Error{
 			StatusCode: llmErr.StatusCode,
 			Status:     http.StatusText(llmErr.StatusCode),

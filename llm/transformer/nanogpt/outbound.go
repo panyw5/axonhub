@@ -45,6 +45,7 @@ func NewOutboundTransformerWithConfig(config *Config) (transformer.Outbound, err
 		PlatformType:   openai.PlatformOpenAI,
 		BaseURL:        config.BaseURL,
 		APIKeyProvider: config.APIKeyProvider,
+		ReasoningField: openai.ReasoningFieldReasoning,
 	}
 
 	t, err := openai.NewOutboundTransformerWithConfig(oaiConfig)
@@ -69,6 +70,7 @@ func (t *OutboundTransformer) TransformResponse(
 	if httpResp.StatusCode >= 400 {
 		// Read response body for diagnostic details
 		body := string(httpResp.Body)
+
 		var errResp struct {
 			Error string `json:"error"`
 		}
@@ -79,11 +81,27 @@ func (t *OutboundTransformer) TransformResponse(
 		if len(body) > 0 {
 			return nil, fmt.Errorf("HTTP error %d: %s", httpResp.StatusCode, body)
 		}
+
 		return nil, fmt.Errorf("HTTP error %d", httpResp.StatusCode)
 	}
 
 	if len(httpResp.Body) == 0 {
 		return nil, fmt.Errorf("response body is empty")
+	}
+
+	// Route to embedded OpenAI transformer for embedding, image, and audio responses.
+	if httpResp.Request != nil {
+		switch httpResp.Request.APIFormat {
+		case string(llm.APIFormatOpenAIEmbedding),
+			string(llm.APIFormatOpenAIModeration),
+			string(llm.APIFormatOpenAIImageGeneration),
+			string(llm.APIFormatOpenAIImageEdit),
+			string(llm.APIFormatOpenAIImageVariation),
+			string(llm.APIFormatOpenAISpeech),
+			string(llm.APIFormatOpenAITranscription),
+			string(llm.APIFormatOpenAITranslation):
+			return t.Outbound.TransformResponse(ctx, httpResp)
+		}
 	}
 
 	var nanoResp Response
@@ -97,18 +115,34 @@ func (t *OutboundTransformer) TransformResponse(
 }
 
 // TransformStream transforms a stream of HTTP events to a stream of llm.Response.
-func (t *OutboundTransformer) TransformStream(ctx context.Context, stream streams.Stream[*httpclient.StreamEvent]) (streams.Stream[*llm.Response], error) {
-	return streams.MapErr(stream, func(event *httpclient.StreamEvent) (*llm.Response, error) {
+func (t *OutboundTransformer) TransformStream(ctx context.Context, req *httpclient.Request, stream streams.Stream[*httpclient.StreamEvent]) (streams.Stream[*llm.Response], error) {
+	// Audio streaming (TTS sse / STT) uses dedicated event schemas owned by the OpenAI
+	// transformer; delegate so chat-completion parsing is not applied.
+	if req != nil {
+		switch req.APIFormat {
+		case string(llm.APIFormatOpenAISpeech),
+			string(llm.APIFormatOpenAITranscription),
+			string(llm.APIFormatOpenAITranslation):
+			return t.Outbound.TransformStream(ctx, req, stream)
+		}
+	}
+
+	// Filter out upstream DONE events
+	filteredStream := streams.Filter(stream, func(event *httpclient.StreamEvent) bool {
+		return !bytes.HasPrefix(event.Data, []byte("[DONE]"))
+	})
+
+	// Transform remaining events
+	transformedStream := streams.MapErr(filteredStream, func(event *httpclient.StreamEvent) (*llm.Response, error) {
 		return t.TransformStreamChunk(ctx, event)
-	}), nil
+	})
+
+	// Always append our own DONE event at the end
+	return streams.AppendStream(transformedStream, llm.DoneResponse), nil
 }
 
 // TransformStreamChunk transforms a single stream event to llm.Response.
 func (t *OutboundTransformer) TransformStreamChunk(ctx context.Context, event *httpclient.StreamEvent) (*llm.Response, error) {
-	if bytes.HasPrefix(event.Data, []byte("[DONE]")) {
-		return llm.DoneResponse, nil
-	}
-
 	ep := gjson.GetBytes(event.Data, "error")
 	if ep.Exists() {
 		return nil, &llm.ResponseError{
@@ -137,6 +171,16 @@ func nanoGPTChunkTransform(ctx context.Context, chunk *httpclient.StreamEvent) (
 }
 
 // AggregateStreamChunks aggregates stream chunks into a single response.
-func (t *OutboundTransformer) AggregateStreamChunks(ctx context.Context, chunks []*httpclient.StreamEvent) ([]byte, llm.ResponseMeta, error) {
+func (t *OutboundTransformer) AggregateStreamChunks(ctx context.Context, req *httpclient.Request, chunks []*httpclient.StreamEvent) ([]byte, llm.ResponseMeta, error) {
+	// Audio streaming uses dedicated event schemas; delegate to the embedded OpenAI transformer.
+	if req != nil {
+		switch req.APIFormat {
+		case string(llm.APIFormatOpenAISpeech),
+			string(llm.APIFormatOpenAITranscription),
+			string(llm.APIFormatOpenAITranslation):
+			return t.Outbound.AggregateStreamChunks(ctx, req, chunks)
+		}
+	}
+
 	return openai.AggregateStreamChunks(ctx, chunks, nanoGPTChunkTransform)
 }

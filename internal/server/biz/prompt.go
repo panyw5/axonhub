@@ -5,24 +5,24 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/zhenzou/executors"
 	"go.uber.org/fx"
 
+	"github.com/looplj/axonhub/internal/authz"
 	"github.com/looplj/axonhub/internal/contexts"
 	"github.com/looplj/axonhub/internal/ent"
-	"github.com/looplj/axonhub/internal/ent/privacy"
 	"github.com/looplj/axonhub/internal/ent/prompt"
 	"github.com/looplj/axonhub/internal/log"
 	"github.com/looplj/axonhub/internal/objects"
+	"github.com/looplj/axonhub/internal/pkg/xerrors"
 	"github.com/looplj/axonhub/internal/pkg/xmap"
 	"github.com/looplj/axonhub/internal/pkg/xregexp"
+	"github.com/looplj/axonhub/internal/server/scheduler"
 )
 
 type PromptServiceParams struct {
 	fx.In
 
-	Executor executors.ScheduledExecutor
-	Ent      *ent.Client
+	Ent *ent.Client
 }
 
 func NewPromptService(params PromptServiceParams) *PromptService {
@@ -34,16 +34,11 @@ func NewPromptService(params PromptServiceParams) *PromptService {
 		latestCachedUpdateTime: xmap.New[int, time.Time](),
 	}
 
-	_, _ = params.Executor.ScheduleFuncAtCronRate(
-		svc.loadPromptsPeriodic,
-		executors.CRONRule{Expr: "*/1 * * * *"},
-	)
-
 	return svc
 }
 
 func (svc *PromptService) Initialize(ctx context.Context) error {
-	ctx = privacy.DecisionContext(ctx, privacy.Allow)
+	ctx = authz.WithSystemBypass(ctx, "prompt-initialize")
 
 	projects, err := svc.entFromContext(ctx).Project.Query().All(ctx)
 	if err != nil {
@@ -69,6 +64,15 @@ type PromptService struct {
 
 	// latestUpdate 记录最新的 prompt 更新时间，用于优化定时加载
 	latestCachedUpdateTime *xmap.Map[int, time.Time]
+}
+
+func (svc *PromptService) RegisterScheduledTasks(ctx context.Context, s *scheduler.Scheduler) error {
+	return s.Register(ctx, scheduler.TaskSpec{
+		Name:        "prompt-cache",
+		Description: "Refresh prompt cache every minute",
+		CronExpr:    "*/1 * * * *",
+		Timezone:    "UTC",
+	}, svc.loadPromptsPeriodic)
 }
 
 func (svc *PromptService) loadPromptsPeriodic(ctx context.Context) {
@@ -103,6 +107,16 @@ func (svc *PromptService) ValidatePromptSettings(settings objects.PromptSettings
 					return fmt.Errorf("model_id is required when type is model_id")
 				}
 			}
+
+			if condition.Type == objects.PromptActivationConditionTypeAPIKey {
+				if condition.APIKeyID == nil {
+					return fmt.Errorf("api_key_id is required when type is api_key")
+				}
+
+				if *condition.APIKeyID <= 0 {
+					return fmt.Errorf("api_key_id must be greater than 0")
+				}
+			}
 		}
 	}
 
@@ -119,20 +133,30 @@ func (svc *PromptService) CreatePrompt(ctx context.Context, input ent.CreateProm
 		return nil, err
 	}
 
+	// Check for duplicate prompt name in the same project
+	exists, err := svc.entFromContext(ctx).Prompt.Query().
+		Where(
+			prompt.Name(input.Name),
+			prompt.ProjectIDEQ(projectID),
+		).
+		Exist(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to check prompt name uniqueness: %w", err)
+	}
+
+	if exists {
+		return nil, xerrors.DuplicateNameError("prompt", input.Name)
+	}
+
 	createBuilder := svc.entFromContext(ctx).Prompt.Create().
 		SetProjectID(projectID).
 		SetName(input.Name).
 		SetRole(input.Role).
 		SetContent(input.Content).
+		SetNillableOrder(input.Order).
+		SetNillableDescription(input.Description).
+		SetNillableStatus(input.Status).
 		SetSettings(input.Settings)
-
-	if input.Description != nil {
-		createBuilder.SetDescription(*input.Description)
-	}
-
-	if input.Status != nil {
-		createBuilder.SetStatus(*input.Status)
-	}
 
 	prompt, err := createBuilder.Save(ctx)
 	if err != nil {
@@ -156,6 +180,24 @@ func (svc *PromptService) UpdatePrompt(ctx context.Context, id int, input *ent.U
 		}
 	}
 
+	// Check for duplicate name if being updated
+	if input.Name != nil {
+		exists, err := svc.entFromContext(ctx).Prompt.Query().
+			Where(
+				prompt.Name(*input.Name),
+				prompt.ProjectIDEQ(projectID),
+				prompt.IDNEQ(id),
+			).
+			Exist(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("failed to check prompt name uniqueness: %w", err)
+		}
+
+		if exists {
+			return nil, xerrors.DuplicateNameError("prompt", *input.Name)
+		}
+	}
+
 	updateBuilder := svc.entFromContext(ctx).Prompt.Update().
 		Where(
 			prompt.IDEQ(id),
@@ -165,6 +207,7 @@ func (svc *PromptService) UpdatePrompt(ctx context.Context, id int, input *ent.U
 		SetNillableDescription(input.Description).
 		SetNillableRole(input.Role).
 		SetNillableContent(input.Content).
+		SetNillableOrder(input.Order).
 		SetNillableStatus(input.Status)
 
 	if input.Settings != nil {
@@ -322,7 +365,7 @@ func (svc *PromptService) BulkDisablePrompts(ctx context.Context, ids []int) err
 }
 
 func (svc *PromptService) loadPrompts(ctx context.Context, projectID int) error {
-	ctx = privacy.DecisionContext(ctx, privacy.Allow)
+	ctx = authz.WithSystemBypass(ctx, "prompt-load-cache")
 	// Check if there are updates for this project
 	latestUpdatedPrompt, err := svc.entFromContext(ctx).Prompt.Query().
 		Where(prompt.ProjectID(projectID)).

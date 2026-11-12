@@ -12,8 +12,47 @@ import (
 	"github.com/looplj/axonhub/internal/ent/channel"
 	"github.com/looplj/axonhub/internal/ent/channelmodelprice"
 	"github.com/looplj/axonhub/internal/ent/model"
+	"github.com/looplj/axonhub/internal/ent/project"
+	"github.com/looplj/axonhub/internal/ent/system"
 	"github.com/looplj/axonhub/internal/objects"
+	"github.com/looplj/axonhub/internal/server/biz"
 )
+
+func TestBackupService_Restore_SystemConfigs(t *testing.T) {
+	client, service, ctx := setupBackupTest(t)
+	defer client.Close()
+
+	_, err := client.System.Create().
+		SetKey(biz.SystemKeyRetryPolicy).
+		SetValue(`{"max_retries":1}`).
+		Save(ctx)
+	require.NoError(t, err)
+	_, err = client.System.Create().
+		SetKey(biz.SystemKeySecretKey).
+		SetValue("target-secret").
+		Save(ctx)
+	require.NoError(t, err)
+
+	data, err := json.Marshal(BackupData{
+		Version: BackupVersion,
+		SystemConfigs: []*BackupSystemConfig{
+			{Key: biz.SystemKeyRetryPolicy, Value: `{"max_retries":4}`},
+			{Key: biz.SystemKeySecretKey, Value: "source-secret"},
+		},
+	})
+	require.NoError(t, err)
+
+	err = service.Restore(ctx, data, RestoreOptions{IncludeSystemConfigs: true})
+	require.NoError(t, err)
+
+	retryPolicy, err := client.System.Query().Where(system.KeyEQ(biz.SystemKeyRetryPolicy)).Only(ctx)
+	require.NoError(t, err)
+	require.Equal(t, `{"max_retries":4}`, retryPolicy.Value)
+
+	secretKey, err := client.System.Query().Where(system.KeyEQ(biz.SystemKeySecretKey)).Only(ctx)
+	require.NoError(t, err)
+	require.Equal(t, "target-secret", secretKey.Value)
+}
 
 func TestBackupService_Restore(t *testing.T) {
 	client, service, ctx := setupBackupTest(t)
@@ -244,6 +283,68 @@ func TestBackupService_Restore_RemapChannelIDsInModelSettingsAndAPIKeyProfiles(t
 	require.NotNil(t, restoredKey.Profiles)
 	require.Len(t, restoredKey.Profiles.Profiles, 1)
 	require.Equal(t, []int{restoredChannel.ID}, restoredKey.Profiles.Profiles[0].ChannelIDs)
+}
+
+func TestBackupService_Restore_RemapChannelIDsInProjectProfiles(t *testing.T) {
+	client, service, ctx := setupBackupTest(t)
+	defer client.Close()
+
+	oldChannelID := 456
+	backupData := BackupData{
+		Version: BackupVersion,
+		Projects: []*BackupProject{
+			{
+				Project: ent.Project{
+					Name:        "Project With Profiles",
+					Description: "project with channel restrictions",
+					Status:      project.StatusActive,
+					Profiles: &objects.ProjectProfiles{
+						ActiveProfile: "production",
+						Profiles: []objects.ProjectProfile{
+							{
+								Name:        "production",
+								ChannelIDs:  []int{oldChannelID},
+								ChannelTags: []string{"allowed"},
+							},
+						},
+					},
+				},
+			},
+		},
+		Channels: []*BackupChannel{
+			{
+				Channel: ent.Channel{
+					ID:      oldChannelID,
+					Type:    channel.TypeOpenai,
+					Name:    "Project Channel From Backup",
+					BaseURL: "https://api.example.com",
+					Status:  channel.StatusEnabled,
+				},
+				Credentials: objects.ChannelCredentials{APIKey: "backup-api-key"},
+			},
+		},
+	}
+
+	data, err := json.MarshalIndent(backupData, "", "  ")
+	require.NoError(t, err)
+
+	err = service.Restore(ctx, data, RestoreOptions{
+		IncludeProjects:         true,
+		IncludeChannels:         true,
+		ProjectConflictStrategy: ConflictStrategyOverwrite,
+		ChannelConflictStrategy: ConflictStrategyOverwrite,
+	})
+	require.NoError(t, err)
+
+	restoredChannel, err := client.Channel.Query().Where(channel.Name("Project Channel From Backup")).First(ctx)
+	require.NoError(t, err)
+	require.NotEqual(t, oldChannelID, restoredChannel.ID)
+
+	restoredProject, err := client.Project.Query().Where(project.Name("Project With Profiles")).First(ctx)
+	require.NoError(t, err)
+	require.NotNil(t, restoredProject.Profiles)
+	require.Len(t, restoredProject.Profiles.Profiles, 1)
+	require.Equal(t, []int{restoredChannel.ID}, restoredProject.Profiles.Profiles[0].ChannelIDs)
 }
 
 func TestBackupService_Restore_NewData(t *testing.T) {
@@ -623,4 +724,111 @@ func TestBackupService_Restore_ModelPriceConflictStrategy_Error(t *testing.T) {
 	})
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "channel model price already exists")
+}
+
+func TestBackupService_Restore_UsageStats(t *testing.T) {
+	client, service, ctx := setupBackupTest(t)
+	defer client.Close()
+
+	user, _ := client.User.Query().First(ctx)
+	proj := createBackupTestProject(t, client, ctx, "Project1", "Test Project")
+	ch := createBackupTestChannel(t, client, ctx, "Channel 1", channel.TypeOpenai)
+	ak := createBackupTestAPIKey(t, client, ctx, user, proj, "API Key 1", "sk-test-key-1")
+	_, usage := createBackupTestUsage(t, client, ctx, proj, ch, ak)
+
+	data, err := service.Backup(ctx, BackupOptions{
+		IncludeAPIKeys:    true,
+		IncludeUsageStats: true,
+	})
+	require.NoError(t, err)
+
+	_, err = client.UsageLog.Delete().Exec(ctx)
+	require.NoError(t, err)
+
+	_, err = client.Request.Delete().Exec(ctx)
+	require.NoError(t, err)
+
+	err = service.Restore(ctx, data, RestoreOptions{
+		IncludeUsageStats: true,
+	})
+	require.NoError(t, err)
+
+	requestsCount, err := client.Request.Query().Count(ctx)
+	require.NoError(t, err)
+	require.Equal(t, 1, requestsCount)
+
+	usageLogs, err := client.UsageLog.Query().All(ctx)
+	require.NoError(t, err)
+	require.Len(t, usageLogs, 1)
+	require.Equal(t, int64(150), usageLogs[0].TotalTokens)
+	require.Equal(t, int64(20), usageLogs[0].PromptCachedTokens)
+	require.NotNil(t, usageLogs[0].TotalCost)
+	require.Equal(t, *usage.TotalCost, *usageLogs[0].TotalCost)
+	require.Equal(t, "price-ref", usageLogs[0].CostPriceReferenceID)
+
+	restoredRequest, err := client.Request.Get(ctx, usageLogs[0].RequestID)
+	require.NoError(t, err)
+	require.Equal(t, "gpt-4", restoredRequest.ModelID)
+	require.Equal(t, proj.ID, restoredRequest.ProjectID)
+	require.Equal(t, ch.ID, restoredRequest.ChannelID)
+	require.Equal(t, ak.ID, restoredRequest.APIKeyID)
+	require.JSONEq(t, `{}`, string(restoredRequest.RequestBody))
+
+	err = service.Restore(ctx, data, RestoreOptions{
+		IncludeUsageStats: true,
+	})
+	require.NoError(t, err)
+
+	requestsCount, err = client.Request.Query().Count(ctx)
+	require.NoError(t, err)
+	require.Equal(t, 1, requestsCount)
+
+	usageLogsAfterSecondRestore, err := client.UsageLog.Query().All(ctx)
+	require.NoError(t, err)
+	require.Len(t, usageLogsAfterSecondRestore, 1)
+	require.Equal(t, restoredRequest.ID, usageLogsAfterSecondRestore[0].RequestID)
+}
+
+func TestBackupService_Restore_UsageStatsWithRequestLogs(t *testing.T) {
+	client, service, ctx := setupBackupTest(t)
+	defer client.Close()
+
+	user, _ := client.User.Query().First(ctx)
+	proj := createBackupTestProject(t, client, ctx, "Project1", "Test Project")
+	ch := createBackupTestChannel(t, client, ctx, "Channel 1", channel.TypeOpenai)
+	ak := createBackupTestAPIKey(t, client, ctx, user, proj, "API Key 1", "sk-test-key-1")
+	_, usage := createBackupTestUsage(t, client, ctx, proj, ch, ak)
+
+	data, err := service.Backup(ctx, BackupOptions{
+		IncludeAPIKeys:     true,
+		IncludeUsageStats:  true,
+		IncludeRequestLogs: true,
+	})
+	require.NoError(t, err)
+
+	_, err = client.UsageLog.Delete().Exec(ctx)
+	require.NoError(t, err)
+
+	_, err = client.Request.Delete().Exec(ctx)
+	require.NoError(t, err)
+
+	err = service.Restore(ctx, data, RestoreOptions{
+		IncludeUsageStats:  true,
+		IncludeRequestLogs: true,
+	})
+	require.NoError(t, err)
+
+	requests, err := client.Request.Query().All(ctx)
+	require.NoError(t, err)
+	require.Len(t, requests, 1)
+	require.JSONEq(t, `{"model":"gpt-4"}`, string(requests[0].RequestBody))
+	require.Equal(t, "127.0.0.1", requests[0].ClientIP)
+
+	usageLogs, err := client.UsageLog.Query().All(ctx)
+	require.NoError(t, err)
+	require.Len(t, usageLogs, 1)
+	require.Equal(t, requests[0].ID, usageLogs[0].RequestID)
+	require.Equal(t, int64(150), usageLogs[0].TotalTokens)
+	require.NotNil(t, usageLogs[0].TotalCost)
+	require.Equal(t, *usage.TotalCost, *usageLogs[0].TotalCost)
 }

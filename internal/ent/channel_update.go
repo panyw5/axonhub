@@ -64,6 +64,20 @@ func (_u *ChannelUpdate) AddDeletedAt(v int) *ChannelUpdate {
 	return _u
 }
 
+// SetType sets the "type" field.
+func (_u *ChannelUpdate) SetType(v channel.Type) *ChannelUpdate {
+	_u.mutation.SetType(v)
+	return _u
+}
+
+// SetNillableType sets the "type" field if the given value is not nil.
+func (_u *ChannelUpdate) SetNillableType(v *channel.Type) *ChannelUpdate {
+	if v != nil {
+		_u.SetType(*v)
+	}
+	return _u
+}
+
 // SetBaseURL sets the "base_url" field.
 func (_u *ChannelUpdate) SetBaseURL(v string) *ChannelUpdate {
 	_u.mutation.SetBaseURL(v)
@@ -156,6 +170,24 @@ func (_u *ChannelUpdate) AppendSupportedModels(v []string) *ChannelUpdate {
 	return _u
 }
 
+// SetManualModels sets the "manual_models" field.
+func (_u *ChannelUpdate) SetManualModels(v []string) *ChannelUpdate {
+	_u.mutation.SetManualModels(v)
+	return _u
+}
+
+// AppendManualModels appends value to the "manual_models" field.
+func (_u *ChannelUpdate) AppendManualModels(v []string) *ChannelUpdate {
+	_u.mutation.AppendManualModels(v)
+	return _u
+}
+
+// ClearManualModels clears the value of the "manual_models" field.
+func (_u *ChannelUpdate) ClearManualModels() *ChannelUpdate {
+	_u.mutation.ClearManualModels()
+	return _u
+}
+
 // SetAutoSyncSupportedModels sets the "auto_sync_supported_models" field.
 func (_u *ChannelUpdate) SetAutoSyncSupportedModels(v bool) *ChannelUpdate {
 	_u.mutation.SetAutoSyncSupportedModels(v)
@@ -167,6 +199,26 @@ func (_u *ChannelUpdate) SetNillableAutoSyncSupportedModels(v *bool) *ChannelUpd
 	if v != nil {
 		_u.SetAutoSyncSupportedModels(*v)
 	}
+	return _u
+}
+
+// SetAutoSyncModelPattern sets the "auto_sync_model_pattern" field.
+func (_u *ChannelUpdate) SetAutoSyncModelPattern(v string) *ChannelUpdate {
+	_u.mutation.SetAutoSyncModelPattern(v)
+	return _u
+}
+
+// SetNillableAutoSyncModelPattern sets the "auto_sync_model_pattern" field if the given value is not nil.
+func (_u *ChannelUpdate) SetNillableAutoSyncModelPattern(v *string) *ChannelUpdate {
+	if v != nil {
+		_u.SetAutoSyncModelPattern(*v)
+	}
+	return _u
+}
+
+// ClearAutoSyncModelPattern clears the value of the "auto_sync_model_pattern" field.
+func (_u *ChannelUpdate) ClearAutoSyncModelPattern() *ChannelUpdate {
+	_u.mutation.ClearAutoSyncModelPattern()
 	return _u
 }
 
@@ -275,6 +327,46 @@ func (_u *ChannelUpdate) ClearErrorMessage() *ChannelUpdate {
 	return _u
 }
 
+// SetAutoDisabledAt sets the "auto_disabled_at" field.
+func (_u *ChannelUpdate) SetAutoDisabledAt(v time.Time) *ChannelUpdate {
+	_u.mutation.SetAutoDisabledAt(v)
+	return _u
+}
+
+// SetNillableAutoDisabledAt sets the "auto_disabled_at" field if the given value is not nil.
+func (_u *ChannelUpdate) SetNillableAutoDisabledAt(v *time.Time) *ChannelUpdate {
+	if v != nil {
+		_u.SetAutoDisabledAt(*v)
+	}
+	return _u
+}
+
+// ClearAutoDisabledAt clears the value of the "auto_disabled_at" field.
+func (_u *ChannelUpdate) ClearAutoDisabledAt() *ChannelUpdate {
+	_u.mutation.ClearAutoDisabledAt()
+	return _u
+}
+
+// SetAutoDisableExpiresAt sets the "auto_disable_expires_at" field.
+func (_u *ChannelUpdate) SetAutoDisableExpiresAt(v time.Time) *ChannelUpdate {
+	_u.mutation.SetAutoDisableExpiresAt(v)
+	return _u
+}
+
+// SetNillableAutoDisableExpiresAt sets the "auto_disable_expires_at" field if the given value is not nil.
+func (_u *ChannelUpdate) SetNillableAutoDisableExpiresAt(v *time.Time) *ChannelUpdate {
+	if v != nil {
+		_u.SetAutoDisableExpiresAt(*v)
+	}
+	return _u
+}
+
+// ClearAutoDisableExpiresAt clears the value of the "auto_disable_expires_at" field.
+func (_u *ChannelUpdate) ClearAutoDisableExpiresAt() *ChannelUpdate {
+	_u.mutation.ClearAutoDisableExpiresAt()
+	return _u
+}
+
 // SetRemark sets the "remark" field.
 func (_u *ChannelUpdate) SetRemark(v string) *ChannelUpdate {
 	_u.mutation.SetRemark(v)
@@ -292,6 +384,24 @@ func (_u *ChannelUpdate) SetNillableRemark(v *string) *ChannelUpdate {
 // ClearRemark clears the value of the "remark" field.
 func (_u *ChannelUpdate) ClearRemark() *ChannelUpdate {
 	_u.mutation.ClearRemark()
+	return _u
+}
+
+// SetEndpoints sets the "endpoints" field.
+func (_u *ChannelUpdate) SetEndpoints(v []objects.ChannelEndpoint) *ChannelUpdate {
+	_u.mutation.SetEndpoints(v)
+	return _u
+}
+
+// AppendEndpoints appends value to the "endpoints" field.
+func (_u *ChannelUpdate) AppendEndpoints(v []objects.ChannelEndpoint) *ChannelUpdate {
+	_u.mutation.AppendEndpoints(v)
+	return _u
+}
+
+// ClearEndpoints clears the value of the "endpoints" field.
+func (_u *ChannelUpdate) ClearEndpoints() *ChannelUpdate {
+	_u.mutation.ClearEndpoints()
 	return _u
 }
 
@@ -549,6 +659,11 @@ func (_u *ChannelUpdate) defaults() error {
 
 // check runs all checks and user-defined validators on the builder.
 func (_u *ChannelUpdate) check() error {
+	if v, ok := _u.mutation.GetType(); ok {
+		if err := channel.TypeValidator(v); err != nil {
+			return &ValidationError{Name: "type", err: fmt.Errorf(`ent: validator failed for field "Channel.type": %w`, err)}
+		}
+	}
 	if v, ok := _u.mutation.Status(); ok {
 		if err := channel.StatusValidator(v); err != nil {
 			return &ValidationError{Name: "status", err: fmt.Errorf(`ent: validator failed for field "Channel.status": %w`, err)}
@@ -584,6 +699,9 @@ func (_u *ChannelUpdate) sqlSave(ctx context.Context) (_node int, err error) {
 	if value, ok := _u.mutation.AddedDeletedAt(); ok {
 		_spec.AddField(channel.FieldDeletedAt, field.TypeInt, value)
 	}
+	if value, ok := _u.mutation.GetType(); ok {
+		_spec.SetField(channel.FieldType, field.TypeEnum, value)
+	}
 	if value, ok := _u.mutation.BaseURL(); ok {
 		_spec.SetField(channel.FieldBaseURL, field.TypeString, value)
 	}
@@ -618,8 +736,25 @@ func (_u *ChannelUpdate) sqlSave(ctx context.Context) (_node int, err error) {
 			sqljson.Append(u, channel.FieldSupportedModels, value)
 		})
 	}
+	if value, ok := _u.mutation.ManualModels(); ok {
+		_spec.SetField(channel.FieldManualModels, field.TypeJSON, value)
+	}
+	if value, ok := _u.mutation.AppendedManualModels(); ok {
+		_spec.AddModifier(func(u *sql.UpdateBuilder) {
+			sqljson.Append(u, channel.FieldManualModels, value)
+		})
+	}
+	if _u.mutation.ManualModelsCleared() {
+		_spec.ClearField(channel.FieldManualModels, field.TypeJSON)
+	}
 	if value, ok := _u.mutation.AutoSyncSupportedModels(); ok {
 		_spec.SetField(channel.FieldAutoSyncSupportedModels, field.TypeBool, value)
+	}
+	if value, ok := _u.mutation.AutoSyncModelPattern(); ok {
+		_spec.SetField(channel.FieldAutoSyncModelPattern, field.TypeString, value)
+	}
+	if _u.mutation.AutoSyncModelPatternCleared() {
+		_spec.ClearField(channel.FieldAutoSyncModelPattern, field.TypeString)
 	}
 	if value, ok := _u.mutation.Tags(); ok {
 		_spec.SetField(channel.FieldTags, field.TypeJSON, value)
@@ -659,11 +794,34 @@ func (_u *ChannelUpdate) sqlSave(ctx context.Context) (_node int, err error) {
 	if _u.mutation.ErrorMessageCleared() {
 		_spec.ClearField(channel.FieldErrorMessage, field.TypeString)
 	}
+	if value, ok := _u.mutation.AutoDisabledAt(); ok {
+		_spec.SetField(channel.FieldAutoDisabledAt, field.TypeTime, value)
+	}
+	if _u.mutation.AutoDisabledAtCleared() {
+		_spec.ClearField(channel.FieldAutoDisabledAt, field.TypeTime)
+	}
+	if value, ok := _u.mutation.AutoDisableExpiresAt(); ok {
+		_spec.SetField(channel.FieldAutoDisableExpiresAt, field.TypeTime, value)
+	}
+	if _u.mutation.AutoDisableExpiresAtCleared() {
+		_spec.ClearField(channel.FieldAutoDisableExpiresAt, field.TypeTime)
+	}
 	if value, ok := _u.mutation.Remark(); ok {
 		_spec.SetField(channel.FieldRemark, field.TypeString, value)
 	}
 	if _u.mutation.RemarkCleared() {
 		_spec.ClearField(channel.FieldRemark, field.TypeString)
+	}
+	if value, ok := _u.mutation.Endpoints(); ok {
+		_spec.SetField(channel.FieldEndpoints, field.TypeJSON, value)
+	}
+	if value, ok := _u.mutation.AppendedEndpoints(); ok {
+		_spec.AddModifier(func(u *sql.UpdateBuilder) {
+			sqljson.Append(u, channel.FieldEndpoints, value)
+		})
+	}
+	if _u.mutation.EndpointsCleared() {
+		_spec.ClearField(channel.FieldEndpoints, field.TypeJSON)
 	}
 	if _u.mutation.RequestsCleared() {
 		edge := &sqlgraph.EdgeSpec{
@@ -968,6 +1126,20 @@ func (_u *ChannelUpdateOne) AddDeletedAt(v int) *ChannelUpdateOne {
 	return _u
 }
 
+// SetType sets the "type" field.
+func (_u *ChannelUpdateOne) SetType(v channel.Type) *ChannelUpdateOne {
+	_u.mutation.SetType(v)
+	return _u
+}
+
+// SetNillableType sets the "type" field if the given value is not nil.
+func (_u *ChannelUpdateOne) SetNillableType(v *channel.Type) *ChannelUpdateOne {
+	if v != nil {
+		_u.SetType(*v)
+	}
+	return _u
+}
+
 // SetBaseURL sets the "base_url" field.
 func (_u *ChannelUpdateOne) SetBaseURL(v string) *ChannelUpdateOne {
 	_u.mutation.SetBaseURL(v)
@@ -1060,6 +1232,24 @@ func (_u *ChannelUpdateOne) AppendSupportedModels(v []string) *ChannelUpdateOne 
 	return _u
 }
 
+// SetManualModels sets the "manual_models" field.
+func (_u *ChannelUpdateOne) SetManualModels(v []string) *ChannelUpdateOne {
+	_u.mutation.SetManualModels(v)
+	return _u
+}
+
+// AppendManualModels appends value to the "manual_models" field.
+func (_u *ChannelUpdateOne) AppendManualModels(v []string) *ChannelUpdateOne {
+	_u.mutation.AppendManualModels(v)
+	return _u
+}
+
+// ClearManualModels clears the value of the "manual_models" field.
+func (_u *ChannelUpdateOne) ClearManualModels() *ChannelUpdateOne {
+	_u.mutation.ClearManualModels()
+	return _u
+}
+
 // SetAutoSyncSupportedModels sets the "auto_sync_supported_models" field.
 func (_u *ChannelUpdateOne) SetAutoSyncSupportedModels(v bool) *ChannelUpdateOne {
 	_u.mutation.SetAutoSyncSupportedModels(v)
@@ -1071,6 +1261,26 @@ func (_u *ChannelUpdateOne) SetNillableAutoSyncSupportedModels(v *bool) *Channel
 	if v != nil {
 		_u.SetAutoSyncSupportedModels(*v)
 	}
+	return _u
+}
+
+// SetAutoSyncModelPattern sets the "auto_sync_model_pattern" field.
+func (_u *ChannelUpdateOne) SetAutoSyncModelPattern(v string) *ChannelUpdateOne {
+	_u.mutation.SetAutoSyncModelPattern(v)
+	return _u
+}
+
+// SetNillableAutoSyncModelPattern sets the "auto_sync_model_pattern" field if the given value is not nil.
+func (_u *ChannelUpdateOne) SetNillableAutoSyncModelPattern(v *string) *ChannelUpdateOne {
+	if v != nil {
+		_u.SetAutoSyncModelPattern(*v)
+	}
+	return _u
+}
+
+// ClearAutoSyncModelPattern clears the value of the "auto_sync_model_pattern" field.
+func (_u *ChannelUpdateOne) ClearAutoSyncModelPattern() *ChannelUpdateOne {
+	_u.mutation.ClearAutoSyncModelPattern()
 	return _u
 }
 
@@ -1179,6 +1389,46 @@ func (_u *ChannelUpdateOne) ClearErrorMessage() *ChannelUpdateOne {
 	return _u
 }
 
+// SetAutoDisabledAt sets the "auto_disabled_at" field.
+func (_u *ChannelUpdateOne) SetAutoDisabledAt(v time.Time) *ChannelUpdateOne {
+	_u.mutation.SetAutoDisabledAt(v)
+	return _u
+}
+
+// SetNillableAutoDisabledAt sets the "auto_disabled_at" field if the given value is not nil.
+func (_u *ChannelUpdateOne) SetNillableAutoDisabledAt(v *time.Time) *ChannelUpdateOne {
+	if v != nil {
+		_u.SetAutoDisabledAt(*v)
+	}
+	return _u
+}
+
+// ClearAutoDisabledAt clears the value of the "auto_disabled_at" field.
+func (_u *ChannelUpdateOne) ClearAutoDisabledAt() *ChannelUpdateOne {
+	_u.mutation.ClearAutoDisabledAt()
+	return _u
+}
+
+// SetAutoDisableExpiresAt sets the "auto_disable_expires_at" field.
+func (_u *ChannelUpdateOne) SetAutoDisableExpiresAt(v time.Time) *ChannelUpdateOne {
+	_u.mutation.SetAutoDisableExpiresAt(v)
+	return _u
+}
+
+// SetNillableAutoDisableExpiresAt sets the "auto_disable_expires_at" field if the given value is not nil.
+func (_u *ChannelUpdateOne) SetNillableAutoDisableExpiresAt(v *time.Time) *ChannelUpdateOne {
+	if v != nil {
+		_u.SetAutoDisableExpiresAt(*v)
+	}
+	return _u
+}
+
+// ClearAutoDisableExpiresAt clears the value of the "auto_disable_expires_at" field.
+func (_u *ChannelUpdateOne) ClearAutoDisableExpiresAt() *ChannelUpdateOne {
+	_u.mutation.ClearAutoDisableExpiresAt()
+	return _u
+}
+
 // SetRemark sets the "remark" field.
 func (_u *ChannelUpdateOne) SetRemark(v string) *ChannelUpdateOne {
 	_u.mutation.SetRemark(v)
@@ -1196,6 +1446,24 @@ func (_u *ChannelUpdateOne) SetNillableRemark(v *string) *ChannelUpdateOne {
 // ClearRemark clears the value of the "remark" field.
 func (_u *ChannelUpdateOne) ClearRemark() *ChannelUpdateOne {
 	_u.mutation.ClearRemark()
+	return _u
+}
+
+// SetEndpoints sets the "endpoints" field.
+func (_u *ChannelUpdateOne) SetEndpoints(v []objects.ChannelEndpoint) *ChannelUpdateOne {
+	_u.mutation.SetEndpoints(v)
+	return _u
+}
+
+// AppendEndpoints appends value to the "endpoints" field.
+func (_u *ChannelUpdateOne) AppendEndpoints(v []objects.ChannelEndpoint) *ChannelUpdateOne {
+	_u.mutation.AppendEndpoints(v)
+	return _u
+}
+
+// ClearEndpoints clears the value of the "endpoints" field.
+func (_u *ChannelUpdateOne) ClearEndpoints() *ChannelUpdateOne {
+	_u.mutation.ClearEndpoints()
 	return _u
 }
 
@@ -1466,6 +1734,11 @@ func (_u *ChannelUpdateOne) defaults() error {
 
 // check runs all checks and user-defined validators on the builder.
 func (_u *ChannelUpdateOne) check() error {
+	if v, ok := _u.mutation.GetType(); ok {
+		if err := channel.TypeValidator(v); err != nil {
+			return &ValidationError{Name: "type", err: fmt.Errorf(`ent: validator failed for field "Channel.type": %w`, err)}
+		}
+	}
 	if v, ok := _u.mutation.Status(); ok {
 		if err := channel.StatusValidator(v); err != nil {
 			return &ValidationError{Name: "status", err: fmt.Errorf(`ent: validator failed for field "Channel.status": %w`, err)}
@@ -1518,6 +1791,9 @@ func (_u *ChannelUpdateOne) sqlSave(ctx context.Context) (_node *Channel, err er
 	if value, ok := _u.mutation.AddedDeletedAt(); ok {
 		_spec.AddField(channel.FieldDeletedAt, field.TypeInt, value)
 	}
+	if value, ok := _u.mutation.GetType(); ok {
+		_spec.SetField(channel.FieldType, field.TypeEnum, value)
+	}
 	if value, ok := _u.mutation.BaseURL(); ok {
 		_spec.SetField(channel.FieldBaseURL, field.TypeString, value)
 	}
@@ -1552,8 +1828,25 @@ func (_u *ChannelUpdateOne) sqlSave(ctx context.Context) (_node *Channel, err er
 			sqljson.Append(u, channel.FieldSupportedModels, value)
 		})
 	}
+	if value, ok := _u.mutation.ManualModels(); ok {
+		_spec.SetField(channel.FieldManualModels, field.TypeJSON, value)
+	}
+	if value, ok := _u.mutation.AppendedManualModels(); ok {
+		_spec.AddModifier(func(u *sql.UpdateBuilder) {
+			sqljson.Append(u, channel.FieldManualModels, value)
+		})
+	}
+	if _u.mutation.ManualModelsCleared() {
+		_spec.ClearField(channel.FieldManualModels, field.TypeJSON)
+	}
 	if value, ok := _u.mutation.AutoSyncSupportedModels(); ok {
 		_spec.SetField(channel.FieldAutoSyncSupportedModels, field.TypeBool, value)
+	}
+	if value, ok := _u.mutation.AutoSyncModelPattern(); ok {
+		_spec.SetField(channel.FieldAutoSyncModelPattern, field.TypeString, value)
+	}
+	if _u.mutation.AutoSyncModelPatternCleared() {
+		_spec.ClearField(channel.FieldAutoSyncModelPattern, field.TypeString)
 	}
 	if value, ok := _u.mutation.Tags(); ok {
 		_spec.SetField(channel.FieldTags, field.TypeJSON, value)
@@ -1593,11 +1886,34 @@ func (_u *ChannelUpdateOne) sqlSave(ctx context.Context) (_node *Channel, err er
 	if _u.mutation.ErrorMessageCleared() {
 		_spec.ClearField(channel.FieldErrorMessage, field.TypeString)
 	}
+	if value, ok := _u.mutation.AutoDisabledAt(); ok {
+		_spec.SetField(channel.FieldAutoDisabledAt, field.TypeTime, value)
+	}
+	if _u.mutation.AutoDisabledAtCleared() {
+		_spec.ClearField(channel.FieldAutoDisabledAt, field.TypeTime)
+	}
+	if value, ok := _u.mutation.AutoDisableExpiresAt(); ok {
+		_spec.SetField(channel.FieldAutoDisableExpiresAt, field.TypeTime, value)
+	}
+	if _u.mutation.AutoDisableExpiresAtCleared() {
+		_spec.ClearField(channel.FieldAutoDisableExpiresAt, field.TypeTime)
+	}
 	if value, ok := _u.mutation.Remark(); ok {
 		_spec.SetField(channel.FieldRemark, field.TypeString, value)
 	}
 	if _u.mutation.RemarkCleared() {
 		_spec.ClearField(channel.FieldRemark, field.TypeString)
+	}
+	if value, ok := _u.mutation.Endpoints(); ok {
+		_spec.SetField(channel.FieldEndpoints, field.TypeJSON, value)
+	}
+	if value, ok := _u.mutation.AppendedEndpoints(); ok {
+		_spec.AddModifier(func(u *sql.UpdateBuilder) {
+			sqljson.Append(u, channel.FieldEndpoints, value)
+		})
+	}
+	if _u.mutation.EndpointsCleared() {
+		_spec.ClearField(channel.FieldEndpoints, field.TypeJSON)
 	}
 	if _u.mutation.RequestsCleared() {
 		edge := &sqlgraph.EdgeSpec{

@@ -2,16 +2,985 @@ package anthropic
 
 import (
 	"encoding/json"
+	"errors"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
+	"github.com/google/go-cmp/cmp/cmpopts"
 	"github.com/stretchr/testify/require"
 
-	"github.com/looplj/axonhub/internal/pkg/xjson"
-	"github.com/looplj/axonhub/internal/pkg/xtest"
+	"github.com/looplj/axonhub/llm"
 	"github.com/looplj/axonhub/llm/httpclient"
+	"github.com/looplj/axonhub/llm/internal/pkg/xjson"
+	"github.com/looplj/axonhub/llm/internal/pkg/xtest"
 	"github.com/looplj/axonhub/llm/streams"
 )
+
+type failingResponseStream struct {
+	items []*llm.Response
+	index int
+	err   error
+}
+
+func (s *failingResponseStream) Next() bool {
+	return s.index < len(s.items)
+}
+
+func (s *failingResponseStream) Current() *llm.Response {
+	item := s.items[s.index]
+	s.index++
+
+	return item
+}
+
+func (s *failingResponseStream) Err() error {
+	return s.err
+}
+
+func (s *failingResponseStream) Close() error {
+	return nil
+}
+
+func TestInboundStream_FinalizesOnCleanExhaustionWithoutFinishReason(t *testing.T) {
+	transformer := NewInboundTransformer()
+	text := "Done"
+	thinking := "Thinking"
+
+	tests := []struct {
+		name               string
+		delta              *llm.Message
+		usage              *llm.Usage
+		expectedStopReason string
+	}{
+		{
+			name: "tool call",
+			delta: &llm.Message{
+				Role: "assistant",
+				ToolCalls: []llm.ToolCall{{
+					Index: 0,
+					ID:    "call_123",
+					Type:  "function",
+					Function: llm.FunctionCall{
+						Name:      "search",
+						Arguments: `{"query":"test"}`,
+					},
+				}},
+			},
+			usage: &llm.Usage{
+				CompletionTokens: 7,
+			},
+			expectedStopReason: "tool_use",
+		},
+		{
+			name: "tool call with empty arguments",
+			delta: &llm.Message{
+				Role: "assistant",
+				ToolCalls: []llm.ToolCall{{
+					Index: 0,
+					ID:    "call_empty",
+					Type:  "function",
+					Function: llm.FunctionCall{
+						Name: "list",
+					},
+				}},
+			},
+			expectedStopReason: "tool_use",
+		},
+		{
+			name: "server tool call",
+			delta: &llm.Message{
+				Role: "assistant",
+				ToolCalls: []llm.ToolCall{{
+					Index: 0,
+					ID:    "server_tool_123",
+					Type:  "function",
+					Function: llm.FunctionCall{
+						Name:      "web_search",
+						Arguments: `{"query":"test"}`,
+					},
+					TransformerMetadata: map[string]any{
+						TransformerMetadataKeyAnthropicType: "server_tool_use",
+					},
+				}},
+			},
+			expectedStopReason: "end_turn",
+		},
+		{
+			name: "mcp tool call",
+			delta: &llm.Message{
+				Role: "assistant",
+				ToolCalls: []llm.ToolCall{{
+					Index: 0,
+					ID:    "mcp_tool_123",
+					Type:  "function",
+					Function: llm.FunctionCall{
+						Name:      "mcp_search",
+						Arguments: `{"query":"test"}`,
+					},
+					TransformerMetadata: map[string]any{
+						TransformerMetadataKeyAnthropicType: "mcp_tool_use",
+					},
+				}},
+			},
+			expectedStopReason: "end_turn",
+		},
+		{
+			name: "text",
+			delta: &llm.Message{
+				Role: "assistant",
+				Content: llm.MessageContent{
+					Content: &text,
+				},
+			},
+			expectedStopReason: "end_turn",
+		},
+		{
+			name: "thinking",
+			delta: &llm.Message{
+				Role:             "assistant",
+				ReasoningContent: &thinking,
+			},
+			expectedStopReason: "end_turn",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			input := []*llm.Response{
+				{
+					ID:     "msg_missing_finish_reason",
+					Object: "chat.completion.chunk",
+					Model:  "claude-sonnet-4-6",
+					Choices: []llm.Choice{{
+						Index: 0,
+						Delta: tt.delta,
+					}},
+				},
+				{
+					ID:      "msg_missing_finish_reason",
+					Object:  "chat.completion.chunk",
+					Model:   "claude-sonnet-4-6",
+					Choices: []llm.Choice{{Index: 0}},
+					Usage:   tt.usage,
+				},
+			}
+
+			events := collectInboundStreamEvents(t, transformer, input)
+			require.GreaterOrEqual(t, len(events), 3)
+
+			terminalEvents := events[len(events)-3:]
+			require.Equal(t, "content_block_stop", terminalEvents[0].Type)
+			require.Equal(t, "message_delta", terminalEvents[1].Type)
+			require.NotNil(t, terminalEvents[1].Delta)
+			require.Equal(t, tt.expectedStopReason, *terminalEvents[1].Delta.StopReason)
+			require.NotNil(t, terminalEvents[1].Usage)
+			if tt.usage == nil {
+				require.Zero(t, terminalEvents[1].Usage.OutputTokens)
+			} else {
+				require.Equal(t, int64(7), terminalEvents[1].Usage.OutputTokens)
+			}
+			require.Equal(t, "message_stop", terminalEvents[2].Type)
+		})
+	}
+}
+
+func TestInboundStream_RejectsIncompleteToolArgumentsOnCleanExhaustion(t *testing.T) {
+	tests := []struct {
+		name      string
+		arguments string
+	}{
+		{name: "truncated object", arguments: `{"content":"unfinished`},
+		{name: "null", arguments: `null`},
+		{name: "array", arguments: `[]`},
+		{name: "string", arguments: `"value"`},
+		{name: "number", arguments: `1`},
+		{name: "boolean", arguments: `true`},
+		{name: "whitespace", arguments: ` `},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			transformer := NewInboundTransformer()
+			input := []*llm.Response{{
+				ID:     "msg_incomplete_tool",
+				Object: "chat.completion.chunk",
+				Model:  "test-model",
+				Choices: []llm.Choice{{
+					Index: 0,
+					Delta: &llm.Message{
+						Role: "assistant",
+						ToolCalls: []llm.ToolCall{{
+							Index: 0,
+							ID:    "call_incomplete",
+							Type:  "function",
+							Function: llm.FunctionCall{
+								Name:      "write",
+								Arguments: tt.arguments,
+							},
+						}},
+					},
+				}},
+			}}
+
+			stream, err := transformer.TransformStream(t.Context(), streams.SliceStream(input))
+			require.NoError(t, err)
+
+			var events []StreamEvent
+			for stream.Next() {
+				var event StreamEvent
+				require.NoError(t, json.Unmarshal(stream.Current().Data, &event))
+				events = append(events, event)
+			}
+
+			require.ErrorContains(t, stream.Err(), "invalid tool call arguments")
+			require.Zero(t, countStreamEvents(events, "content_block_stop"))
+			require.Zero(t, countStreamEvents(events, "message_delta"))
+			require.Zero(t, countStreamEvents(events, "message_stop"))
+		})
+	}
+}
+
+func TestInboundStream_PreservesExplicitFinishReasonWithMalformedToolArguments(t *testing.T) {
+	transformer := NewInboundTransformer()
+	finishReason := "tool_calls"
+	input := []*llm.Response{
+		{
+			ID:     "msg_incomplete_tool",
+			Object: "chat.completion.chunk",
+			Model:  "test-model",
+			Choices: []llm.Choice{{
+				Index: 0,
+				Delta: &llm.Message{
+					Role: "assistant",
+					ToolCalls: []llm.ToolCall{{
+						Index: 0,
+						ID:    "call_incomplete",
+						Type:  "function",
+						Function: llm.FunctionCall{
+							Name:      "write",
+							Arguments: `{"content":"unfinished`,
+						},
+					}},
+				},
+			}},
+		},
+		{
+			ID:     "msg_incomplete_tool",
+			Object: "chat.completion.chunk",
+			Model:  "test-model",
+			Choices: []llm.Choice{{
+				Index:        0,
+				FinishReason: &finishReason,
+			}},
+			Usage: &llm.Usage{CompletionTokens: 10},
+		},
+	}
+
+	stream, err := transformer.TransformStream(t.Context(), streams.SliceStream(input))
+	require.NoError(t, err)
+
+	var events []StreamEvent
+	for stream.Next() {
+		var event StreamEvent
+		require.NoError(t, json.Unmarshal(stream.Current().Data, &event))
+		events = append(events, event)
+	}
+
+	require.NoError(t, stream.Err())
+	require.Equal(t, 1, countStreamEvents(events, "content_block_stop"))
+	require.Equal(t, 1, countStreamEvents(events, "message_delta"))
+	require.Equal(t, 1, countStreamEvents(events, "message_stop"))
+	for _, event := range events {
+		if event.Type == "message_delta" {
+			require.NotNil(t, event.Delta)
+			require.NotNil(t, event.Delta.StopReason)
+			require.Equal(t, "tool_use", *event.Delta.StopReason)
+			require.NotNil(t, event.Usage)
+			require.Equal(t, int64(10), event.Usage.OutputTokens)
+		}
+	}
+}
+
+func TestInboundStream_RejectsInvalidEarlierReadArgumentsOnCleanExhaustion(t *testing.T) {
+	transformer := NewInboundTransformer()
+	input := []*llm.Response{{
+		ID:     "msg_multiple_tools",
+		Object: "chat.completion.chunk",
+		Model:  "test-model",
+		Choices: []llm.Choice{{
+			Index: 0,
+			Delta: &llm.Message{
+				Role: "assistant",
+				ToolCalls: []llm.ToolCall{
+					{
+						Index: 0,
+						ID:    "call_invalid",
+						Type:  "function",
+						Function: llm.FunctionCall{
+							Name:      "Read",
+							Arguments: `{"content":"unfinished`,
+						},
+					},
+					{
+						Index: 1,
+						ID:    "call_valid",
+						Type:  "function",
+						Function: llm.FunctionCall{
+							Name:      "bash",
+							Arguments: `{"command":"true"}`,
+						},
+					},
+				},
+			},
+		}},
+	}}
+
+	stream, err := transformer.TransformStream(t.Context(), streams.SliceStream(input))
+	require.NoError(t, err)
+
+	var events []StreamEvent
+	for stream.Next() {
+		var event StreamEvent
+		require.NoError(t, json.Unmarshal(stream.Current().Data, &event))
+		events = append(events, event)
+	}
+
+	require.ErrorContains(t, stream.Err(), "invalid tool call arguments")
+	require.Zero(t, countStreamEvents(events, "message_delta"))
+	require.Zero(t, countStreamEvents(events, "message_stop"))
+}
+
+func TestInboundStream_PreservesExplicitFinishReasonWithoutUsage(t *testing.T) {
+	transformer := NewInboundTransformer()
+	finishReason := "tool_calls"
+	input := []*llm.Response{
+		{
+			ID:     "msg_incomplete_tool",
+			Object: "chat.completion.chunk",
+			Model:  "test-model",
+			Choices: []llm.Choice{{
+				Index: 0,
+				Delta: &llm.Message{
+					Role: "assistant",
+					ToolCalls: []llm.ToolCall{{
+						Index: 0,
+						ID:    "call_incomplete",
+						Type:  "function",
+						Function: llm.FunctionCall{
+							Name:      "write",
+							Arguments: `{"content":"unfinished`,
+						},
+					}},
+				},
+			}},
+		},
+		{
+			ID:     "msg_incomplete_tool",
+			Object: "chat.completion.chunk",
+			Model:  "test-model",
+			Choices: []llm.Choice{{
+				Index:        0,
+				FinishReason: &finishReason,
+			}},
+		},
+	}
+
+	stream, err := transformer.TransformStream(t.Context(), streams.SliceStream(input))
+	require.NoError(t, err)
+
+	var events []StreamEvent
+	for stream.Next() {
+		var event StreamEvent
+		require.NoError(t, json.Unmarshal(stream.Current().Data, &event))
+		events = append(events, event)
+	}
+
+	require.NoError(t, stream.Err())
+	require.Equal(t, 1, countStreamEvents(events, "message_delta"))
+	require.Equal(t, 1, countStreamEvents(events, "message_stop"))
+	for _, event := range events {
+		if event.Type == "message_delta" {
+			require.NotNil(t, event.Delta)
+			require.NotNil(t, event.Delta.StopReason)
+			require.Equal(t, "tool_use", *event.Delta.StopReason)
+			require.NotNil(t, event.Usage)
+			require.Zero(t, event.Usage.OutputTokens)
+		}
+	}
+}
+
+// TestInboundStream_UsesUsageFromFinalUsageOnlyChunk reproduces the ModelScope
+// streaming shape, where every chunk carries a zeroed usage object and only the
+// trailing usage-only chunk (empty choices) reports the real counts. The
+// finish_reason chunk must not finalize the message with the placeholder zero
+// usage, otherwise the real counts that arrive afterwards are dropped.
+func TestInboundStream_UsesUsageFromFinalUsageOnlyChunk(t *testing.T) {
+	transformer := NewInboundTransformer()
+	text := "Hi"
+	finishReason := "stop"
+
+	events := collectInboundStreamEvents(t, transformer, []*llm.Response{
+		{
+			ID:     "chatcmpl-modelscope",
+			Object: "chat.completion.chunk",
+			Model:  "deepseek-v4.1-flash",
+			Choices: []llm.Choice{{
+				Index: 0,
+				Delta: &llm.Message{
+					Role:    "assistant",
+					Content: llm.MessageContent{Content: &text},
+				},
+			}},
+			Usage: &llm.Usage{},
+		},
+		{
+			ID:     "chatcmpl-modelscope",
+			Object: "chat.completion.chunk",
+			Model:  "deepseek-v4.1-flash",
+			Choices: []llm.Choice{{
+				Index:        0,
+				FinishReason: &finishReason,
+			}},
+			Usage: &llm.Usage{},
+		},
+		{
+			ID:     "chatcmpl-modelscope",
+			Object: "chat.completion.chunk",
+			Model:  "deepseek-v4.1-flash",
+			Choices: []llm.Choice{},
+			Usage: &llm.Usage{
+				PromptTokens:     338678,
+				CompletionTokens: 5795,
+				TotalTokens:      344473,
+				PromptTokensDetails: &llm.PromptTokensDetails{
+					CachedTokens: 100,
+				},
+			},
+		},
+	})
+
+	require.Equal(t, 1, countStreamEvents(events, "message_delta"))
+	require.Equal(t, 1, countStreamEvents(events, "message_stop"))
+
+	var deltaUsage *Usage
+
+	for _, event := range events {
+		if event.Type == "message_delta" {
+			deltaUsage = event.Usage
+		}
+	}
+
+	require.NotNil(t, deltaUsage)
+	// Anthropic reports cached tokens separately and excludes them from input_tokens.
+	require.EqualValues(t, 338578, deltaUsage.InputTokens)
+	require.EqualValues(t, 100, deltaUsage.CacheReadInputTokens)
+	require.EqualValues(t, 5795, deltaUsage.OutputTokens)
+}
+
+// TestInboundStream_UsesUsageFromFinishChunkWithoutUsageOnlyChunk covers providers
+// that report usage only on the chunk carrying finish_reason and never send a
+// separate usage-only chunk. The terminal event is emitted at clean stream end,
+// so the usage collected along the way must still reach message_delta.
+func TestInboundStream_UsesUsageFromFinishChunkWithoutUsageOnlyChunk(t *testing.T) {
+	transformer := NewInboundTransformer()
+	text := "Hi"
+	finishReason := "stop"
+
+	events := collectInboundStreamEvents(t, transformer, []*llm.Response{
+		{
+			ID:     "chatcmpl-standard",
+			Object: "chat.completion.chunk",
+			Model:  "gpt-4o",
+			Choices: []llm.Choice{{
+				Index: 0,
+				Delta: &llm.Message{
+					Role:    "assistant",
+					Content: llm.MessageContent{Content: &text},
+				},
+			}},
+		},
+		{
+			ID:     "chatcmpl-standard",
+			Object: "chat.completion.chunk",
+			Model:  "gpt-4o",
+			Choices: []llm.Choice{{
+				Index:        0,
+				FinishReason: &finishReason,
+			}},
+			Usage: &llm.Usage{
+				PromptTokens:     120,
+				CompletionTokens: 8,
+				TotalTokens:      128,
+			},
+		},
+	})
+
+	require.Equal(t, 1, countStreamEvents(events, "message_delta"))
+	require.Equal(t, 1, countStreamEvents(events, "message_stop"))
+
+	var deltaUsage *Usage
+
+	for _, event := range events {
+		if event.Type == "message_delta" {
+			deltaUsage = event.Usage
+		}
+	}
+
+	require.NotNil(t, deltaUsage)
+	require.EqualValues(t, 120, deltaUsage.InputTokens)
+	require.EqualValues(t, 8, deltaUsage.OutputTokens)
+}
+
+func TestInboundStream_DoesNotDuplicateTerminalEvents(t *testing.T) {
+	transformer := NewInboundTransformer()
+	text := "Done"
+	finishReason := "stop"
+
+	events := collectInboundStreamEvents(t, transformer, []*llm.Response{
+		{
+			ID:     "msg_with_finish_reason",
+			Object: "chat.completion.chunk",
+			Model:  "claude-sonnet-4-6",
+			Choices: []llm.Choice{{
+				Index: 0,
+				Delta: &llm.Message{
+					Role: "assistant",
+					Content: llm.MessageContent{
+						Content: &text,
+					},
+				},
+			}},
+		},
+		{
+			ID:     "msg_with_finish_reason",
+			Object: "chat.completion.chunk",
+			Model:  "claude-sonnet-4-6",
+			Choices: []llm.Choice{{
+				Index:        0,
+				FinishReason: &finishReason,
+			}},
+			Usage: &llm.Usage{},
+		},
+	})
+
+	require.Equal(t, 1, countStreamEvents(events, "message_delta"))
+	require.Equal(t, 1, countStreamEvents(events, "message_stop"))
+}
+
+func TestInboundStream_DoesNotFinalizeOnSourceError(t *testing.T) {
+	transformer := NewInboundTransformer()
+	text := "Partial"
+	sourceErr := errors.New("upstream stream failed")
+	source := &failingResponseStream{
+		items: []*llm.Response{{
+			ID:     "msg_stream_error",
+			Object: "chat.completion.chunk",
+			Model:  "claude-sonnet-4-6",
+			Choices: []llm.Choice{{
+				Index: 0,
+				Delta: &llm.Message{
+					Role: "assistant",
+					Content: llm.MessageContent{
+						Content: &text,
+					},
+				},
+			}},
+		}},
+		err: sourceErr,
+	}
+
+	stream, err := transformer.TransformStream(t.Context(), source)
+	require.NoError(t, err)
+
+	var events []StreamEvent
+	for stream.Next() {
+		var event StreamEvent
+		require.NoError(t, json.Unmarshal(stream.Current().Data, &event))
+		events = append(events, event)
+	}
+
+	require.ErrorIs(t, stream.Err(), sourceErr)
+	require.Zero(t, countStreamEvents(events, "message_delta"))
+	require.Zero(t, countStreamEvents(events, "message_stop"))
+}
+
+func countStreamEvents(events []StreamEvent, eventType string) int {
+	count := 0
+	for _, event := range events {
+		if event.Type == eventType {
+			count++
+		}
+	}
+
+	return count
+}
+
+func TestInboundStream_EmitsCitationsDeltaBeforeContentBlockStop(t *testing.T) {
+	transformer := NewInboundTransformer()
+
+	text := "Annotated answer"
+	stop := "stop"
+
+	input := []*llm.Response{
+		{
+			ID:     "msg_annotations_stream",
+			Object: "chat.completion.chunk",
+			Model:  "claude-sonnet-4-6",
+			Choices: []llm.Choice{{
+				Index: 0,
+				Delta: &llm.Message{
+					Role: "assistant",
+					Content: llm.MessageContent{
+						Content: &text,
+					},
+					Annotations: []llm.Annotation{
+						{
+							Type: "url_citation",
+							URLCitation: &llm.URLCitation{
+								URL:   "https://example.com/1",
+								Title: "Source One",
+							},
+						},
+						{
+							Type: "url_citation",
+							URLCitation: &llm.URLCitation{
+								URL:   "https://example.com/2",
+								Title: "Source Two",
+							},
+						},
+					},
+				},
+			}},
+		},
+		{
+			ID:     "msg_annotations_stream",
+			Object: "chat.completion.chunk",
+			Model:  "claude-sonnet-4-6",
+			Choices: []llm.Choice{{
+				Index:        0,
+				FinishReason: &stop,
+			}},
+			Usage: &llm.Usage{},
+		},
+	}
+
+	events := collectInboundStreamEvents(t, transformer, input)
+
+	assertCitationsDeltaBeforeContentBlockStop(t, events, []TextCitation{
+		{
+			Type:  "url_citation",
+			URL:   "https://example.com/1",
+			Title: "Source One",
+		},
+		{
+			Type:  "url_citation",
+			URL:   "https://example.com/2",
+			Title: "Source Two",
+		},
+	})
+}
+
+func TestInboundStream_RemovesEmptyReadPages(t *testing.T) {
+	transformer := NewInboundTransformer()
+	finishReason := "tool_calls"
+
+	input := []*llm.Response{
+		{
+			ID:     "msg_read_pages_stream",
+			Object: "chat.completion.chunk",
+			Model:  "claude-sonnet-4-6",
+			Choices: []llm.Choice{{
+				Index: 0,
+				Delta: &llm.Message{
+					Role: "assistant",
+				},
+			}},
+		},
+		{
+			ID:     "msg_read_pages_stream",
+			Object: "chat.completion.chunk",
+			Model:  "claude-sonnet-4-6",
+			Choices: []llm.Choice{{
+				Index: 0,
+				Delta: &llm.Message{
+					ToolCalls: []llm.ToolCall{{
+						Index: 0,
+						ID:    "call_read",
+						Type:  "function",
+						Function: llm.FunctionCall{
+							Name:      "Read",
+							Arguments: `{"file_path":`,
+						},
+					}},
+				},
+			}},
+		},
+		{
+			ID:     "msg_read_pages_stream",
+			Object: "chat.completion.chunk",
+			Model:  "claude-sonnet-4-6",
+			Choices: []llm.Choice{{
+				Index: 0,
+				Delta: &llm.Message{
+					ToolCalls: []llm.ToolCall{{
+						Index: 0,
+						Function: llm.FunctionCall{
+							Arguments: `"/tmp/a.go","pages":""}`,
+						},
+					}},
+				},
+			}},
+		},
+		{
+			ID:     "msg_read_pages_stream",
+			Object: "chat.completion.chunk",
+			Model:  "claude-sonnet-4-6",
+			Choices: []llm.Choice{{
+				Index:        0,
+				FinishReason: &finishReason,
+			}},
+			Usage: &llm.Usage{},
+		},
+	}
+
+	events := collectInboundStreamEvents(t, transformer, input)
+
+	var argumentDeltas []string
+	for _, event := range events {
+		if event.Type == "content_block_delta" && event.Delta != nil &&
+			event.Delta.Type != nil && *event.Delta.Type == "input_json_delta" &&
+			event.Delta.PartialJSON != nil {
+			argumentDeltas = append(argumentDeltas, *event.Delta.PartialJSON)
+		}
+	}
+
+	require.Len(t, argumentDeltas, 1)
+	require.JSONEq(t, `{"file_path":"/tmp/a.go"}`, argumentDeltas[0])
+}
+
+func TestInboundStream_EmitsCitationsDeltaWhenAnnotationsArriveBeforeText(t *testing.T) {
+	transformer := NewInboundTransformer()
+
+	text := "Annotated after metadata"
+	stop := "stop"
+
+	input := []*llm.Response{
+		{
+			ID:     "msg_annotations_before_text",
+			Object: "chat.completion.chunk",
+			Model:  "claude-sonnet-4-6",
+			Choices: []llm.Choice{{
+				Index: 0,
+				Delta: &llm.Message{
+					Role: "assistant",
+					Annotations: []llm.Annotation{
+						{
+							Type: "url_citation",
+							URLCitation: &llm.URLCitation{
+								URL:   "https://example.com/metadata-first",
+								Title: "Metadata First",
+							},
+						},
+					},
+				},
+			}},
+		},
+		{
+			ID:     "msg_annotations_before_text",
+			Object: "chat.completion.chunk",
+			Model:  "claude-sonnet-4-6",
+			Choices: []llm.Choice{{
+				Index: 0,
+				Delta: &llm.Message{
+					Role: "assistant",
+					Content: llm.MessageContent{
+						Content: &text,
+					},
+				},
+			}},
+		},
+		{
+			ID:     "msg_annotations_before_text",
+			Object: "chat.completion.chunk",
+			Model:  "claude-sonnet-4-6",
+			Choices: []llm.Choice{{
+				Index:        0,
+				FinishReason: &stop,
+			}},
+			Usage: &llm.Usage{},
+		},
+	}
+
+	events := collectInboundStreamEvents(t, transformer, input)
+
+	assertCitationsDeltaBeforeContentBlockStop(t, events, []TextCitation{{
+		Type:  "url_citation",
+		URL:   "https://example.com/metadata-first",
+		Title: "Metadata First",
+	}})
+}
+
+func TestInboundStream_EmitsCitationsDeltaFromChoiceMessageAnnotations(t *testing.T) {
+	transformer := NewInboundTransformer()
+
+	text := "Annotated via choice.message"
+	stop := "stop"
+
+	input := []*llm.Response{
+		{
+			ID:     "msg_choice_message_annotations",
+			Object: "chat.completion.chunk",
+			Model:  "claude-sonnet-4-6",
+			Choices: []llm.Choice{{
+				Index: 0,
+				Message: &llm.Message{
+					Annotations: []llm.Annotation{
+						{
+							Type: "url_citation",
+							URLCitation: &llm.URLCitation{
+								URL:   "https://example.com/message-annotations",
+								Title: "Message Annotation",
+							},
+						},
+					},
+				},
+				Delta: &llm.Message{
+					Role: "assistant",
+					Content: llm.MessageContent{
+						Content: &text,
+					},
+				},
+			}},
+		},
+		{
+			ID:     "msg_choice_message_annotations",
+			Object: "chat.completion.chunk",
+			Model:  "claude-sonnet-4-6",
+			Choices: []llm.Choice{{
+				Index:        0,
+				FinishReason: &stop,
+			}},
+			Usage: &llm.Usage{},
+		},
+	}
+
+	events := collectInboundStreamEvents(t, transformer, input)
+
+	assertCitationsDeltaBeforeContentBlockStop(t, events, []TextCitation{{
+		Type:  "url_citation",
+		URL:   "https://example.com/message-annotations",
+		Title: "Message Annotation",
+	}})
+}
+
+func collectInboundStreamEvents(t *testing.T, transformer *InboundTransformer, input []*llm.Response) []StreamEvent {
+	t.Helper()
+
+	stream, err := transformer.TransformStream(t.Context(), streams.SliceStream(input))
+	require.NoError(t, err)
+
+	var events []StreamEvent
+	for stream.Next() {
+		raw := stream.Current()
+		var event StreamEvent
+		err := json.Unmarshal(raw.Data, &event)
+		require.NoError(t, err)
+		events = append(events, event)
+	}
+	require.NoError(t, stream.Err())
+
+	return events
+}
+
+func assertCitationsDeltaBeforeContentBlockStop(t *testing.T, events []StreamEvent, expected []TextCitation) {
+	t.Helper()
+
+	var (
+		citationEventIndexes  []int
+		contentBlockStopIndex = -1
+		actualCitations       []TextCitation
+	)
+
+	for i, event := range events {
+		if event.Type == "content_block_delta" && event.Delta != nil && event.Delta.Type != nil && *event.Delta.Type == "citations_delta" {
+			citationEventIndexes = append(citationEventIndexes, i)
+			require.NotNil(t, event.Delta.Citation)
+			actualCitations = append(actualCitations, *event.Delta.Citation)
+			require.Nil(t, event.Delta.Citation.EncryptedIndex)
+			require.Nil(t, event.Delta.Citation.CitedText)
+		}
+		if event.Type == "content_block_stop" && event.Index != nil && *event.Index == 0 && contentBlockStopIndex == -1 {
+			contentBlockStopIndex = i
+		}
+	}
+
+	require.Len(t, citationEventIndexes, len(expected))
+	require.NotEqual(t, -1, contentBlockStopIndex)
+	for _, idx := range citationEventIndexes {
+		require.Less(t, idx, contentBlockStopIndex)
+	}
+	require.Equal(t, expected, actualCitations)
+}
+
+func TestInboundStream_NormalizesOpenAIWebSearchCitationTypeFromChunkMetadata(t *testing.T) {
+	transformer := NewInboundTransformer()
+
+	text := "Annotated answer"
+	stop := "stop"
+
+	input := []*llm.Response{
+		{
+			ID:     "msg_annotations_stream_web_search",
+			Object: "chat.completion.chunk",
+			Model:  "gpt-4o-search-preview",
+			TransformerMetadata: map[string]any{
+				"openai_responses_web_search_calls": []map[string]any{{
+					"id":     "ws_123",
+					"type":   "web_search_call",
+					"status": "completed",
+					"action": map[string]any{
+						"type":  "search",
+						"query": "latest ai news",
+					},
+				}},
+			},
+			Choices: []llm.Choice{{
+				Index: 0,
+				Delta: &llm.Message{
+					Role: "assistant",
+					Content: llm.MessageContent{
+						Content: &text,
+					},
+					Annotations: []llm.Annotation{{
+						Type: "url_citation",
+						URLCitation: &llm.URLCitation{
+							URL:   "https://example.com/result",
+							Title: "Example Result",
+						},
+					}},
+				},
+			}},
+		},
+		{
+			ID:     "msg_annotations_stream_web_search",
+			Object: "chat.completion.chunk",
+			Model:  "gpt-4o-search-preview",
+			Choices: []llm.Choice{{
+				Index:        0,
+				FinishReason: &stop,
+			}},
+			Usage: &llm.Usage{},
+		},
+	}
+
+	events := collectInboundStreamEvents(t, transformer, input)
+
+	assertCitationsDeltaBeforeContentBlockStop(t, events, []TextCitation{{
+		Type:  "web_search_result_location",
+		URL:   "https://example.com/result",
+		Title: "Example Result",
+	}})
+}
 
 func TestInboundTransformer_StreamTransformation_WithTestData(t *testing.T) {
 	transformer := NewInboundTransformer()
@@ -281,7 +1250,7 @@ func TestInboundTransformer_StreamTransformation_WithTestData(t *testing.T) {
 					require.NotNil(t, expectedStreamEvent.Delta)
 					require.NotNil(t, actualStreamEvent.Delta)
 
-					if !xtest.Equal(expectedStreamEvent.Delta, actualStreamEvent.Delta) {
+					if !xtest.Equal(expectedStreamEvent.Delta, actualStreamEvent.Delta, cmpopts.IgnoreFields(StreamDelta{}, "Signature")) {
 						t.Errorf("Index: %d, Diff: %s ", i, cmp.Diff(expectedStreamEvent.Delta, actualStreamEvent.Delta))
 					}
 
@@ -302,7 +1271,7 @@ func TestInboundTransformer_StreamTransformation_WithTestData(t *testing.T) {
 
 					require.Equal(t, expectedStreamEvent.Delta.StopReason, actualStreamEvent.Delta.StopReason)
 
-					if !xtest.Equal(expectedStreamEvent.Delta, actualStreamEvent.Delta) {
+					if !xtest.Equal(expectedStreamEvent.Delta, actualStreamEvent.Delta, cmpopts.IgnoreFields(StreamDelta{}, "Signature")) {
 						t.Errorf("Index: %d, Diff: %s ", i, cmp.Diff(expectedStreamEvent.Delta, actualStreamEvent.Delta))
 					}
 

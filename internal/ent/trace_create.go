@@ -79,6 +79,20 @@ func (_c *TraceCreate) SetNillableThreadID(v *int) *TraceCreate {
 	return _c
 }
 
+// SetStatus sets the "status" field.
+func (_c *TraceCreate) SetStatus(v trace.Status) *TraceCreate {
+	_c.mutation.SetStatus(v)
+	return _c
+}
+
+// SetNillableStatus sets the "status" field if the given value is not nil.
+func (_c *TraceCreate) SetNillableStatus(v *trace.Status) *TraceCreate {
+	if v != nil {
+		_c.SetStatus(*v)
+	}
+	return _c
+}
+
 // SetProject sets the "project" edge to the Project entity.
 func (_c *TraceCreate) SetProject(v *Project) *TraceCreate {
 	return _c.SetProjectID(v.ID)
@@ -155,22 +169,28 @@ func (_c *TraceCreate) defaults() error {
 		v := trace.DefaultUpdatedAt()
 		_c.mutation.SetUpdatedAt(v)
 	}
+	if _, ok := _c.mutation.Status(); !ok {
+		v := trace.DefaultStatus
+		_c.mutation.SetStatus(v)
+	}
 	return nil
 }
 
 // check runs all checks and user-defined validators on the builder.
 func (_c *TraceCreate) check() error {
-	if _, ok := _c.mutation.CreatedAt(); !ok {
-		return &ValidationError{Name: "created_at", err: errors.New(`ent: missing required field "Trace.created_at"`)}
-	}
-	if _, ok := _c.mutation.UpdatedAt(); !ok {
-		return &ValidationError{Name: "updated_at", err: errors.New(`ent: missing required field "Trace.updated_at"`)}
-	}
 	if _, ok := _c.mutation.ProjectID(); !ok {
 		return &ValidationError{Name: "project_id", err: errors.New(`ent: missing required field "Trace.project_id"`)}
 	}
 	if _, ok := _c.mutation.TraceID(); !ok {
 		return &ValidationError{Name: "trace_id", err: errors.New(`ent: missing required field "Trace.trace_id"`)}
+	}
+	if _, ok := _c.mutation.Status(); !ok {
+		return &ValidationError{Name: "status", err: errors.New(`ent: missing required field "Trace.status"`)}
+	}
+	if v, ok := _c.mutation.Status(); ok {
+		if err := trace.StatusValidator(v); err != nil {
+			return &ValidationError{Name: "status", err: fmt.Errorf(`ent: validator failed for field "Trace.status": %w`, err)}
+		}
 	}
 	if len(_c.mutation.ProjectIDs()) == 0 {
 		return &ValidationError{Name: "project", err: errors.New(`ent: missing required edge "Trace.project"`)}
@@ -213,6 +233,10 @@ func (_c *TraceCreate) createSpec() (*Trace, *sqlgraph.CreateSpec) {
 	if value, ok := _c.mutation.TraceID(); ok {
 		_spec.SetField(trace.FieldTraceID, field.TypeString, value)
 		_node.TraceID = value
+	}
+	if value, ok := _c.mutation.Status(); ok {
+		_spec.SetField(trace.FieldStatus, field.TypeEnum, value)
+		_node.Status = value
 	}
 	if nodes := _c.mutation.ProjectIDs(); len(nodes) > 0 {
 		edge := &sqlgraph.EdgeSpec{
@@ -340,6 +364,18 @@ func (u *TraceUpsert) UpdateTraceID() *TraceUpsert {
 	return u
 }
 
+// SetStatus sets the "status" field.
+func (u *TraceUpsert) SetStatus(v trace.Status) *TraceUpsert {
+	u.Set(trace.FieldStatus, v)
+	return u
+}
+
+// UpdateStatus sets the "status" field to the value that was provided on create.
+func (u *TraceUpsert) UpdateStatus() *TraceUpsert {
+	u.SetExcluded(trace.FieldStatus)
+	return u
+}
+
 // UpdateNewValues updates the mutable fields using the new values that were set on create.
 // Using this option is equivalent to using:
 //
@@ -416,6 +452,20 @@ func (u *TraceUpsertOne) SetTraceID(v string) *TraceUpsertOne {
 func (u *TraceUpsertOne) UpdateTraceID() *TraceUpsertOne {
 	return u.Update(func(s *TraceUpsert) {
 		s.UpdateTraceID()
+	})
+}
+
+// SetStatus sets the "status" field.
+func (u *TraceUpsertOne) SetStatus(v trace.Status) *TraceUpsertOne {
+	return u.Update(func(s *TraceUpsert) {
+		s.SetStatus(v)
+	})
+}
+
+// UpdateStatus sets the "status" field to the value that was provided on create.
+func (u *TraceUpsertOne) UpdateStatus() *TraceUpsertOne {
+	return u.Update(func(s *TraceUpsert) {
+		s.UpdateStatus()
 	})
 }
 
@@ -661,6 +711,20 @@ func (u *TraceUpsertBulk) SetTraceID(v string) *TraceUpsertBulk {
 func (u *TraceUpsertBulk) UpdateTraceID() *TraceUpsertBulk {
 	return u.Update(func(s *TraceUpsert) {
 		s.UpdateTraceID()
+	})
+}
+
+// SetStatus sets the "status" field.
+func (u *TraceUpsertBulk) SetStatus(v trace.Status) *TraceUpsertBulk {
+	return u.Update(func(s *TraceUpsert) {
+		s.SetStatus(v)
+	})
+}
+
+// UpdateStatus sets the "status" field to the value that was provided on create.
+func (u *TraceUpsertBulk) UpdateStatus() *TraceUpsertBulk {
+	return u.Update(func(s *TraceUpsert) {
+		s.UpdateStatus()
 	})
 }
 

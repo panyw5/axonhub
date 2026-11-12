@@ -11,6 +11,7 @@ import (
 	"github.com/looplj/axonhub/internal/ent/channel"
 	"github.com/looplj/axonhub/internal/ent/channeloverridetemplate"
 	"github.com/looplj/axonhub/internal/objects"
+	"github.com/looplj/axonhub/internal/pkg/xerrors"
 )
 
 // ChannelOverrideTemplateService handles CRUD and application of channel override templates.
@@ -62,6 +63,12 @@ func (svc *ChannelOverrideTemplateService) CreateTemplate(
 		SetBodyOverrideOperations(input.BodyOverrideOperations).
 		Save(ctx)
 	if err != nil {
+		// Name uniqueness is enforced by the (user_id, name, deleted_at) unique
+		// index; surface a friendly error instead of a raw constraint violation.
+		if ent.IsConstraintError(err) {
+			return nil, xerrors.DuplicateNameError("Template", input.Name)
+		}
+
 		return nil, fmt.Errorf("failed to create channel override template: %w", err)
 	}
 
@@ -120,6 +127,13 @@ func (svc *ChannelOverrideTemplateService) UpdateTemplate(
 
 	template, err := mut.Save(ctx)
 	if err != nil {
+		// Renaming onto another template's name violates the
+		// (user_id, name, deleted_at) unique index; report it as a name conflict
+		// so the client can show which name is already taken.
+		if ent.IsConstraintError(err) && input.Name != nil {
+			return nil, xerrors.DuplicateNameError("Template", *input.Name)
+		}
+
 		return nil, fmt.Errorf("failed to update channel override template: %w", err)
 	}
 
@@ -145,11 +159,22 @@ func (svc *ChannelOverrideTemplateService) GetTemplate(ctx context.Context, id i
 	return template, nil
 }
 
+// ApplyTemplateMode specifies how to apply a template to channels.
+type ApplyTemplateMode string
+
+const (
+	// ApplyTemplateModeMerge merges template operations with existing channel operations.
+	ApplyTemplateModeMerge ApplyTemplateMode = "MERGE"
+	// ApplyTemplateModeReplace clears existing operations then applies template operations.
+	ApplyTemplateModeReplace ApplyTemplateMode = "REPLACE"
+)
+
 // ApplyTemplate applies the template to the given channels atomically.
 func (svc *ChannelOverrideTemplateService) ApplyTemplate(
 	ctx context.Context,
 	templateID int,
 	channelIDs []int,
+	mode ApplyTemplateMode,
 ) (updated []*ent.Channel, err error) {
 	db := svc.entFromContext(ctx)
 
@@ -181,24 +206,28 @@ func (svc *ChannelOverrideTemplateService) ApplyTemplate(
 				settings = *ch.Settings
 			}
 
-			// Get existing header operations from channel settings
-			existingHeaderOps := getHeaderOverrideOperations(&settings)
+			var (
+				newHeaderOps []objects.OverrideOperation
+				newBodyOps   []objects.OverrideOperation
+			)
 
-			// Merge template header operations with existing channel header operations
-			mergedHeaderOps := MergeOverrideHeaders(existingHeaderOps, template.HeaderOverrideOperations)
-			settings.HeaderOverrideOperations = mergedHeaderOps
+			if mode == ApplyTemplateModeReplace {
+				// Replace mode: use template operations directly, ignoring existing
+				newHeaderOps = template.HeaderOverrideOperations
+				newBodyOps = template.BodyOverrideOperations
+			} else {
+				// Default: merge mode
+				existingHeaderOps := getHeaderOverrideOperations(&settings)
+				newHeaderOps = MergeOverrideHeaders(existingHeaderOps, template.HeaderOverrideOperations)
 
-			// Clear legacy header field
+				existingBodyOps := getBodyOverrideOperations(&settings)
+				newBodyOps = MergeOverrideOperations(existingBodyOps, template.BodyOverrideOperations)
+			}
+
+			settings.HeaderOverrideOperations = newHeaderOps
 			settings.OverrideHeaders = nil
 
-			// Get existing body operations from channel settings
-			existingBodyOps := getBodyOverrideOperations(&settings)
-
-			// Merge template body operations with existing channel body operations
-			mergedBodyOps := MergeOverrideOperations(existingBodyOps, template.BodyOverrideOperations)
-			settings.BodyOverrideOperations = mergedBodyOps
-
-			// Clear legacy body parameters field
+			settings.BodyOverrideOperations = newBodyOps
 			settings.OverrideParameters = ""
 
 			updatedChannel, err := db.Channel.UpdateOneID(ch.ID).
@@ -218,7 +247,64 @@ func (svc *ChannelOverrideTemplateService) ApplyTemplate(
 	}
 
 	if svc.channelService != nil {
-		svc.channelService.asyncReloadChannels()
+		svc.channelService.reloadChannelsAfterCommit(ctx)
+	}
+
+	return updated, nil
+}
+
+// ClearTemplates clears header and body override operations from the given channels.
+func (svc *ChannelOverrideTemplateService) ClearTemplates(
+	ctx context.Context,
+	channelIDs []int,
+) (updated []*ent.Channel, err error) {
+	db := svc.entFromContext(ctx)
+
+	channels, err := db.Channel.Query().
+		Where(channel.IDIn(channelIDs...)).
+		All(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query channels: %w", err)
+	}
+
+	if len(channels) != len(channelIDs) {
+		return nil, fmt.Errorf("some channels not found for provided IDs")
+	}
+
+	updated = make([]*ent.Channel, 0, len(channels))
+
+	err = svc.RunInTransaction(ctx, func(ctx context.Context) error {
+		db := svc.entFromContext(ctx)
+
+		for _, ch := range channels {
+			settings := objects.ChannelSettings{}
+			if ch.Settings != nil {
+				settings = *ch.Settings
+			}
+
+			settings.HeaderOverrideOperations = nil
+			settings.OverrideHeaders = nil
+			settings.BodyOverrideOperations = nil
+			settings.OverrideParameters = ""
+
+			updatedChannel, err := db.Channel.UpdateOneID(ch.ID).
+				SetSettings(&settings).
+				Save(ctx)
+			if err != nil {
+				return fmt.Errorf("failed to update channel %s: %w", ch.Name, err)
+			}
+
+			updated = append(updated, updatedChannel)
+		}
+
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	if svc.channelService != nil {
+		svc.channelService.reloadChannelsAfterCommit(ctx)
 	}
 
 	return updated, nil
@@ -258,37 +344,47 @@ func getBodyOverrideOperations(settings *objects.ChannelSettings) []objects.Over
 }
 
 // MergeOverrideOperations merges existing body operations with template operations.
-// - For set/delete ops, matching is by Path. Template overrides existing.
-// - For rename/copy ops, they are always appended.
+// - For set/set_if_absent/delete ops, template paths replace matching existing operations.
+// - Template operations remain ordered because multiple conditions at the same path are meaningful.
+// - For rename/copy and array_* ops, they are always appended (multiple of the same path are meaningful).
 // - Existing ops not mentioned in the template are preserved.
 func MergeOverrideOperations(existing, template []objects.OverrideOperation) []objects.OverrideOperation {
 	result := make([]objects.OverrideOperation, 0, len(existing)+len(template))
-	result = append(result, existing...)
-
+	templateOpsByPath := make(map[string][]objects.OverrideOperation, len(template))
 	for _, op := range template {
-		if op.Op == objects.OverrideOpRename || op.Op == objects.OverrideOpCopy {
-			result = append(result, op)
-			continue
-		}
-
-		found := false
-
-		for i := range result {
-			if (result[i].Op == objects.OverrideOpSet || result[i].Op == objects.OverrideOpDelete) &&
-				result[i].Path == op.Path {
-				result[i] = op
-				found = true
-
-				break
-			}
-		}
-
-		if !found {
-			result = append(result, op)
+		if isReplacingBodyOverrideOperation(op.Op) {
+			templateOpsByPath[op.Path] = append(templateOpsByPath[op.Path], op)
 		}
 	}
 
+	emittedTemplatePaths := make(map[string]struct{}, len(templateOpsByPath))
+	for _, op := range existing {
+		if isReplacingBodyOverrideOperation(op.Op) {
+			if replacements, ok := templateOpsByPath[op.Path]; ok {
+				if _, emitted := emittedTemplatePaths[op.Path]; !emitted {
+					result = append(result, replacements...)
+					emittedTemplatePaths[op.Path] = struct{}{}
+				}
+				continue
+			}
+		}
+		result = append(result, op)
+	}
+
+	for _, op := range template {
+		if isReplacingBodyOverrideOperation(op.Op) {
+			if _, emitted := emittedTemplatePaths[op.Path]; emitted {
+				continue
+			}
+		}
+		result = append(result, op)
+	}
+
 	return result
+}
+
+func isReplacingBodyOverrideOperation(op string) bool {
+	return op == objects.OverrideOpSet || op == objects.OverrideOpSetIfAbsent || op == objects.OverrideOpDelete
 }
 
 // QueryChannelOverrideTemplatesInput represents the input for querying templates.

@@ -2,18 +2,55 @@ package orchestrator
 
 import (
 	"context"
+	"net/http"
+	"regexp"
+	"sync/atomic"
 	"time"
 
 	"github.com/tidwall/gjson"
 
+	"github.com/looplj/axonhub/internal/ent/requestexecution"
 	"github.com/looplj/axonhub/internal/log"
 	"github.com/looplj/axonhub/internal/pkg/xcontext"
 	"github.com/looplj/axonhub/internal/pkg/xerrors"
 	"github.com/looplj/axonhub/internal/server/biz"
 	"github.com/looplj/axonhub/llm"
 	"github.com/looplj/axonhub/llm/httpclient"
+	"github.com/looplj/axonhub/llm/modelname"
 	"github.com/looplj/axonhub/llm/pipeline"
 )
+
+// Precompiled regex patterns for sanitizeResponseBody to avoid recompiling on each call.
+var (
+	tokenRegex  = regexp.MustCompile(`(?i)(bearer[\s:=]+)[a-zA-Z0-9_\-\.]+`)
+	apiKeyRegex = regexp.MustCompile(`(api[keyK]ey|API[keyK]ey)["']?\s*[:=]\s*["']?([a-zA-Z0-9_\-\.]{8,})["']?`)
+	emailRegex  = regexp.MustCompile(`[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}`)
+)
+
+// sanitizeResponseBody redacts obvious secrets and truncates the body for safe logging.
+func sanitizeResponseBody(body []byte, maxLen int) []byte {
+	if len(body) == 0 {
+		return body
+	}
+
+	str := string(body)
+
+	// Redact bearer tokens (case-insensitive), preserving the bearer prefix
+	str = tokenRegex.ReplaceAllString(str, "${1}[REDACTED]")
+
+	// Redact API keys (common patterns)
+	str = apiKeyRegex.ReplaceAllString(str, "$1=[REDACTED]")
+
+	// Redact email addresses
+	str = emailRegex.ReplaceAllString(str, "[EMAIL REDACTED]")
+
+	// Truncate if too long
+	if len(str) > maxLen {
+		str = str[:maxLen] + "..."
+	}
+
+	return []byte(str)
+}
 
 // persistRequestExecutionMiddleware ensures a request execution exists and handles error updates.
 type persistRequestExecutionMiddleware struct {
@@ -21,7 +58,23 @@ type persistRequestExecutionMiddleware struct {
 
 	outbound *PersistentOutboundTransformer
 
-	rawResponse *httpclient.Response
+	rawResponse    *httpclient.Response
+	headerObserver *executionHeaderObserver
+}
+
+type executionHeaderObserver struct {
+	service     *biz.RequestService
+	executionID int
+	observed    atomic.Bool
+}
+
+func (o *executionHeaderObserver) observe(ctx context.Context, headers http.Header) {
+	o.observed.Store(true)
+	persistCtx, cancel := xcontext.DetachWithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	if err := o.service.UpdateRequestExecutionResponseHeaders(persistCtx, o.executionID, headers); err != nil {
+		log.Warn(persistCtx, "Failed to save execution response headers", log.Cause(err))
+	}
 }
 
 func persistRequestExecution(outbound *PersistentOutboundTransformer) pipeline.Middleware {
@@ -35,8 +88,19 @@ func (m *persistRequestExecutionMiddleware) Name() string {
 }
 
 func (m *persistRequestExecutionMiddleware) OnOutboundRawRequest(ctx context.Context, request *httpclient.Request) (*httpclient.Request, error) {
+	// This middleware is reused across attempts. Response metadata belongs only
+	// to the execution created for this outbound request.
+	m.rawResponse = nil
+
 	state := m.outbound.state
-	if state == nil || state.RequestExec != nil {
+	if state == nil {
+		return request, nil
+	}
+	if state.RequestExec != nil {
+		if m.headerObserver != nil {
+			m.headerObserver.observed.Store(false)
+			request.OnResponseHeaders = m.headerObserver.observe
+		}
 		return request, nil
 	}
 
@@ -45,6 +109,15 @@ func (m *persistRequestExecutionMiddleware) OnOutboundRawRequest(ctx context.Con
 		return request, nil
 	}
 
+	// Prefer the API format of the actual outbound request: transformers may emit
+	// multiple formats (e.g. OpenAI outbound also builds audio speech/transcription
+	// requests) while APIFormat() only reports the primary one.
+	format := m.outbound.APIFormat()
+	if request.APIFormat != "" {
+		format = llm.APIFormat(request.APIFormat)
+	}
+	// Keep the channel model used for routing and pricing. Provider transforms
+	// and body overrides may change the model in the final HTTP request.
 	candidate := state.ChannelModelsCandidates[state.CurrentCandidateIndex]
 	entry := candidate.Models[state.CurrentModelIndex]
 
@@ -54,7 +127,8 @@ func (m *persistRequestExecutionMiddleware) OnOutboundRawRequest(ctx context.Con
 		entry.ActualModel,
 		state.Request,
 		*request,
-		m.outbound.APIFormat(),
+		format,
+		state.PassThroughApplied,
 	)
 	if err != nil {
 		return nil, err
@@ -71,12 +145,17 @@ func (m *persistRequestExecutionMiddleware) OnOutboundRawRequest(ctx context.Con
 	}
 
 	state.RequestExec = requestExec
+	m.headerObserver = &executionHeaderObserver{service: state.RequestService, executionID: requestExec.ID}
+	request.OnResponseHeaders = m.headerObserver.observe
 
 	return request, nil
 }
 
 func (m *persistRequestExecutionMiddleware) OnOutboundRawResponse(ctx context.Context, response *httpclient.Response) (*httpclient.Response, error) {
 	m.rawResponse = response
+	if response != nil && m.headerObserver != nil && !m.headerObserver.observed.Load() {
+		m.headerObserver.observe(ctx, response.Headers)
+	}
 	return response, nil
 }
 
@@ -106,14 +185,9 @@ func (m *persistRequestExecutionMiddleware) OnOutboundLlmResponse(ctx context.Co
 			if state.Perf.Stream && state.Perf.FirstTokenTime != nil {
 				firstTokenLatencyMs = state.Perf.FirstTokenTime.Sub(state.Perf.StartTime).Milliseconds()
 			}
-		}
 
-		if requestLatencyMs < 0 {
-			requestLatencyMs = 0
-		}
-
-		if firstTokenLatencyMs < 0 {
-			firstTokenLatencyMs = 0
+			requestLatencyMs = biz.ClampLatency(requestLatencyMs)
+			firstTokenLatencyMs = biz.ClampLatency(firstTokenLatencyMs)
 		}
 
 		metrics = &biz.LatencyMetrics{
@@ -122,14 +196,28 @@ func (m *persistRequestExecutionMiddleware) OnOutboundLlmResponse(ctx context.Co
 		if state.Perf.Stream && state.Perf.FirstTokenTime != nil {
 			metrics.FirstTokenLatencyMs = &firstTokenLatencyMs
 		}
+
+		if state.Perf.Stream {
+			reasoningDurationMs := state.Perf.CalculateReasoningDurationMs()
+			if reasoningDurationMs > 0 {
+				metrics.ReasoningDurationMs = &reasoningDurationMs
+			}
+		}
 	}
 
-	err := state.RequestService.UpdateRequestExecutionCompleted(
+	// Audio responses (binary TTS / non-JSON STT) must be converted to JSON-safe payloads
+	// before persisting into the JSON response_body column.
+	respBody := audioSafeResponseBody(llmResp.RequestType, m.rawResponse.Headers.Get("Content-Type"), m.rawResponse.Body)
+
+	err := state.RequestService.UpdateRequestExecutionFinalized(
 		persistCtx,
 		state.RequestExec.ID,
+		requestexecution.StatusCompleted,
+		"",
 		llmResp.ID,
-		m.rawResponse.Body,
+		respBody,
 		metrics,
+		modelname.FromResponse(m.rawResponse, llm.APIFormat(state.RequestExec.Format)),
 	)
 	if err != nil {
 		log.Warn(persistCtx, "Failed to update request execution status to completed", log.Cause(err))
@@ -156,6 +244,11 @@ func (m *persistRequestExecutionMiddleware) OnOutboundRawError(ctx context.Conte
 		if modelID := m.outbound.GetCurrentModelID(); modelID != "" {
 			logFields = append(logFields, log.String("model_id", modelID))
 		}
+		// Add response body for HTTP errors to help debug 400 errors (sanitized for PII)
+		if httpErr, ok := xerrors.As[*httpclient.Error](err); ok && len(httpErr.Body) > 0 {
+			sanitizedBody := sanitizeResponseBody(httpErr.Body, 1024)
+			logFields = append(logFields, log.ByteString("response_body", sanitizedBody))
+		}
 
 		log.Warn(ctx, "request process failed", logFields...)
 	}
@@ -164,13 +257,38 @@ func (m *persistRequestExecutionMiddleware) OnOutboundRawError(ctx context.Conte
 	persistCtx, cancel := xcontext.DetachWithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
-	updateErr := state.RequestService.UpdateRequestExecutionFailed(
+	failure := ClassifyUpstreamTransportError(err)
+
+	updateErr := state.RequestService.UpdateRequestExecutionStatusWithMetrics(
 		persistCtx,
 		state.RequestExec.ID,
-		ExtractErrorMessage(err),
+		requestexecution.StatusFailed,
+		ExtractErrorMessage(failure),
+		ExtractErrorInfo(failure),
+		nil,
+		modelname.FromResponse(m.rawResponse, llm.APIFormat(state.RequestExec.Format)),
 	)
 	if updateErr != nil {
 		log.Warn(persistCtx, "Failed to update request execution status to failed", log.Cause(updateErr))
+	}
+}
+
+// ExtractErrorInfo extracts HTTP status code and sanitized response body from error.
+func ExtractErrorInfo(err error) *biz.ExecutionErrorInfo {
+	httpErr, ok := xerrors.As[*httpclient.Error](err)
+	if !ok {
+		// Classified errors (e.g. upstream transport failures) carry their own status code.
+		if respErr, ok := xerrors.As[*llm.ResponseError](err); ok && respErr.StatusCode != 0 {
+			statusCode := respErr.StatusCode
+
+			return &biz.ExecutionErrorInfo{StatusCode: &statusCode}
+		}
+
+		return nil
+	}
+
+	return &biz.ExecutionErrorInfo{
+		StatusCode: &httpErr.StatusCode,
 	}
 }
 
@@ -178,6 +296,12 @@ func (m *persistRequestExecutionMiddleware) OnOutboundRawError(ctx context.Conte
 func ExtractErrorMessage(err error) string {
 	httpErr, ok := xerrors.As[*httpclient.Error](err)
 	if !ok {
+		// Prefer the structured message over ResponseError.Error(), which also
+		// concatenates the status text, code and type.
+		if respErr, ok := xerrors.As[*llm.ResponseError](err); ok && respErr.Detail.Message != "" {
+			return respErr.Detail.Message
+		}
+
 		return err.Error()
 	}
 
@@ -187,10 +311,17 @@ func ExtractErrorMessage(err error) string {
 		return message.String()
 	}
 
-	// Other campatible error format.
-	message = gjson.GetBytes(httpErr.Body, "errors.message")
-	if message.Exists() && message.Type == gjson.String {
-		return message.String()
+	// Other compatible error format.
+	// Try errors.0.message first, then fall back to errors.message
+	message1 := gjson.GetBytes(httpErr.Body, "errors.0.message")
+	message2 := gjson.GetBytes(httpErr.Body, "errors.message")
+
+	if message1.Exists() && message1.Type == gjson.String && message1.String() != "" {
+		return message1.String()
+	}
+
+	if message2.Exists() && message2.Type == gjson.String {
+		return message2.String()
 	}
 
 	return httpErr.Error()

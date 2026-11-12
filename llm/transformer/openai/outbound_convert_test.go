@@ -1,12 +1,15 @@
 package openai
 
 import (
+	"context"
+	"encoding/json"
 	"testing"
 
 	"github.com/samber/lo"
 	"github.com/stretchr/testify/require"
 
 	"github.com/looplj/axonhub/llm"
+	"github.com/looplj/axonhub/llm/transformer/shared"
 )
 
 func TestRequestFromLLM(t *testing.T) {
@@ -68,10 +71,195 @@ func TestRequestFromLLM(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := RequestFromLLM(tt.llmReq)
+			result := RequestFromLLM(context.Background(), tt.llmReq, ReasoningFieldNone)
 			tt.validate(t, result)
 		})
 	}
+}
+
+func TestRequestFromLLM_FiltersResponsesCustomTools(t *testing.T) {
+	req := RequestFromLLM(context.Background(), &llm.Request{
+		Model:    "gpt-4o",
+		Messages: []llm.Message{{Role: "user", Content: llm.MessageContent{Content: lo.ToPtr("hi")}}},
+		Tools: []llm.Tool{
+			{
+				Type: llm.ToolTypeResponsesCustomTool,
+				ResponseCustomTool: &llm.ResponseCustomTool{
+					Name: "apply_patch",
+				},
+			},
+			{
+				Type: llm.ToolTypeFunction,
+				Function: llm.Function{
+					Name:       "get_weather",
+					Parameters: []byte(`{"type":"object"}`),
+				},
+			},
+		},
+	}, ReasoningFieldNone)
+
+	require.NotNil(t, req)
+	require.Len(t, req.Tools, 1)
+	require.Equal(t, llm.ToolTypeFunction, req.Tools[0].Type)
+}
+
+func TestMessageContentPartAudioRoundTrip(t *testing.T) {
+	part := llm.MessageContentPart{
+		Type: "input_audio",
+		InputAudio: &llm.InputAudio{
+			Format: "mp3",
+			Data:   "audio-base64",
+		},
+	}
+
+	oaiPart := MessageContentPartFromLLM(part)
+	require.Equal(t, "input_audio", oaiPart.Type)
+	require.NotNil(t, oaiPart.InputAudio)
+	require.Equal(t, "mp3", oaiPart.InputAudio.Format)
+	require.Equal(t, "audio-base64", oaiPart.InputAudio.Data)
+
+	roundTrip := oaiPart.ToLLMPart()
+	require.Equal(t, "input_audio", roundTrip.Type)
+	require.NotNil(t, roundTrip.InputAudio)
+	require.Equal(t, "mp3", roundTrip.InputAudio.Format)
+	require.Equal(t, "audio-base64", roundTrip.InputAudio.Data)
+}
+
+func TestMessageContentPartFileRoundTrip(t *testing.T) {
+	part := llm.MessageContentPart{
+		Type: "document",
+		Document: &llm.DocumentURL{
+			URL:      "data:application/pdf;base64,JVBERi0xLjQK",
+			MIMEType: "application/pdf",
+			Filename: "report.pdf",
+		},
+	}
+
+	oaiPart := MessageContentPartFromLLM(part)
+	require.Equal(t, "file", oaiPart.Type)
+	require.NotNil(t, oaiPart.File)
+	require.Equal(t, "report.pdf", oaiPart.File.Filename)
+	require.Equal(t, part.Document.URL, oaiPart.File.FileData)
+
+	roundTrip := oaiPart.ToLLMPart()
+	require.Equal(t, "document", roundTrip.Type)
+	require.NotNil(t, roundTrip.Document)
+	require.Equal(t, "report.pdf", roundTrip.Document.Filename)
+	require.Equal(t, part.Document.URL, roundTrip.Document.URL)
+}
+
+func TestMessageContentPartFromLLMDoesNotMapRegularFileURLToFileData(t *testing.T) {
+	part := MessageContentPartFromLLM(llm.MessageContentPart{
+		Type: "document",
+		Document: &llm.DocumentURL{
+			URL:      "https://example.com/report.pdf",
+			MIMEType: "application/pdf",
+		},
+	})
+
+	require.Equal(t, "file", part.Type)
+	require.NotNil(t, part.File)
+	require.Empty(t, part.File.FileData)
+	require.Empty(t, part.File.FileID)
+}
+
+func TestMessageContentFromLLM_IgnoresCompactionParts(t *testing.T) {
+	content := MessageContentFromLLM(llm.MessageContent{
+		MultipleContent: []llm.MessageContentPart{
+			{
+				Type: "compaction",
+				Compact: &llm.CompactContent{
+					ID:               "cmp_123",
+					EncryptedContent: "secret",
+				},
+			},
+			{
+				Type: "compaction_summary",
+				Compact: &llm.CompactContent{
+					ID:               "cmp_456",
+					EncryptedContent: "summary",
+				},
+			},
+			{
+				Type: "text",
+				Text: lo.ToPtr("visible"),
+			},
+		},
+	})
+
+	require.Len(t, content.MultipleContent, 1)
+	require.Equal(t, "text", content.MultipleContent[0].Type)
+	require.NotNil(t, content.MultipleContent[0].Text)
+	require.Equal(t, "visible", *content.MultipleContent[0].Text)
+}
+
+func TestRequestFromLLM_IgnoresCompactionPartsInMessages(t *testing.T) {
+	req := RequestFromLLM(context.Background(), &llm.Request{
+		Model: "gpt-4o",
+		Messages: []llm.Message{
+			{
+				Role: "assistant",
+				Content: llm.MessageContent{
+					MultipleContent: []llm.MessageContentPart{
+						{
+							Type: "compaction",
+							Compact: &llm.CompactContent{
+								ID:               "cmp_123",
+								EncryptedContent: "secret",
+							},
+						},
+						{
+							Type: "compaction_summary",
+							Compact: &llm.CompactContent{
+								ID:               "cmp_456",
+								EncryptedContent: "summary",
+							},
+						},
+						{
+							Type: "text",
+							Text: lo.ToPtr("hello"),
+						},
+					},
+				},
+			},
+		},
+	}, ReasoningFieldNone)
+
+	require.NotNil(t, req)
+	require.Len(t, req.Messages, 1)
+	require.Len(t, req.Messages[0].Content.MultipleContent, 1)
+	require.Equal(t, "text", req.Messages[0].Content.MultipleContent[0].Type)
+	require.NotNil(t, req.Messages[0].Content.MultipleContent[0].Text)
+	require.Equal(t, "hello", *req.Messages[0].Content.MultipleContent[0].Text)
+}
+
+func TestMessageAudioRoundTrip(t *testing.T) {
+	msg := llm.Message{
+		Role: "assistant",
+		Content: llm.MessageContent{
+			Content: lo.ToPtr("Audio reply"),
+		},
+		Audio: &llm.OutputAudio{
+			ID:         "audio_123",
+			Data:       "base64-audio",
+			ExpiresAt:  1234567890,
+			Transcript: "hello world",
+		},
+	}
+
+	oaiMsg := MessageFromLLM(msg)
+	require.NotNil(t, oaiMsg.Audio)
+	require.Equal(t, "audio_123", oaiMsg.Audio.ID)
+	require.Equal(t, "base64-audio", oaiMsg.Audio.Data)
+	require.Equal(t, int64(1234567890), oaiMsg.Audio.ExpiresAt)
+	require.Equal(t, "hello world", oaiMsg.Audio.Transcript)
+
+	roundTrip := oaiMsg.ToLLMMessage()
+	require.NotNil(t, roundTrip.Audio)
+	require.Equal(t, "audio_123", roundTrip.Audio.ID)
+	require.Equal(t, "base64-audio", roundTrip.Audio.Data)
+	require.Equal(t, int64(1234567890), roundTrip.Audio.ExpiresAt)
+	require.Equal(t, "hello world", roundTrip.Audio.Transcript)
 }
 
 func TestResponse_ToLLMResponse(t *testing.T) {
@@ -183,14 +371,18 @@ func TestMessage_ToLLMMessage_WithAnnotations(t *testing.T) {
 				Content: MessageContent{Content: lo.ToPtr("The meaning of life...")},
 				Annotations: []Annotation{
 					{
-						Type: "url_citation",
+						Type:       "url_citation",
+						StartIndex: lo.ToPtr(int64(0)),
+						EndIndex:   lo.ToPtr(int64(11)),
 						URLCitation: &URLCitation{
 							URL:   "https://en.wikipedia.org/wiki/Meaning_of_life",
 							Title: "Meaning of life - Wikipedia",
 						},
 					},
 					{
-						Type: "url_citation",
+						Type:       "url_citation",
+						StartIndex: lo.ToPtr(int64(20)),
+						EndIndex:   lo.ToPtr(int64(27)),
 						URLCitation: &URLCitation{
 							URL:   "https://plato.stanford.edu/entries/life-meaning/",
 							Title: "The Meaning of Life - Stanford Encyclopedia",
@@ -202,9 +394,17 @@ func TestMessage_ToLLMMessage_WithAnnotations(t *testing.T) {
 				require.Equal(t, "assistant", msg.Role)
 				require.Len(t, msg.Annotations, 2)
 				require.Equal(t, "url_citation", msg.Annotations[0].Type)
+				require.NotNil(t, msg.Annotations[0].StartIndex)
+				require.Equal(t, int64(0), *msg.Annotations[0].StartIndex)
+				require.NotNil(t, msg.Annotations[0].EndIndex)
+				require.Equal(t, int64(11), *msg.Annotations[0].EndIndex)
 				require.NotNil(t, msg.Annotations[0].URLCitation)
 				require.Equal(t, "https://en.wikipedia.org/wiki/Meaning_of_life", msg.Annotations[0].URLCitation.URL)
 				require.Equal(t, "Meaning of life - Wikipedia", msg.Annotations[0].URLCitation.Title)
+				require.NotNil(t, msg.Annotations[1].StartIndex)
+				require.Equal(t, int64(20), *msg.Annotations[1].StartIndex)
+				require.NotNil(t, msg.Annotations[1].EndIndex)
+				require.Equal(t, int64(27), *msg.Annotations[1].EndIndex)
 			},
 		},
 		{
@@ -337,4 +537,490 @@ func TestResponse_ToLLMResponse_WithCitations(t *testing.T) {
 			tt.validate(t, result)
 		})
 	}
+}
+
+func TestRequestFromLLM_KeepsGoogleThoughtSignatureInRequestModel(t *testing.T) {
+	req := RequestFromLLM(context.Background(), &llm.Request{
+		Model: "gemini-3-pro",
+		Messages: []llm.Message{
+			{
+				Role:               "assistant",
+				ReasoningSignature: shared.EncodeGeminiThoughtSignature(lo.ToPtr("sig_from_reasoning")),
+				ToolCalls: []llm.ToolCall{
+					{
+						ID:   "call_1",
+						Type: "function",
+						Function: llm.FunctionCall{
+							Name:      "get_weather",
+							Arguments: `{"city":"Shanghai"}`,
+						},
+						Index: 0,
+						TransformerMetadata: map[string]any{
+							TransformerMetadataKeyGoogleThoughtSignature: "sig_from_metadata",
+						},
+					},
+				},
+			},
+		},
+	}, ReasoningFieldNone)
+
+	require.NotNil(t, req)
+	require.Len(t, req.Messages, 1)
+	require.Len(t, req.Messages[0].ToolCalls, 1)
+	require.NotNil(t, req.Messages[0].ToolCalls[0].ExtraContent)
+	require.NotNil(t, req.Messages[0].ToolCalls[0].ExtraContent.Google)
+	require.Equal(t, "sig_from_metadata", req.Messages[0].ToolCalls[0].ExtraContent.Google.ThoughtSignature)
+}
+
+func TestMessageFromLLM_DoesNotOverrideFirstToolCallWhenMetadataExists(t *testing.T) {
+	msg := MessageFromLLM(llm.Message{
+		Role:               "assistant",
+		ReasoningSignature: shared.EncodeGeminiThoughtSignature(lo.ToPtr("sig_from_second_tool_call")),
+		ToolCalls: []llm.ToolCall{
+			{
+				ID:   "call_1",
+				Type: "function",
+				Function: llm.FunctionCall{
+					Name:      "tool_a",
+					Arguments: "{}",
+				},
+				Index: 0,
+			},
+			{
+				ID:   "call_2",
+				Type: "function",
+				Function: llm.FunctionCall{
+					Name:      "tool_b",
+					Arguments: "{}",
+				},
+				Index: 1,
+				TransformerMetadata: map[string]any{
+					TransformerMetadataKeyGoogleThoughtSignature: "sig_from_second_tool_call",
+				},
+			},
+		},
+	})
+
+	require.Len(t, msg.ToolCalls, 2)
+	require.Nil(t, msg.ToolCalls[0].ExtraContent)
+	require.NotNil(t, msg.ToolCalls[1].ExtraContent)
+	require.NotNil(t, msg.ToolCalls[1].ExtraContent.Google)
+	require.Equal(t, "sig_from_second_tool_call", msg.ToolCalls[1].ExtraContent.Google.ThoughtSignature)
+}
+
+func TestMessageFromLLM_GeminiReasoningSignatureDoesNotInjectThoughtSignature(t *testing.T) {
+	msg := MessageFromLLM(llm.Message{
+		Role:               "assistant",
+		ReasoningSignature: shared.EncodeGeminiThoughtSignature(lo.ToPtr("gemini_signature")),
+		ToolCalls: []llm.ToolCall{
+			{
+				ID:   "call_1",
+				Type: "function",
+				Function: llm.FunctionCall{
+					Name:      "tool_a",
+					Arguments: "{}",
+				},
+				Index: 0,
+			},
+		},
+	})
+
+	require.Len(t, msg.ToolCalls, 1)
+	require.Nil(t, msg.ToolCalls[0].ExtraContent)
+}
+
+func TestApplyReasoningEffortMapping(t *testing.T) {
+	tests := []struct {
+		name    string
+		effort  string
+		mapping []llm.ReasoningEffortMapping
+		want    string
+	}{
+		{name: "xhigh mapped to max", effort: "xhigh", mapping: []llm.ReasoningEffortMapping{{From: "xhigh", To: "max"}}, want: "max"},
+		{name: "high mapped to medium", effort: "high", mapping: []llm.ReasoningEffortMapping{{From: "high", To: "medium"}}, want: "medium"},
+		{name: "max passes through (not in list)", effort: "max", mapping: []llm.ReasoningEffortMapping{{From: "xhigh", To: "max"}}, want: "max"},
+		{name: "low passes through (not in list)", effort: "low", mapping: []llm.ReasoningEffortMapping{{From: "xhigh", To: "max"}}, want: "low"},
+		{name: "empty effort passes through", effort: "", mapping: []llm.ReasoningEffortMapping{{From: "xhigh", To: "max"}}, want: ""},
+		{name: "nil mapping passes through", effort: "xhigh", mapping: nil, want: "xhigh"},
+		{name: "empty mapping passes through", effort: "xhigh", mapping: []llm.ReasoningEffortMapping{}, want: "xhigh"},
+		{name: "multiple entries hit", effort: "high", mapping: []llm.ReasoningEffortMapping{{From: "xhigh", To: "max"}, {From: "high", To: "medium"}}, want: "medium"},
+		{name: "multiple entries miss", effort: "low", mapping: []llm.ReasoningEffortMapping{{From: "xhigh", To: "max"}, {From: "high", To: "medium"}}, want: "low"},
+		{name: "first matching entry wins", effort: "xhigh", mapping: []llm.ReasoningEffortMapping{{From: "xhigh", To: "max"}, {From: "xhigh", To: "high"}}, want: "max"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			require.Equal(t, tt.want, llm.ApplyReasoningEffortMapping(tt.effort, tt.mapping))
+		})
+	}
+}
+
+// TestRequestFromLLM_PreservesReasoningEffort ensures RequestFromLLM does NOT map
+// reasoning_effort: per-channel mapping is applied by the orchestrator on the
+// unified request before the outbound transformer runs, not in this converter.
+func TestRequestFromLLM_PreservesReasoningEffort(t *testing.T) {
+	req := RequestFromLLM(context.Background(), &llm.Request{
+		Model:           "gpt-4",
+		ReasoningEffort: "xhigh",
+		Messages: []llm.Message{
+			{Role: "user", Content: llm.MessageContent{Content: lo.ToPtr("hi")}},
+		},
+	}, ReasoningFieldNone)
+
+	require.NotNil(t, req)
+	require.Equal(t, "xhigh", req.ReasoningEffort, "RequestFromLLM must keep reasoning_effort unchanged; mapping happens in TransformRequest")
+}
+
+// Assistant messages that carry tool calls but no content must still serialize a
+// content field. Omitting it (nil content) or emitting null (all parts filtered
+// out) is accepted by OpenAI but rejected by stricter OpenAI-compatible upstreams
+// whose schema only allows a string or an array.
+func TestMessageFromLLM_ToolCallOnlyMessageKeepsContentField(t *testing.T) {
+	toolCalls := []llm.ToolCall{
+		{
+			ID:   "call_1",
+			Type: "function",
+			Function: llm.FunctionCall{
+				Name:      "shell_command",
+				Arguments: `{"command":"ls"}`,
+			},
+		},
+	}
+
+	tests := []struct {
+		name    string
+		message llm.Message
+	}{
+		{
+			name: "no content at all",
+			message: llm.Message{
+				Role:      "assistant",
+				ToolCalls: toolCalls,
+			},
+		},
+		{
+			name: "every content part filtered out",
+			message: llm.Message{
+				Role: "assistant",
+				Content: llm.MessageContent{
+					MultipleContent: []llm.MessageContentPart{
+						{
+							Type:    "compaction",
+							Compact: &llm.CompactContent{ID: "cmp_1", EncryptedContent: "secret"},
+						},
+					},
+				},
+				ToolCalls: toolCalls,
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			msg := MessageFromLLM(tt.message)
+
+			data, err := json.Marshal(msg)
+			require.NoError(t, err)
+
+			var decoded map[string]any
+			require.NoError(t, json.Unmarshal(data, &decoded))
+
+			content, ok := decoded["content"]
+			require.True(t, ok, "content field must be present, got %s", data)
+			require.NotNil(t, content, "content must not be null, got %s", data)
+			require.Equal(t, "", content)
+		})
+	}
+}
+
+// A reasoning-only assistant turn (thinking echoed back without visible text or
+// tool calls) must still serialize a content field. Without it the message carries
+// neither 'content' nor 'tool_calls', and strict OpenAI-compatible upstreams such
+// as llama.cpp reject it ("Expected 'content' or 'tool_calls'").
+func TestMessageFromLLM_ReasoningOnlyMessageKeepsContentField(t *testing.T) {
+	tests := []struct {
+		name    string
+		message llm.Message
+	}{
+		{
+			name:    "reasoning_content only",
+			message: llm.Message{Role: "assistant", ReasoningContent: lo.ToPtr("thinking step by step")},
+		},
+		{
+			name:    "reasoning only",
+			message: llm.Message{Role: "assistant", Reasoning: lo.ToPtr("thinking step by step")},
+		},
+		{
+			name: "both reasoning fields without content",
+			message: llm.Message{
+				Role:             "assistant",
+				ReasoningContent: lo.ToPtr("thinking step by step"),
+				Reasoning:        lo.ToPtr("thinking step by step"),
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			msg := MessageFromLLM(tt.message)
+
+			data, err := json.Marshal(msg)
+			require.NoError(t, err)
+
+			var decoded map[string]any
+			require.NoError(t, json.Unmarshal(data, &decoded))
+
+			content, ok := decoded["content"]
+			require.True(t, ok, "content field must be present, got %s", data)
+			require.NotNil(t, content, "content must not be null, got %s", data)
+			require.Equal(t, "", content)
+
+			// The reasoning payload itself must survive the normalization.
+			require.Contains(t, decoded, "reasoning_content")
+			require.Equal(t, "thinking step by step", decoded["reasoning_content"])
+		})
+	}
+}
+
+// A reasoning-only turn keeps working across the full request conversion, which is
+// the path an OpenAI-compatible channel actually serializes to the wire.
+func TestRequestFromLLM_ReasoningOnlyMessageKeepsContentField(t *testing.T) {
+	req := RequestFromLLM(context.Background(), &llm.Request{
+		Model: "local-model",
+		Messages: []llm.Message{
+			{Role: "user", Content: llm.MessageContent{Content: lo.ToPtr("hi")}},
+			{Role: "assistant", ReasoningContent: lo.ToPtr("thinking step by step")},
+		},
+	}, ReasoningFieldContent)
+
+	require.NotNil(t, req)
+	require.Len(t, req.Messages, 2)
+
+	assistantMsg := req.Messages[1]
+	require.NotNil(t, assistantMsg.Content.Content, "content must be set for a reasoning-only assistant turn")
+	require.Equal(t, "", *assistantMsg.Content.Content)
+	require.NotNil(t, assistantMsg.ReasoningContent)
+	require.Equal(t, "thinking step by step", *assistantMsg.ReasoningContent)
+}
+
+// Content that survives conversion must be preserved as-is.
+func TestMessageFromLLM_ToolCallMessageKeepsExistingContent(t *testing.T) {
+	msg := MessageFromLLM(llm.Message{
+		Role:    "assistant",
+		Content: llm.MessageContent{Content: lo.ToPtr("calling a tool")},
+		ToolCalls: []llm.ToolCall{
+			{
+				ID:       "call_1",
+				Type:     "function",
+				Function: llm.FunctionCall{Name: "shell_command", Arguments: "{}"},
+			},
+		},
+	})
+
+	require.NotNil(t, msg.Content.Content)
+	require.Equal(t, "calling a tool", *msg.Content.Content)
+}
+
+// Messages without tool calls keep their existing serialization, so the
+// normalization above cannot change unrelated payloads.
+func TestMessageFromLLM_WithoutToolCallsContentUnchanged(t *testing.T) {
+	msg := MessageFromLLM(llm.Message{Role: "user"})
+
+	data, err := json.Marshal(msg)
+	require.NoError(t, err)
+
+	var decoded map[string]any
+	require.NoError(t, json.Unmarshal(data, &decoded))
+
+	_, ok := decoded["content"]
+	require.False(t, ok, "content must stay omitted for messages without tool calls, got %s", data)
+}
+
+// Responses splits text parts into input_text/output_text, but Chat Completions
+// only knows "text". Types it does understand must not be rewritten.
+func TestMessageContentPartFromLLM_NormalizesTextPartTypes(t *testing.T) {
+	tests := []struct {
+		name     string
+		partType string
+		expected string
+	}{
+		{name: "input_text becomes text", partType: "input_text", expected: "text"},
+		{name: "output_text becomes text", partType: "output_text", expected: "text"},
+		{name: "text is unchanged", partType: "text", expected: "text"},
+		{name: "image_url is unchanged", partType: "image_url", expected: "image_url"},
+		{name: "video_url is unchanged", partType: "video_url", expected: "video_url"},
+		{name: "input_audio is unchanged", partType: "input_audio", expected: "input_audio"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			part := MessageContentPartFromLLM(llm.MessageContentPart{
+				Type: tt.partType,
+				Text: lo.ToPtr("hello"),
+			})
+
+			require.Equal(t, tt.expected, part.Type)
+		})
+	}
+}
+
+// Multi-part content is the path where Responses text types actually reach an
+// upstream: a lone text part is collapsed into a plain string before this point.
+func TestRequestFromLLM_NormalizesTextPartTypesInMessages(t *testing.T) {
+	req := RequestFromLLM(context.Background(), &llm.Request{
+		Model: "gpt-4o",
+		Messages: []llm.Message{
+			{
+				Role: "user",
+				Content: llm.MessageContent{
+					MultipleContent: []llm.MessageContentPart{
+						{Type: "input_text", Text: lo.ToPtr("describe this")},
+						{Type: "image_url", ImageURL: &llm.ImageURL{URL: "https://example.com/a.png"}},
+					},
+				},
+			},
+		},
+	}, ReasoningFieldNone)
+
+	require.NotNil(t, req)
+	require.Len(t, req.Messages, 1)
+	require.Len(t, req.Messages[0].Content.MultipleContent, 2)
+	require.Equal(t, "text", req.Messages[0].Content.MultipleContent[0].Type)
+	require.Equal(t, "image_url", req.Messages[0].Content.MultipleContent[1].Type)
+}
+
+func TestRequestFromLLM_MergesMultipleSystemMessages(t *testing.T) {
+	req := RequestFromLLM(context.Background(), &llm.Request{
+		Model: "qwen-max",
+		Messages: []llm.Message{
+			{Role: "system", Content: llm.MessageContent{Content: lo.ToPtr("You are a coding agent.")}},
+			{Role: "system", Content: llm.MessageContent{Content: lo.ToPtr("Use rg for searches.")}},
+			{Role: "user", Content: llm.MessageContent{Content: lo.ToPtr("Hello")}},
+			{Role: "system", Content: llm.MessageContent{Content: lo.ToPtr("Keep answers short.")}},
+		},
+	}, ReasoningFieldNone)
+
+	require.NotNil(t, req)
+	require.Len(t, req.Messages, 2)
+	require.Equal(t, "system", req.Messages[0].Role)
+	require.Equal(t,
+		"You are a coding agent.\n\nUse rg for searches.\n\nKeep answers short.",
+		*req.Messages[0].Content.Content)
+	require.Equal(t, "user", req.Messages[1].Role)
+	require.Equal(t, "Hello", *req.Messages[1].Content.Content)
+}
+
+func TestRequestFromLLM_MovesSingleLateSystemMessageToBeginning(t *testing.T) {
+	req := RequestFromLLM(context.Background(), &llm.Request{
+		Model: "qwen-max",
+		Messages: []llm.Message{
+			{Role: "user", Content: llm.MessageContent{Content: lo.ToPtr("Hello")}},
+			{Role: "system", Content: llm.MessageContent{Content: lo.ToPtr("Use concise answers.")}},
+		},
+	}, ReasoningFieldNone)
+
+	require.NotNil(t, req)
+	require.Len(t, req.Messages, 2)
+	require.Equal(t, "system", req.Messages[0].Role)
+	require.Equal(t, "Use concise answers.", *req.Messages[0].Content.Content)
+	require.Equal(t, "user", req.Messages[1].Role)
+}
+
+func TestRequestFromLLM_KeepsSingleSystemMessage(t *testing.T) {
+	req := RequestFromLLM(context.Background(), &llm.Request{
+		Model: "qwen-max",
+		Messages: []llm.Message{
+			{Role: "system", Content: llm.MessageContent{Content: lo.ToPtr("You are a coding agent.")}},
+			{Role: "user", Content: llm.MessageContent{Content: lo.ToPtr("Hello")}},
+		},
+	}, ReasoningFieldNone)
+
+	require.NotNil(t, req)
+	require.Len(t, req.Messages, 2)
+	require.Equal(t, "system", req.Messages[0].Role)
+	require.Equal(t, "You are a coding agent.", *req.Messages[0].Content.Content)
+}
+
+// When a message carries both scalar Content and MultipleContent (both layers
+// treat MultipleContent as authoritative on marshal), merging must emit only
+// the MultipleContent text and not duplicate the scalar.
+func TestRequestFromLLM_MergesSystemMessages_MultipleContentPrecedence(t *testing.T) {
+	req := RequestFromLLM(context.Background(), &llm.Request{
+		Model: "qwen-max",
+		Messages: []llm.Message{
+			{
+				Role: "system",
+				Content: llm.MessageContent{
+					Content: lo.ToPtr("STALE SCALAR — must not appear"),
+					MultipleContent: []llm.MessageContentPart{
+						{Type: "text", Text: lo.ToPtr("You are a coding agent.")},
+						{Type: "text", Text: lo.ToPtr("Use rg for searches.")},
+					},
+				},
+			},
+			{
+				Role: "system",
+				Content: llm.MessageContent{
+					Content: lo.ToPtr("Second scalar"),
+				},
+			},
+			{Role: "user", Content: llm.MessageContent{Content: lo.ToPtr("Hello")}},
+		},
+	}, ReasoningFieldNone)
+
+	require.NotNil(t, req)
+	require.Len(t, req.Messages, 2)
+	require.Equal(t, "system", req.Messages[0].Role)
+	merged := *req.Messages[0].Content.Content
+	require.Equal(t, "You are a coding agent.\n\nUse rg for searches.\n\nSecond scalar", merged)
+	require.NotContains(t, merged, "STALE SCALAR")
+	require.Equal(t, "user", req.Messages[1].Role)
+}
+
+func TestRequestFromLLM_AllowedToolsToolChoice(t *testing.T) {
+	// An allowed_tools choice must keep its mode and tool subset on the Chat
+	// Completions wire; the plain named shape would emit an empty function
+	// name and silently lift the restriction (issue #2504).
+	req := RequestFromLLM(context.Background(), &llm.Request{
+		Model:    "gpt-4o",
+		Messages: []llm.Message{{Role: "user", Content: llm.MessageContent{Content: lo.ToPtr("hi")}}},
+		Tools: []llm.Tool{
+			{Type: llm.ToolTypeFunction, Function: llm.Function{Name: "tool_a", Parameters: []byte(`{"type":"object"}`)}},
+			{Type: llm.ToolTypeFunction, Function: llm.Function{Name: "tool_b", Parameters: []byte(`{"type":"object"}`)}},
+		},
+		ToolChoice: &llm.ToolChoice{
+			ToolChoice:      lo.ToPtr("required"),
+			NamedToolChoice: &llm.NamedToolChoice{Type: "allowed_tools"},
+			Tools:           []llm.ToolOption{{Type: "function", Name: "tool_a"}},
+		},
+	}, ReasoningFieldNone)
+
+	require.NotNil(t, req)
+	require.NotNil(t, req.ToolChoice)
+
+	data, err := json.Marshal(req.ToolChoice)
+	require.NoError(t, err)
+	require.JSONEq(t,
+		`{"type":"allowed_tools","allowed_tools":{"mode":"required","tools":[{"type":"function","function":{"name":"tool_a"}}]}}`,
+		string(data))
+}
+
+func TestRequestFromLLM_NamedToolChoiceUnchanged(t *testing.T) {
+	// A named function choice keeps its existing single-tool wire shape.
+	req := RequestFromLLM(context.Background(), &llm.Request{
+		Model:    "gpt-4o",
+		Messages: []llm.Message{{Role: "user", Content: llm.MessageContent{Content: lo.ToPtr("hi")}}},
+		Tools: []llm.Tool{
+			{Type: llm.ToolTypeFunction, Function: llm.Function{Name: "tool_a", Parameters: []byte(`{"type":"object"}`)}},
+		},
+		ToolChoice: &llm.ToolChoice{
+			NamedToolChoice: &llm.NamedToolChoice{Type: "function", Function: llm.ToolFunction{Name: "tool_a"}},
+		},
+	}, ReasoningFieldNone)
+
+	require.NotNil(t, req)
+	require.NotNil(t, req.ToolChoice)
+
+	data, err := json.Marshal(req.ToolChoice)
+	require.NoError(t, err)
+	require.JSONEq(t, `{"type":"function","function":{"name":"tool_a"}}`, string(data))
 }

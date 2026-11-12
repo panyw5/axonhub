@@ -15,10 +15,6 @@ import (
 	"github.com/looplj/axonhub/internal/pkg/xredis"
 )
 
-func intPtr(i int) *int {
-	return &i
-}
-
 func TestNewMemory(t *testing.T) {
 	client := gocache.New(5*time.Minute, 10*time.Minute)
 	cache := NewMemory[string](client)
@@ -57,9 +53,7 @@ func TestNewRedis(t *testing.T) {
 	defer mr.Close()
 
 	// Create Redis client
-	client := redis.NewClient(&redis.Options{
-		Addr: mr.Addr(),
-	})
+	client := redis.NewUniversalClient(&redis.UniversalOptions{Addrs: []string{mr.Addr()}})
 
 	cache := NewRedis[string](client)
 
@@ -82,9 +76,7 @@ func TestNewRedisWithOptions(t *testing.T) {
 	mr := miniredis.RunT(t)
 	defer mr.Close()
 
-	opts := &redis.Options{
-		Addr: mr.Addr(),
-	}
+	opts := &redis.UniversalOptions{Addrs: []string{mr.Addr()}}
 
 	cache := NewRedisWithOptions[string](opts)
 
@@ -108,9 +100,7 @@ func TestNewTwoLevel(t *testing.T) {
 	mr := miniredis.RunT(t)
 	defer mr.Close()
 
-	redisClient := redis.NewClient(&redis.Options{
-		Addr: mr.Addr(),
-	})
+	redisClient := redis.NewUniversalClient(&redis.UniversalOptions{Addrs: []string{mr.Addr()}})
 	redisCache := NewRedis[string](redisClient)
 
 	// Two-level cache
@@ -146,9 +136,7 @@ func TestNewTwoLevelWithClients(t *testing.T) {
 	defer mr.Close()
 
 	memClient := gocache.New(5*time.Minute, 10*time.Minute)
-	redisClient := redis.NewClient(&redis.Options{
-		Addr: mr.Addr(),
-	})
+	redisClient := redis.NewUniversalClient(&redis.UniversalOptions{Addrs: []string{mr.Addr()}})
 
 	cache := NewTwoLevelWithClients[string](
 		memClient,

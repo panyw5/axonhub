@@ -1,12 +1,14 @@
 package orchestrator
 
 import (
+	"maps"
 	"strings"
 
 	"github.com/samber/lo"
 
 	"github.com/looplj/axonhub/internal/objects"
 	"github.com/looplj/axonhub/llm"
+	"github.com/looplj/axonhub/llm/transformer/anthropic"
 )
 
 // applyTransformOptions applies channel transform options to create a new llm.Request.
@@ -37,6 +39,66 @@ func applyTransformOptions(req *llm.Request, channelSettings *objects.ChannelSet
 	if transformOptions.ReplaceDeveloperRoleWithSystem {
 		newReq.Messages = replaceDeveloperRoleWithSystem(newReq.Messages)
 	}
+
+	return &newReq
+}
+
+// applyModelDefaultMaxTokens copies the catalog model output limit onto the
+// request so Anthropic outbound conversion can use it as max_tokens when the
+// client omitted an output cap. Other outbound formats leave max_tokens unset.
+func applyModelDefaultMaxTokens(req *llm.Request, candidate *ChannelModelsCandidate, outboundFormat llm.APIFormat) *llm.Request {
+	if req == nil || candidate == nil || candidate.DefaultMaxTokens <= 0 {
+		return req
+	}
+
+	if outboundFormat != llm.APIFormatAnthropicMessage {
+		return req
+	}
+
+	if req.MaxTokens != nil || req.MaxCompletionTokens != nil {
+		return req
+	}
+
+	if req.TransformOptions.DefaultMaxTokens != nil {
+		return req
+	}
+
+	newReq := *req
+	newReq.TransformOptions.DefaultMaxTokens = lo.ToPtr(candidate.DefaultMaxTokens)
+
+	return &newReq
+}
+
+// applyReasoningEffortMapping applies the channel's reasoning effort mapping to the
+// unified request before the outbound transformer runs, so the mapping affects every
+// outbound protocol (chat completions, responses, messages) uniformly, regardless of
+// which client the request came from.
+func applyReasoningEffortMapping(req *llm.Request, channelSettings *objects.ChannelSettings) *llm.Request {
+	if req == nil || channelSettings == nil {
+		return req
+	}
+
+	mapped := llm.ApplyReasoningEffortMapping(req.ReasoningEffort, channelSettings.TransformOptions.ReasoningEffortMapping)
+	if mapped == req.ReasoningEffort {
+		return req
+	}
+
+	newReq := *req
+
+	// The Anthropic inbound records the client's native output_config.effort in
+	// TransformerMetadata and the outbound transformer rebuilds the upstream request
+	// from that marker, so it must follow the mapped value or the mapping would never
+	// reach messages-protocol channels. Clone the map first: the shallow request copy
+	// still shares it with the original request.
+	if _, ok := newReq.TransformerMetadata[anthropic.TransformerMetadataKeyOutputConfigEffort]; ok {
+		metadata := make(map[string]any, len(newReq.TransformerMetadata))
+		maps.Copy(metadata, newReq.TransformerMetadata)
+
+		metadata[anthropic.TransformerMetadataKeyOutputConfigEffort] = mapped
+		newReq.TransformerMetadata = metadata
+	}
+
+	newReq.ReasoningEffort = mapped
 
 	return &newReq
 }

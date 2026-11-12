@@ -2,13 +2,13 @@ import { createFileRoute } from '@tanstack/react-router';
 import { RouteGuard } from '@/components/route-guard';
 import SystemManagement from '@/features/system';
 
-type SystemTabKey = 'brand' | 'storage' | 'retry' | 'about';
+type SystemTabKey = 'brand' | 'storage' | 'retry' | 'webhook' | 'about' | 'general' | 'proxy' | 'backup';
 
 function ProtectedSystem() {
   const search = Route.useSearch();
 
   return (
-    <RouteGuard requiredScopes={['read_system']}>
+    <RouteGuard requiredScopes={['read_settings']} scopeLevel="system">
       <SystemManagement initialTab={search.tab as SystemTabKey | undefined} />
     </RouteGuard>
   );

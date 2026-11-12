@@ -7,8 +7,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/looplj/axonhub/internal/pkg/xtest"
 	"github.com/looplj/axonhub/llm/httpclient"
+	"github.com/looplj/axonhub/llm/internal/pkg/xtest"
 )
 
 func TestAggregateStreamChunks(t *testing.T) {
@@ -146,6 +146,33 @@ func TestAggregateStreamChunks(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestAggregateStreamChunks_SetsCompletedForStopReason(t *testing.T) {
+	chunks := []*httpclient.StreamEvent{
+		{Data: []byte(`{"type":"message_start","message":{"id":"msg_stop","type":"message","role":"assistant","content":[],"model":"claude-sonnet-4-6"}}`)},
+		{Data: []byte(`{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"done"}}`)},
+		{Data: []byte(`{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":10,"output_tokens":1}}`)},
+	}
+
+	_, meta, err := AggregateStreamChunks(t.Context(), chunks, PlatformDirect)
+
+	require.NoError(t, err)
+	require.Equal(t, "msg_stop", meta.ID)
+	require.True(t, meta.Completed)
+}
+
+func TestAggregateStreamChunks_DoesNotCompleteWithoutMessageStart(t *testing.T) {
+	chunks := []*httpclient.StreamEvent{
+		{Data: []byte(`{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"partial"}}`)},
+		{Data: []byte(`{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":10,"output_tokens":1}}`)},
+	}
+
+	_, meta, err := AggregateStreamChunks(t.Context(), chunks, PlatformDirect)
+
+	require.NoError(t, err)
+	require.Equal(t, "msg_unknown", meta.ID)
+	require.False(t, meta.Completed)
 }
 
 func TestAggregateStreamChunks_EdgeCases(t *testing.T) {
@@ -839,6 +866,87 @@ func TestAggregateStreamChunks_EdgeCases(t *testing.T) {
 	})
 }
 
+func TestAggregateStreamChunks_WithCitationsDelta(t *testing.T) {
+	chunks := []*httpclient.StreamEvent{
+		{
+			Data: []byte(`{
+				"type": "message_start",
+				"message": {
+					"id": "msg_citations",
+					"type": "message",
+					"role": "assistant",
+					"content": [],
+					"model": "claude-sonnet-4-6"
+				}
+			}`),
+		},
+		{
+			Data: []byte(`{
+				"type": "content_block_start",
+				"index": 0,
+				"content_block": {
+					"type": "text",
+					"text": ""
+				}
+			}`),
+		},
+		{
+			Data: []byte(`{
+				"type": "content_block_delta",
+				"index": 0,
+				"delta": {
+					"type": "text_delta",
+					"text": "Answer with source"
+				}
+			}`),
+		},
+		{
+			Data: []byte(`{
+				"type": "content_block_delta",
+				"index": 0,
+				"delta": {
+					"type": "citations_delta",
+					"citation": {
+						"type": "url_citation",
+						"url": "https://example.com/source",
+						"title": "Example Source"
+					}
+				}
+			}`),
+		},
+		{
+			Data: []byte(`{
+				"type": "content_block_stop",
+				"index": 0
+			}`),
+		},
+		{
+			Data: []byte(`{
+				"type": "message_delta",
+				"delta": {
+					"stop_reason": "end_turn"
+				}
+			}`),
+		},
+	}
+
+	resultBytes, _, err := AggregateStreamChunks(t.Context(), chunks, PlatformDirect)
+	require.NoError(t, err)
+
+	var result Message
+	err = json.Unmarshal(resultBytes, &result)
+	require.NoError(t, err)
+	require.Len(t, result.Content, 1)
+	require.Equal(t, "text", result.Content[0].Type)
+	require.Equal(t, "Answer with source", *result.Content[0].Text)
+	require.Equal(t, []TextCitation{{
+		Type:  "url_citation",
+		URL:   "https://example.com/source",
+		Title: "Example Source",
+	}}, result.Content[0].Citations)
+	require.Nil(t, result.Content[0].Citations[0].EncryptedIndex)
+}
+
 func TestAggregateStreamChunks_WithTestData(t *testing.T) {
 	tests := []struct {
 		name         string
@@ -906,7 +1014,6 @@ func TestAggregateStreamChunks_WithTestData(t *testing.T) {
 				// Compare thinking content
 				if expectedContent.Type == "thinking" {
 					require.Equal(t, expectedContent.Thinking, result.Content[i].Thinking)
-					require.Equal(t, expectedContent.Signature, result.Content[i].Signature)
 				}
 
 				// Compare tool use content

@@ -97,6 +97,7 @@ func (e EmbeddingInput) GetType() string {
 
 // EmbeddingRequest represents the unified embedding request model.
 // Based on OpenAI embedding request format for compatibility.
+// Note: Common fields like Model are in the parent Request struct, not here.
 type EmbeddingRequest struct {
 	// Input is the text to embed. Can be string, []string, []int (tokens), or [][]int (multiple token arrays).
 	Input EmbeddingInput `json:"input"`
@@ -125,6 +126,7 @@ type EmbeddingRequest struct {
 }
 
 // EmbeddingResponse represents the unified embedding response model.
+// Note: Common fields like Usage are in the parent Response struct, not here.
 type EmbeddingResponse struct {
 	// ID is the response identifier (some providers return this).
 	ID string `json:"id,omitempty"`
@@ -134,9 +136,6 @@ type EmbeddingResponse struct {
 
 	// Data contains the embedding results.
 	Data []EmbeddingData `json:"data"`
-
-	// Usage contains token usage information.
-	Usage *EmbeddingUsage `json:"usage,omitempty"`
 }
 
 // EmbeddingData represents a single embedding result.
@@ -186,13 +185,4 @@ func (e *Embedding) UnmarshalJSON(data []byte) error {
 	}
 
 	return fmt.Errorf("invalid embedding type")
-}
-
-// EmbeddingUsage represents token usage for embedding requests.
-type EmbeddingUsage struct {
-	// PromptTokens is the number of tokens in the input.
-	PromptTokens int64 `json:"prompt_tokens"`
-
-	// TotalTokens is the total number of tokens used.
-	TotalTokens int64 `json:"total_tokens"`
 }

@@ -1,11 +1,13 @@
 'use client';
 
-import { forwardRef, useCallback, useEffect, useRef, useState } from 'react';
+import { forwardRef, useCallback, useEffect, useRef, useState, useMemo } from 'react';
 import { Check } from 'lucide-react';
 import { X } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { TruncatedText } from '@/components/truncated-text';
 import { Popover, PopoverContent, PopoverTrigger } from './popover';
+
+const MAX_DISPLAY = 100;
 
 interface TagsAutocompleteInputProps {
   value: string[];
@@ -24,12 +26,19 @@ export const TagsAutocompleteInput = forwardRef<HTMLDivElement, TagsAutocomplete
     const containerRef = useRef<HTMLDivElement>(null);
     const inputRef = useRef<HTMLInputElement>(null);
 
-    // Filter suggestions based on input and not already selected
-    const filteredSuggestions = suggestions.filter((s) => {
-      if (value.includes(s)) return false;
-      if (!inputValue.trim()) return true;
-      return s.toLowerCase().includes(inputValue.toLowerCase());
-    });
+
+    // Filter suggestions based on input and not already selected (capped for performance)
+    const filteredSuggestions = useMemo(() => {
+      const result: string[] = [];
+      const q = inputValue.trim().toLowerCase();
+      for (const s of suggestions) {
+        if (value.includes(s)) continue;
+        if (q && !s.toLowerCase().includes(q)) continue;
+        result.push(s);
+        if (result.length >= MAX_DISPLAY) break;
+      }
+      return result;
+    }, [inputValue, suggestions, value]);
 
     const handleInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
       setInputValue(e.target.value);
@@ -107,7 +116,7 @@ export const TagsAutocompleteInput = forwardRef<HTMLDivElement, TagsAutocomplete
         ref={containerRef}
         data-tags-input-container
         className={cn(
-          'border-input bg-background ring-offset-background focus-within:ring-ring flex min-h-10 w-full flex-wrap gap-1 rounded-md border px-3 py-2 text-sm focus-within:ring-2 focus-within:ring-offset-2',
+          'border-input bg-background has-[input:focus-visible]:border-ring has-[input:focus-visible]:outline-foreground flex min-h-10 w-full flex-wrap gap-1 rounded-md border px-3 py-2 text-sm has-[input:focus-visible]:outline-2 has-[input:focus-visible]:outline-offset-1',
           className
         )}
         onClick={handleContainerClick}
@@ -118,7 +127,7 @@ export const TagsAutocompleteInput = forwardRef<HTMLDivElement, TagsAutocomplete
             <button
               type='button'
               onClick={() => removeTag(tag)}
-              className='text-secondary-foreground/80 hover:text-secondary-foreground focus:outline-none'
+              className='text-secondary-foreground/80 hover:text-secondary-foreground focus-visible:outline-foreground rounded-sm focus-visible:outline-2 focus-visible:outline-offset-1'
               aria-label={`Remove ${tag} tag`}
             >
               <X className='h-3 w-3' />

@@ -66,7 +66,7 @@ func TestConvertDocumentURLToGeminiPart(t *testing.T) {
 				require.NotNil(t, result)
 				require.NotNil(t, result.FileData)
 				assert.Equal(t, "https://example.com/report.pdf", result.FileData.FileURI)
-				assert.Equal(t, "", result.FileData.MIMEType)
+				assert.Equal(t, "application/pdf", result.FileData.MIMEType)
 			},
 		},
 		{
@@ -90,6 +90,80 @@ func TestConvertDocumentURLToGeminiPart(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			result := convertDocumentURLToGeminiPart(tt.doc)
+			tt.validate(t, result)
+		})
+	}
+}
+
+func TestConvertAudioToGeminiPart(t *testing.T) {
+	tests := []struct {
+		name     string
+		audio    *llm.InputAudio
+		validate func(t *testing.T, result *Part)
+	}{
+		{
+			name: "mp3 audio",
+			audio: &llm.InputAudio{
+				Format: "mp3",
+				Data:   "SUQzBAAAAAA=",
+			},
+			validate: func(t *testing.T, result *Part) {
+				t.Helper()
+				require.NotNil(t, result)
+				require.NotNil(t, result.InlineData)
+				assert.Equal(t, "audio/mp3", result.InlineData.MIMEType)
+				assert.Equal(t, "SUQzBAAAAAA=", result.InlineData.Data)
+			},
+		},
+		{
+			name: "wav audio",
+			audio: &llm.InputAudio{
+				Format: "wav",
+				Data:   "UklGRiQAAABXQVZF",
+			},
+			validate: func(t *testing.T, result *Part) {
+				t.Helper()
+				require.NotNil(t, result)
+				require.NotNil(t, result.InlineData)
+				assert.Equal(t, "audio/wav", result.InlineData.MIMEType)
+				assert.Equal(t, "UklGRiQAAABXQVZF", result.InlineData.Data)
+			},
+		},
+		{
+			name: "remote mp3 audio",
+			audio: &llm.InputAudio{
+				URL: "https://assets.example.com/audio/input.mp3?token=test",
+			},
+			validate: func(t *testing.T, result *Part) {
+				t.Helper()
+				require.NotNil(t, result)
+				require.NotNil(t, result.FileData)
+				assert.Equal(t, "audio/mpeg", result.FileData.MIMEType)
+				assert.Equal(t, "https://assets.example.com/audio/input.mp3?token=test", result.FileData.FileURI)
+			},
+		},
+		{
+			name: "inline audio takes precedence over URL",
+			audio: &llm.InputAudio{
+				Format:   "wav",
+				Data:     "UklGRiQAAABXQVZF",
+				URL:      "https://assets.example.com/audio/input.mp3",
+				MIMEType: "audio/wav",
+			},
+			validate: func(t *testing.T, result *Part) {
+				t.Helper()
+				require.NotNil(t, result)
+				require.NotNil(t, result.InlineData)
+				assert.Equal(t, "audio/wav", result.InlineData.MIMEType)
+				assert.Equal(t, "UklGRiQAAABXQVZF", result.InlineData.Data)
+				assert.Nil(t, result.FileData)
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := convertAudioToGeminiPart(tt.audio)
 			tt.validate(t, result)
 		})
 	}

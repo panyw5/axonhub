@@ -14,6 +14,8 @@ type Tx struct {
 	config
 	// APIKey is the client for interacting with the APIKey builders.
 	APIKey *APIKeyClient
+	// APIKeyProfileTemplate is the client for interacting with the APIKeyProfileTemplate builders.
+	APIKeyProfileTemplate *APIKeyProfileTemplateClient
 	// Channel is the client for interacting with the Channel builders.
 	Channel *ChannelClient
 	// ChannelModelPrice is the client for interacting with the ChannelModelPrice builders.
@@ -26,12 +28,18 @@ type Tx struct {
 	ChannelProbe *ChannelProbeClient
 	// DataStorage is the client for interacting with the DataStorage builders.
 	DataStorage *DataStorageClient
+	// Invitation is the client for interacting with the Invitation builders.
+	Invitation *InvitationClient
 	// Model is the client for interacting with the Model builders.
 	Model *ModelClient
+	// OIDCIdentity is the client for interacting with the OIDCIdentity builders.
+	OIDCIdentity *OIDCIdentityClient
 	// Project is the client for interacting with the Project builders.
 	Project *ProjectClient
 	// Prompt is the client for interacting with the Prompt builders.
 	Prompt *PromptClient
+	// PromptProtectionRule is the client for interacting with the PromptProtectionRule builders.
+	PromptProtectionRule *PromptProtectionRuleClient
 	// ProviderQuotaStatus is the client for interacting with the ProviderQuotaStatus builders.
 	ProviderQuotaStatus *ProviderQuotaStatusClient
 	// Request is the client for interacting with the Request builders.
@@ -186,15 +194,19 @@ func (tx *Tx) Client() *Client {
 
 func (tx *Tx) init() {
 	tx.APIKey = NewAPIKeyClient(tx.config)
+	tx.APIKeyProfileTemplate = NewAPIKeyProfileTemplateClient(tx.config)
 	tx.Channel = NewChannelClient(tx.config)
 	tx.ChannelModelPrice = NewChannelModelPriceClient(tx.config)
 	tx.ChannelModelPriceVersion = NewChannelModelPriceVersionClient(tx.config)
 	tx.ChannelOverrideTemplate = NewChannelOverrideTemplateClient(tx.config)
 	tx.ChannelProbe = NewChannelProbeClient(tx.config)
 	tx.DataStorage = NewDataStorageClient(tx.config)
+	tx.Invitation = NewInvitationClient(tx.config)
 	tx.Model = NewModelClient(tx.config)
+	tx.OIDCIdentity = NewOIDCIdentityClient(tx.config)
 	tx.Project = NewProjectClient(tx.config)
 	tx.Prompt = NewPromptClient(tx.config)
+	tx.PromptProtectionRule = NewPromptProtectionRuleClient(tx.config)
 	tx.ProviderQuotaStatus = NewProviderQuotaStatusClient(tx.config)
 	tx.Request = NewRequestClient(tx.config)
 	tx.RequestExecution = NewRequestExecutionClient(tx.config)

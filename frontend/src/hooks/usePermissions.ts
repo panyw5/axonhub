@@ -23,8 +23,15 @@ export function usePermissions() {
       return [];
     }
     const project = user.projects.find((p) => p.projectID === selectedProjectId);
-    return project?.scopes || [];
+    return project?.effectiveScopes || project?.scopes || [];
   }, [selectedProjectId, user?.projects]);
+
+  const isProjectOwner = useMemo(() => {
+    if (isOwner) return true;
+    if (!selectedProjectId || !user?.projects) return false;
+    const project = user.projects.find((p) => p.projectID === selectedProjectId);
+    return project?.isOwner || false;
+  }, [isOwner, selectedProjectId, user?.projects]);
 
   // Check if user has a specific scope at system level only
   const hasSystemScope = useCallback(
@@ -52,8 +59,8 @@ export function usePermissions() {
   // Check if user has a specific scope at project level only
   const hasProjectScope = useCallback(
     (requiredScope: string): boolean => {
-      // Owner has all permissions
-      if (isOwner) {
+      // Owners have all permissions in the selected project.
+      if (isProjectOwner) {
         return true;
       }
 
@@ -69,7 +76,7 @@ export function usePermissions() {
 
       return false;
     },
-    [user, isOwner, projectScopes]
+    [user, isProjectOwner, projectScopes]
   );
 
   // Check if user has a specific scope (system-level or project-level)
@@ -126,9 +133,9 @@ export function usePermissions() {
       canWrite: hasScope('write_users'),
       canCreate: hasScope('write_users'),
       canEdit: hasScope('write_users'),
-      canDelete: hasScope('write_users'),
+      canDelete: isOwner, // Only system owners can delete users
     }),
-    [hasScope]
+    [hasScope, isOwner]
   );
 
   // Common permission checks for role operations
@@ -174,14 +181,15 @@ export function usePermissions() {
       canWrite: hasScope('write_projects'),
       canCreate: hasScope('write_projects'),
       canEdit: hasScope('write_projects'),
-      canDelete: hasScope('write_projects'),
+      canDelete: isOwner, // Only system owners can delete projects
     }),
-    [hasScope]
+    [hasScope, isOwner]
   );
 
   return {
     user,
     isOwner,
+    isProjectOwner,
     hasScope,
     hasSystemScope,
     hasProjectScope,

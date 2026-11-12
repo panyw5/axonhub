@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/tidwall/sjson"
+
 	"github.com/looplj/axonhub/llm"
 	"github.com/looplj/axonhub/llm/auth"
 	"github.com/looplj/axonhub/llm/httpclient"
@@ -47,6 +49,7 @@ func NewOutboundTransformerWithConfig(config *Config) (transformer.Outbound, err
 		PlatformType:   openai.PlatformOpenAI,
 		BaseURL:        config.BaseURL,
 		APIKeyProvider: config.APIKeyProvider,
+		ReasoningField: openai.ReasoningFieldContent,
 	}
 
 	base, err := openai.NewOutboundTransformerWithConfig(oaiConfig)
@@ -60,8 +63,28 @@ func NewOutboundTransformerWithConfig(config *Config) (transformer.Outbound, err
 // TransformRequest applies Bailian-specific request normalization before delegating to OpenAI-compatible transformer.
 func (t *OutboundTransformer) TransformRequest(ctx context.Context, llmReq *llm.Request) (*httpclient.Request, error) {
 	llmReq = mergeConsecutiveToolCallMessages(llmReq)
+	reasoningNone := llmReq != nil && llmReq.ReasoningEffort == "none"
+	if reasoningNone {
+		updated := *llmReq
+		updated.ReasoningEffort = ""
+		llmReq = &updated
+	}
 
-	return t.Outbound.TransformRequest(ctx, llmReq)
+	httpReq, err := t.Outbound.TransformRequest(ctx, llmReq)
+	if err != nil {
+		return nil, err
+	}
+
+	if !reasoningNone {
+		return httpReq, nil
+	}
+
+	httpReq.Body, err = sjson.SetBytes(httpReq.Body, "enable_thinking", false)
+	if err != nil {
+		return nil, fmt.Errorf("failed to set Bailian enable_thinking: %w", err)
+	}
+
+	return httpReq, nil
 }
 
 func mergeConsecutiveToolCallMessages(req *llm.Request) *llm.Request {
@@ -142,9 +165,10 @@ func isEmptyMessageContent(content llm.MessageContent) bool {
 // TransformStream applies Bailian-specific streaming normalization on top of OpenAI-compatible stream.
 func (t *OutboundTransformer) TransformStream(
 	ctx context.Context,
+	req *httpclient.Request,
 	stream streams.Stream[*httpclient.StreamEvent],
 ) (streams.Stream[*llm.Response], error) {
-	baseStream, err := t.Outbound.TransformStream(ctx, stream)
+	baseStream, err := t.Outbound.TransformStream(ctx, req, stream)
 	if err != nil {
 		return nil, err
 	}

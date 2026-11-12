@@ -1,10 +1,13 @@
 package openai
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"mime/multipart"
 	"net/http"
+	"strings"
 	"testing"
 
 	"github.com/samber/lo"
@@ -12,6 +15,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/looplj/axonhub/llm"
+	"github.com/looplj/axonhub/llm/auth"
 	"github.com/looplj/axonhub/llm/httpclient"
 )
 
@@ -150,6 +154,125 @@ func TestBuildImageGenerateRequest_WithParameters(t *testing.T) {
 	assert.Equal(t, "transparent", body["background"])
 }
 
+func TestBuildImageGenerateRequest_WithSingleImage(t *testing.T) {
+	tr, err := NewOutboundTransformer("https://api.openai.com/v1", "test-key")
+	require.NoError(t, err)
+
+	ot := tr.(*OutboundTransformer)
+
+	// 1x1 red pixel PNG
+	imageData, err := base64.StdEncoding.DecodeString("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFBQIAX8jx0gAAAABJRU5ErkJggg==")
+	require.NoError(t, err)
+
+	req := &llm.Request{
+		Model: "gpt-image-1",
+		Image: &llm.ImageRequest{
+			Prompt: "Make this image brighter",
+			Images: [][]byte{imageData},
+		},
+	}
+
+	httpReq, err := ot.buildImageGenerateRequest(req, "test-key")
+	require.NoError(t, err)
+
+	var body map[string]any
+	err = json.Unmarshal(httpReq.Body, &body)
+	require.NoError(t, err)
+
+	assert.Equal(t, "Make this image brighter", body["prompt"])
+	assert.Equal(t, "gpt-image-1", body["model"])
+
+	// image should be a single data URL string
+	imageField, ok := body["image"].(string)
+	require.True(t, ok, "image field should be a string for single image")
+	assert.Contains(t, imageField, "data:image/png;base64,")
+}
+
+func TestBuildImageGenerateRequest_WithMultipleImages(t *testing.T) {
+	tr, err := NewOutboundTransformer("https://api.openai.com/v1", "test-key")
+	require.NoError(t, err)
+
+	ot := tr.(*OutboundTransformer)
+
+	imageData1, err := base64.StdEncoding.DecodeString("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFBQIAX8jx0gAAAABJRU5ErkJggg==")
+	require.NoError(t, err)
+
+	imageData2 := []byte{0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A}
+
+	req := &llm.Request{
+		Model: "gpt-image-1",
+		Image: &llm.ImageRequest{
+			Prompt: "Combine these images",
+			Images: [][]byte{imageData1, imageData2},
+		},
+	}
+
+	httpReq, err := ot.buildImageGenerateRequest(req, "test-key")
+	require.NoError(t, err)
+
+	var body map[string]any
+	err = json.Unmarshal(httpReq.Body, &body)
+	require.NoError(t, err)
+
+	// image should be an array for multiple images
+	imageField, ok := body["image"].([]any)
+	require.True(t, ok, "image field should be an array for multiple images")
+	assert.Len(t, imageField, 2)
+
+	for _, img := range imageField {
+		str, ok := img.(string)
+		require.True(t, ok)
+		assert.Contains(t, str, "data:image/")
+	}
+}
+
+func TestBuildImageGenerateRequest_WithoutImage(t *testing.T) {
+	tr, err := NewOutboundTransformer("https://api.openai.com/v1", "test-key")
+	require.NoError(t, err)
+
+	ot := tr.(*OutboundTransformer)
+
+	req := &llm.Request{
+		Model: "dall-e-3",
+		Image: &llm.ImageRequest{
+			Prompt: "A beautiful sunset",
+		},
+	}
+
+	httpReq, err := ot.buildImageGenerateRequest(req, "test-key")
+	require.NoError(t, err)
+
+	var body map[string]any
+	err = json.Unmarshal(httpReq.Body, &body)
+	require.NoError(t, err)
+
+	// image field should not be present when no input images
+	_, hasImage := body["image"]
+	assert.False(t, hasImage, "image field should not be present when no input images")
+}
+
+func TestBuildImageGenerateRequest_GPTImageModelOmitsResponseFormat(t *testing.T) {
+	tr, err := NewOutboundTransformer("https://api.openai.com/v1", "test-key")
+	require.NoError(t, err)
+
+	ot := tr.(*OutboundTransformer)
+	req := &llm.Request{
+		Model: "gpt-image-2",
+		Image: &llm.ImageRequest{
+			Prompt:         "A futuristic city",
+			ResponseFormat: "b64_json",
+		},
+	}
+
+	httpReq, err := ot.buildImageGenerateRequest(req, "test-key")
+	require.NoError(t, err)
+
+	var body map[string]any
+	err = json.Unmarshal(httpReq.Body, &body)
+	require.NoError(t, err)
+	assert.NotContains(t, body, "response_format")
+}
+
 func TestBuildImageGenerateRequest_NoPrompt(t *testing.T) {
 	tr, err := NewOutboundTransformer("https://api.openai.com/v1", "test-key")
 	require.NoError(t, err)
@@ -196,6 +319,58 @@ func TestBuildImageEditRequest_WithImage(t *testing.T) {
 
 	// Verify headers - should be multipart/form-data
 	assert.Contains(t, httpReq.Headers.Get("Content-Type"), "multipart/form-data")
+}
+
+func TestBuildImageEditRequest_GPTImage2OmitsResponseFormat(t *testing.T) {
+	tr, err := NewOutboundTransformer("https://api.openai.com/v1", "test-key")
+	require.NoError(t, err)
+
+	ot := tr.(*OutboundTransformer)
+	imageData, err := base64.StdEncoding.DecodeString("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFBQIAX8jx0gAAAABJRU5ErkJggg==")
+	require.NoError(t, err)
+
+	req := &llm.Request{
+		Model:     "gpt-image-2",
+		APIFormat: llm.APIFormatOpenAIImageEdit,
+		Image: &llm.ImageRequest{
+			Prompt:         "Make this image brighter",
+			Images:         [][]byte{imageData},
+			ResponseFormat: "b64_json",
+		},
+	}
+
+	httpReq, err := ot.buildImageEditRequest(req, "test-key")
+	require.NoError(t, err)
+
+	var body map[string]any
+	err = json.Unmarshal(httpReq.JSONBody, &body)
+	require.NoError(t, err)
+	assert.NotContains(t, body, "response_format")
+}
+
+func TestBuildImageEditRequest_MultipleImagesUsesArrayField(t *testing.T) {
+	tr, err := NewOutboundTransformer("https://api.openai.com/v1", "test-key")
+	require.NoError(t, err)
+
+	ot := tr.(*OutboundTransformer)
+	req := &llm.Request{
+		Model:     "gpt-image-2",
+		APIFormat: llm.APIFormatOpenAIImageEdit,
+		Image: &llm.ImageRequest{
+			Prompt: "Add the logo from the second image to the first image",
+			Images: [][]byte{[]byte("image1"), []byte("image2")},
+		},
+	}
+
+	httpReq, err := ot.buildImageEditRequest(req, "test-key")
+	require.NoError(t, err)
+
+	reader := multipart.NewReader(bytes.NewReader(httpReq.Body), strings.TrimPrefix(httpReq.Headers.Get("Content-Type"), "multipart/form-data; boundary="))
+	form, err := reader.ReadForm(1024)
+	require.NoError(t, err)
+
+	assert.Empty(t, form.File["image"])
+	assert.Len(t, form.File["image[]"], 2)
 }
 
 func TestBuildImageEditRequest_NoImage(t *testing.T) {
@@ -257,6 +432,70 @@ func TestBuildImageGenerationAPIRequest_RoutesToGenerate(t *testing.T) {
 	assert.Equal(t, "https://api.openai.com/v1/images/generations", httpReq.URL)
 	assert.Equal(t, string(llm.APIFormatOpenAIImageGeneration), httpReq.APIFormat)
 	assert.Equal(t, "dall-e-3", httpReq.TransformerMetadata["model"])
+}
+
+func TestImageRequests_UseCustomEndpointPath(t *testing.T) {
+	imageData, err := base64.StdEncoding.DecodeString("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFBQIAX8jx0gAAAABJRU5ErkJggg==")
+	require.NoError(t, err)
+
+	tests := []struct {
+		name        string
+		apiFormat   llm.APIFormat
+		endpoint    string
+		image       *llm.ImageRequest
+		expectedURL string
+	}{
+		{
+			name:      "generation",
+			apiFormat: llm.APIFormatOpenAIImageGeneration,
+			endpoint:  "/custom/images/generations",
+			image: &llm.ImageRequest{
+				Prompt: "Generate a skyline",
+			},
+			expectedURL: "https://custom.api.com/custom/images/generations",
+		},
+		{
+			name:      "edit",
+			apiFormat: llm.APIFormatOpenAIImageEdit,
+			endpoint:  "/custom/images/edits",
+			image: &llm.ImageRequest{
+				Prompt: "Edit the image",
+				Images: [][]byte{imageData},
+			},
+			expectedURL: "https://custom.api.com/custom/images/edits",
+		},
+		{
+			name:      "variation",
+			apiFormat: llm.APIFormatOpenAIImageVariation,
+			endpoint:  "/custom/images/variations",
+			image: &llm.ImageRequest{
+				Images: [][]byte{imageData},
+			},
+			expectedURL: "https://custom.api.com/custom/images/variations",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			transformerInterface, err := NewOutboundTransformerWithConfig(&Config{
+				PlatformType:   PlatformOpenAI,
+				BaseURL:        "https://custom.api.com",
+				APIKeyProvider: auth.NewStaticKeyProvider("test-key"),
+				EndpointPath:   tt.endpoint,
+			})
+			require.NoError(t, err)
+
+			transformer := transformerInterface.(*OutboundTransformer)
+			httpReq, err := transformer.TransformRequest(context.Background(), &llm.Request{
+				Model:       "gpt-image-1",
+				RequestType: llm.RequestTypeImage,
+				APIFormat:   tt.apiFormat,
+				Image:       tt.image,
+			})
+			require.NoError(t, err)
+			require.Equal(t, tt.expectedURL, httpReq.URL)
+		})
+	}
 }
 
 func TestBuildImageGenerationAPIRequest_RoutesToGeneration(t *testing.T) {
@@ -343,6 +582,90 @@ func TestTransformImageGenerationResponse_WithUsage(t *testing.T) {
 	assert.Equal(t, int64(10), resp.Usage.PromptTokens)
 	assert.Equal(t, int64(256), resp.Usage.CompletionTokens)
 	assert.Equal(t, int64(266), resp.Usage.TotalTokens)
+	require.NotNil(t, resp.Usage.PromptTokensDetails)
+	assert.Equal(t, int64(0), resp.Usage.PromptTokensDetails.ImageTokens)
+	assert.Equal(t, int64(10), resp.Usage.PromptTokensDetails.TextTokens)
+}
+
+func TestTransformImageGenerationResponse_WithCachedTokens(t *testing.T) {
+	body := []byte(`{
+		"created": 1730000000,
+		"data": [
+			{
+				"b64_json": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=="
+			}
+		],
+		"usage": {
+			"input_tokens": 100,
+			"output_tokens": 256,
+			"total_tokens": 356,
+			"input_tokens_details": {
+				"image_tokens": 80,
+				"text_tokens": 10,
+				"cached_tokens": 10
+			}
+		}
+	}`)
+
+	httpResp := &httpclient.Response{
+		StatusCode: http.StatusOK,
+		Body:       body,
+	}
+
+	resp, err := transformImageGenerationResponse(httpResp)
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+	require.NotNil(t, resp.Usage)
+
+	assert.Equal(t, int64(100), resp.Usage.PromptTokens)
+	assert.Equal(t, int64(256), resp.Usage.CompletionTokens)
+	assert.Equal(t, int64(356), resp.Usage.TotalTokens)
+	require.NotNil(t, resp.Usage.PromptTokensDetails)
+	assert.Equal(t, int64(80), resp.Usage.PromptTokensDetails.ImageTokens)
+	assert.Equal(t, int64(10), resp.Usage.PromptTokensDetails.TextTokens)
+	assert.Equal(t, int64(10), resp.Usage.PromptTokensDetails.CachedTokens)
+}
+
+func TestTransformImageGenerationResponse_WithOutputTokensDetails(t *testing.T) {
+	body := []byte(`{
+		"created": 1730000000,
+		"data": [
+			{
+				"b64_json": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=="
+			}
+		],
+		"usage": {
+			"input_tokens": 100,
+			"output_tokens": 256,
+			"total_tokens": 356,
+			"input_tokens_details": {
+				"image_tokens": 80,
+				"text_tokens": 20
+			},
+			"output_tokens_details": {
+				"reasoning_tokens": 50
+			}
+		}
+	}`)
+
+	httpResp := &httpclient.Response{
+		StatusCode: http.StatusOK,
+		Body:       body,
+	}
+
+	resp, err := transformImageGenerationResponse(httpResp)
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+	require.NotNil(t, resp.Usage)
+
+	assert.Equal(t, int64(100), resp.Usage.PromptTokens)
+	assert.Equal(t, int64(256), resp.Usage.CompletionTokens)
+	assert.Equal(t, int64(356), resp.Usage.TotalTokens)
+	require.NotNil(t, resp.Usage.PromptTokensDetails)
+	assert.Equal(t, int64(80), resp.Usage.PromptTokensDetails.ImageTokens)
+	assert.Equal(t, int64(20), resp.Usage.PromptTokensDetails.TextTokens)
+	require.NotNil(t, resp.Usage.CompletionTokensDetails)
+	assert.Equal(t, int64(50), resp.Usage.CompletionTokensDetails.ReasoningTokens)
 }
 
 func TestTransformImageGenerationResponse_MultipleImages(t *testing.T) {

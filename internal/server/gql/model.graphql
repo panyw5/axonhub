@@ -1,6 +1,7 @@
 # ModelCard represents model capabilities and metadata
 type ModelCard {
   reasoning: ModelCardReasoning!
+  reasoningEfforts: [String!]
   toolCall: Boolean!
   temperature: Boolean!
   modalities: ModelCardModalities!
@@ -36,18 +37,28 @@ type ModelCardLimit {
 
 # ModelSettings represents model Association configuration
 type ModelSettings {
+  disableDeveloperSettingsInheritance: Boolean!
   associations: [ModelAssociation!]!
+  loadBalancerStrategy: String!
+  traceStickyMode: String!
 }
 
 type ModelAssociation {
   type: String!
   priority: Int!
+  disabled: Boolean!
+  when: ModelAssociationWhen
   channelModel: ChannelModelAssociation
   channelRegex: ChannelRegexAssociation
   regex: RegexAssociation
   modelId: ModelIDAssociation
   channelTagsModel: ChannelTagsModelAssociation
   channelTagsRegex: ChannelTagsRegexAssociation
+}
+
+type ModelAssociationWhen {
+  enabled: Boolean!
+  condition: FilterCondition
 }
 
 type ChannelModelAssociation {
@@ -89,6 +100,7 @@ type ChannelTagsRegexAssociation {
 # Input types for mutations
 input ModelCardInput {
   reasoning: ModelCardReasoningInput
+  reasoningEfforts: [String!]
   toolCall: Boolean
   temperature: Boolean
   modalities: ModelCardModalitiesInput
@@ -123,18 +135,28 @@ input ModelCardLimitInput {
 }
 
 input ModelSettingsInput {
+  disableDeveloperSettingsInheritance: Boolean
   associations: [ModelAssociationInput!]!
+  loadBalancerStrategy: String
+  traceStickyMode: String
 }
 
 input ModelAssociationInput {
   type: String!
   priority: Int
+  disabled: Boolean
+  when: ModelAssociationWhenInput
   channelModel: ChannelModelAssociationInput
   channelRegex: ChannelRegexAssociationInput
   regex: RegexAssociationInput
   modelId: ModelIDAssociationInput
   channelTagsModel: ChannelTagsModelAssociationInput
   channelTagsRegex: ChannelTagsRegexAssociationInput
+}
+
+input ModelAssociationWhenInput {
+  enabled: Boolean
+  condition: FilterConditionInput
 }
 
 input ChannelModelAssociationInput {

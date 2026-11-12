@@ -7,8 +7,10 @@ import { ApiKeysBulkDisableDialog } from './apikeys-bulk-disable-dialog';
 import { ApiKeysBulkEnableDialog } from './apikeys-bulk-enable-dialog';
 import { ApiKeysCreateDialog } from './apikeys-create-dialog';
 import { ApiKeysEditDialog } from './apikeys-edit-dialog';
+import { ApiKeysProfileTemplatesDialog } from './apikeys-profile-templates-dialog';
 import { ApiKeyProfilesDialog } from './apikeys-profiles-dialog';
 // import { ApiKeysDeleteDialog } from './apikeys-delete-dialog'
+import { ApiKeysRotateDialog } from './apikeys-rotate-dialog';
 import { ApiKeysStatusDialog } from './apikeys-status-dialog';
 import { ApiKeysViewDialog } from './apikeys-view-dialog';
 
@@ -22,9 +24,11 @@ export function ApiKeysDialogs() {
       <ApiKeysViewDialog />
       <ApiKeysArchiveDialog />
       <ApiKeysProfilesDialogWrapper />
+      <ApiKeysProfileTemplatesDialogWrapper />
       <ApiKeysBulkDisableDialog />
       <ApiKeysBulkArchiveDialog />
       <ApiKeysBulkEnableDialog />
+      <ApiKeysRotateDialog />
     </>
   );
 }
@@ -62,5 +66,13 @@ function ApiKeysProfilesDialogWrapper() {
           : undefined
       }
     />
+  );
+}
+
+function ApiKeysProfileTemplatesDialogWrapper() {
+  const { isDialogOpen, closeDialog } = useApiKeysContext();
+
+  return (
+    <ApiKeysProfileTemplatesDialog open={isDialogOpen.profileTemplates} onOpenChange={(open) => !open && closeDialog('profileTemplates')} />
   );
 }

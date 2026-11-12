@@ -7,6 +7,7 @@ import (
 	"entgo.io/ent/schema"
 	"entgo.io/ent/schema/edge"
 	"entgo.io/ent/schema/field"
+	"entgo.io/ent/schema/index"
 
 	"github.com/looplj/axonhub/internal/ent/schema/schematype"
 	"github.com/looplj/axonhub/internal/scopes"
@@ -24,10 +25,18 @@ func (User) Mixin() []ent.Mixin {
 	}
 }
 
+// Indexes of the User.
+// Unique index on (email, deleted_at) to allow same email after soft delete.
+func (User) Indexes() []ent.Index {
+	return []ent.Index{
+		index.Fields("email", "deleted_at").Unique(),
+	}
+}
+
 // Fields of the User.
 func (User) Fields() []ent.Field {
 	return []ent.Field{
-		field.String("email").Unique(),
+		field.String("email"),
 		field.Enum("status").Values("activated", "deactivated").Default("activated"),
 		field.String("prefer_language").Default("en").Comment("用户偏好语言"),
 		field.String("password").Sensitive(),
@@ -71,6 +80,12 @@ func (User) Edges() []ent.Edge {
 				entgql.Skip(entgql.SkipMutationCreateInput, entgql.SkipMutationUpdateInput),
 				entgql.RelayConnection(),
 			),
+		edge.From("oidc_identities", OIDCIdentity.Type).
+			Ref("user").
+			Annotations(
+				entgql.Skip(entgql.SkipMutationCreateInput, entgql.SkipMutationUpdateInput),
+				entgql.RelayConnection(),
+			),
 	}
 }
 
@@ -86,13 +101,14 @@ func (User) Policy() ent.Policy {
 	return scopes.Policy{
 		Query: scopes.QueryPolicy{
 			scopes.OwnerRule(),
+			scopes.ProjectOwnerReadUsersRule(),
+			scopes.ProjectMemberReadUsersRule(scopes.ScopeReadUsers),
 			scopes.UserReadScopeRule(scopes.ScopeReadUsers),
 			scopes.UserOwnedQueryRule(),
 		},
 		Mutation: scopes.MutationPolicy{
 			scopes.OwnerRule(),
 			scopes.UserWriteScopeRule(scopes.ScopeWriteUsers),
-			scopes.UserOwnedMutationRule(),
 		},
 	}
 }

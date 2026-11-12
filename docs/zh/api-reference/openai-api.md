@@ -59,8 +59,8 @@ AxonHub 提供对 OpenAI Responses API 的部分支持。该 API 为单轮交互
 **端点：**
 - `POST /v1/responses` - 生成响应
 
-**限制：**
-- ❌ **不支持** `previous_response_id` - 对话历史需要在客户端管理
+**能力：**
+- ✅ 支持 `previous_response_id` 透传，可用于同一上游 channel 上的连续 Responses 对话复用
 - ✅ 基本响应生成完全可用
 - ✅ 支持流式响应
 
@@ -84,9 +84,10 @@ client := openai.NewClient(
 
 ctx := context.Background()
 
-// 生成响应（不支持 previous_response_id）
+// 生成响应（支持同一上游 channel 的 previous_response_id 透传）
 params := responses.ResponseNewParams{
     Model: shared.ResponsesModel("gpt-4o"),
+    PreviousResponseID: openai.String("resp_prev_123"),
     Input: responses.ResponseNewParamsInputUnion{
         OfString: openai.String("你好，最近怎么样？"),
     },
@@ -149,6 +150,129 @@ if err := stream.Err(); err != nil {
 fmt.Println("\n完整响应:", fullContent.String())
 ```
 
+### OpenAI Decisions API
+
+AxonHub 以原生方式支持 OpenAI Decisions 协议，并提供独立的非流式端点。
+请求发送到 `POST /v1/decisions`，保留 Decisions JSON 结构，不会转换为 Chat
+Completions、Responses 或 SystemOne。
+
+**端点：**
+
+- `POST /v1/decisions` - 使用带类型的问题评估共享输入
+
+**渠道端点配置：**
+
+在需要接收 Decisions 请求的渠道中添加自定义端点，并设置
+`api_format: openai/decisions`。端点可以继承渠道的 `base_url`，也可以提供
+自己的 `base_url`。可选的 `path` 会替换默认路径，且必须以 `/` 开头，例如
+`/v1/decisions`。Decisions 不会回退到 Chat 端点。渠道必须配置兼容的
+`openai/decisions` 端点，才能接收此类请求。
+
+```json
+{
+  "api_format": "openai/decisions",
+  "base_url": "https://decisions.example.test/api",
+  "path": "/v1/decisions"
+}
+```
+
+**请求协议：**
+
+原生请求必须包含 `model`、`input` 和非空的 `questions` 数组。`input` 可以是
+非空字符串，也可以是受支持的消息项数组。文本部分使用 `input_text`，图片
+部分使用 `input_image`；`message` 项可以包含文本或嵌套内容部分。问题和答案
+对象保持原生 JSON 结构，包括未知字段和带类型的 choice 值。
+
+```json
+{
+  "model": "example-decisions-model",
+  "input": "一条虚构的客户报告称包裹完好送达。",
+  "questions": [
+    {
+      "type": "choice",
+      "name": "route",
+      "instructions": "选择最合适的虚构路由标签。",
+      "choices": [
+        { "value": "review", "description": "需要人工审核。" },
+        { "value": "complete", "description": "不需要后续处理。" }
+      ]
+    }
+  ]
+}
+```
+
+**响应和限制：**
+
+- 成功响应以原生 Decisions JSON 返回，并包含 `answers` 数组。答案可以是
+  `choice`、`predicate` 或 `score` 等带类型结果，也可以包含 `refusal` 答案。
+- 第一阶段的 Decisions 仅支持非流式请求。请设置 `stream` 为 `false` 或省略
+  该字段。带有 `"stream": true` 的请求会在本地被拒绝，并返回无效请求错误。
+  此端点不支持 SSE 客户端和 SDK 的流式辅助方法。
+- 如果响应包含 `usage`，只有 `usage.input_tokens` 会映射为 AxonHub 的 prompt
+  用量。output、total、cache 和 reasoning token 字段不会由此协议映射。缺少
+  `usage` 或其值为 null 时，相关用量保持缺失。
+- 提示词保护会按请求应用已配置的提示词保护规则：匹配的规则可以遮盖命中的文本，
+  也可以直接拒绝请求。遮盖分为主路径和条件性的原始回放路径：
+  - 主路径：字符串形式的 `input`，以及 `input[].content[]` 中 `type` 为
+    `input_text` 的部分的 `text`。
+  - 条件性原始回放路径：仅当请求体透传已启用且实际应用、主路径命中的遮盖规则
+    可用，并且额外字段本身也匹配这些规则及其作用域时，遮盖才会作用于独立的
+    `input[].text` 和字符串形式的 `message.content`。透传禁用时，仅遮盖主路径的
+    字符串 `input` 和嵌套 `input_text` 字段。额外形式单独出现时不会产生主路径
+    命中，因而会原样返回。
+  内联图片值和无关的上游字段会保留，但追踪数据不会暴露内联图片字节。
+- 原生 Decisions 请求和响应不会转换为 SystemOne。SystemOne 端点配置属于独立
+  的协议边界，不是 `/v1/decisions` 的回退或兼容路径。
+
+**虚构响应示例：**
+
+```json
+{
+  "model": "example-decisions-model",
+  "answers": [
+    { "type": "choice", "name": "route", "choice": "complete" },
+    { "type": "refusal", "name": "safety_check", "refusal": "not evaluated" }
+  ],
+  "usage": { "input_tokens": 12, "output_tokens": 99 }
+}
+```
+
+**虚构错误示例：**
+
+```json
+{
+  "error": {
+    "message": "decision rate limit",
+    "type": "rate_limit_error",
+    "code": "rate_limit",
+    "x_beta": null
+  }
+}
+```
+
+**虚构的条件性提示词保护示例：**
+
+遮盖 `secret-*` 的规则命中了嵌套的 `input_text` 部分，因此主路径会遮盖它。
+如果请求体透传已启用且实际应用、该命中的遮盖规则可用于原始回放，并且独立的
+`input[].text` 本身也匹配该规则及其作用域，条件性原始回放路径才会同时遮盖它：
+
+```json
+{
+  "input": [
+    {
+      "type": "message",
+      "role": "user",
+      "content": [{ "type": "input_text", "text": "secret-nested" }]
+    },
+    { "type": "input_text", "text": "secret-standalone" }
+  ]
+}
+```
+
+满足这些条件时，两处 `secret-*` 都会被遮盖。透传禁用时，仅遮盖嵌套的
+`input_text` 字段。如果只存在独立的 `input[].text`，则没有任何主路径
+字段命中，请求会原样返回。
+
 ## API 转换能力
 
 AxonHub 自动在 API 格式之间进行转换，实现以下强大场景：
@@ -184,6 +308,58 @@ responseText := completion.Choices[0].Message.Content
 fmt.Println(responseText)
 // AxonHub 自动转换 OpenAI 格式 → Gemini 格式
 ```
+
+## Moderations API
+
+AxonHub 通过独立端点提供 OpenAI 兼容的内容审核（Moderations）能力。
+
+**端点：**
+- `POST /v1/moderations` - 对文本和/或图片输入进行分类，支持 `omni-moderation-latest` 等模型
+
+**请求参数：**
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `input` | string \| string[] \| 多模态对象数组 | ✅ | 待分类内容。多模态项为 `{ "type": "text", "text": "..." }` 或 `{ "type": "image_url", "image_url": { "url": "..." } }`。 |
+| `model` | string | ❌ | 审核模型。省略时 AxonHub 默认使用 `omni-moderation-latest`。该模型需配置在具备 `openai/moderations` 端点的渠道上。 |
+
+**独立请求示例：**
+
+```json
+{
+  "model": "omni-moderation-latest",
+  "input": "...text to classify goes here..."
+}
+```
+
+也支持多模态输入（文本 + 图片）：
+
+```json
+{
+  "model": "omni-moderation-latest",
+  "input": [
+    { "type": "text", "text": "...text to classify goes here..." },
+    {
+      "type": "image_url",
+      "image_url": { "url": "https://example.com/image.png" }
+    }
+  ]
+}
+```
+
+**说明：**
+- Chat Completions / Responses 不建模可选的内联 `moderation` 请求字段，请改用本独立端点。
+- OpenAI 及部分 OpenAI 兼容渠道类型默认包含 `openai/moderations` 端点。若上游不支持 `/moderations`，可能返回上游错误；可按需移除或覆盖该端点。
+- 开启请求体透传且入站/出站 format 一致时，moderations 请求仍会修补顶层 `model` 字段以支持模型映射。
+
+## Codex Alpha Search API
+
+AxonHub 可透明转发 Codex/CPA 兼容的 Alpha Search 端点，不解析上游自定义的搜索请求和响应结构。
+
+**端点：**
+- `POST /v1/alpha/search`
+
+请求必须包含 `model`，以便 AxonHub 选择渠道。除模型映射会修改顶层 `model` 外，其余 JSON（包括 `commands.search_query`）原样转发；上游响应也原样返回。该端点不属于公开 OpenAI API，只应为确实实现了 `/alpha/search` 的上游（例如 CPA）配置 `openai/alpha_search` endpoint。只有内置 Codex 渠道默认包含该端点；其他渠道（包括 Fenno、OpenAI 和 OpenAI Responses）都需要显式加入。
 
 ## 嵌入 API
 
@@ -331,6 +507,7 @@ AxonHub 提供增强的 `/v1/models` 端点，可列出可用模型并选择性�
 | `description` | 字符串 | 模型描述 |
 | `context_length` | 整数 | 最大上下文长度（以令牌计） |
 | `max_output_tokens` | 整数 | 最大输出令牌数 |
+| `modalities` | 对象 | 模型支持的输入输出类型（input, output） |
 | `capabilities` | 对象 | 模型能力（vision, tool_call, reasoning） |
 | `pricing` | 对象 | 定价信息（input, output, cache_read, cache_write） |
 | `icon` | 字符串 | 模型图标 URL |
@@ -377,6 +554,10 @@ AxonHub 提供增强的 `/v1/models` 端点，可列出可用模型并选择性�
       "description": "GPT-4 model with advanced reasoning capabilities",
       "context_length": 8192,
       "max_output_tokens": 4096,
+      "modalities": {
+        "input": ["text", "image"],
+        "output": ["text"]
+      },
       "capabilities": {
         "vision": false,
         "tool_call": true,
@@ -402,6 +583,9 @@ AxonHub 提供增强的 `/v1/models` 端点，可列出可用模型并选择性�
 - `description` - 详细的模型描述
 - `context_length` - 上下文窗口的最大令牌数
 - `max_output_tokens` - 响应中的最大令牌数
+- `modalities` - 模型支持的输入输出模态类型：
+  - `input` - 支持的输入类型数组（如 `text`、`image`、`audio`、`video`、`pdf`）
+  - `output` - 支持的输出类型数组（如 `text`）
 - `capabilities` - 包含布尔标志的对象：
   - `vision` - 支持图像输入
   - `tool_call` - 支持函数调用

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/samber/lo"
@@ -13,6 +14,7 @@ import (
 	"github.com/looplj/axonhub/llm"
 	"github.com/looplj/axonhub/llm/auth"
 	"github.com/looplj/axonhub/llm/httpclient"
+	"github.com/looplj/axonhub/llm/internal/pkg/xurl"
 	"github.com/looplj/axonhub/llm/transformer"
 	"github.com/looplj/axonhub/llm/transformer/openai"
 )
@@ -22,6 +24,10 @@ type Config struct {
 	// API configuration
 	BaseURL        string              `json:"base_url,omitempty"` // Custom base URL (optional)
 	APIKeyProvider auth.APIKeyProvider `json:"-"`                  // API key provider
+	// EndpointPath replaces the default "/chat/completions" path. When set, the
+	// base URL is kept as-is without version normalization (same convention as
+	// the OpenAI transformer).
+	EndpointPath string `json:"endpoint_path,omitempty"`
 }
 
 // OutboundTransformer implements transformer.Outbound for Doubao format.
@@ -30,7 +36,16 @@ type OutboundTransformer struct {
 
 	BaseURL        string
 	APIKeyProvider auth.APIKeyProvider
+	endpointPath   string
+	rawURL         bool
 }
+
+// Ark accepts user_id values of 6-128 characters; the field is omitted when the
+// client-supplied value is shorter.
+const (
+	minUserIDLength = 6
+	maxUserIDLength = 128
+)
 
 // NewOutboundTransformer creates a new Doubao OutboundTransformer with legacy parameters.
 // Deprecated: Use NewOutboundTransformerWithConfig instead.
@@ -61,12 +76,28 @@ func NewOutboundTransformerWithConfig(config *Config) (transformer.Outbound, err
 		return nil, fmt.Errorf("API key provider is required for Doubao transformer")
 	}
 
-	baseURL := transformer.NormalizeBaseURL(config.BaseURL, "v3")
+	// "##" suffix marks a raw full request URL (same convention as the OpenAI
+	// transformer); strip it here so it never leaks into the request URL.
+	rawURL := strings.HasSuffix(config.BaseURL, "##")
+	if rawURL {
+		config.BaseURL = strings.TrimSuffix(config.BaseURL, "##")
+	}
+
+	var baseURL string
+	switch {
+	case rawURL:
+		baseURL = strings.TrimRight(config.BaseURL, "/")
+	case config.EndpointPath != "":
+		baseURL = transformer.NormalizeBaseURL(config.BaseURL, "")
+	default:
+		baseURL = transformer.NormalizeBaseURL(config.BaseURL, "v3")
+	}
 
 	oaiConfig := &openai.Config{
 		PlatformType:   openai.PlatformOpenAI,
 		BaseURL:        baseURL,
 		APIKeyProvider: config.APIKeyProvider,
+		ReasoningField: openai.ReasoningFieldContent,
 	}
 
 	outbound, err := openai.NewOutboundTransformerWithConfig(oaiConfig)
@@ -78,6 +109,8 @@ func NewOutboundTransformerWithConfig(config *Config) (transformer.Outbound, err
 		Outbound:       outbound,
 		BaseURL:        baseURL,
 		APIKeyProvider: config.APIKeyProvider,
+		endpointPath:   config.EndpointPath,
+		rawURL:         rawURL,
 	}, nil
 }
 
@@ -113,8 +146,14 @@ func (t *OutboundTransformer) TransformRequest(
 	switch llmReq.RequestType {
 	case llm.RequestTypeChat, "":
 		// continue
+	case llm.RequestTypeEmbedding:
+		return t.transformEmbeddingRequest(ctx, llmReq)
 	case llm.RequestTypeImage:
 		return t.buildImageGenerationAPIRequest(llmReq)
+	case llm.RequestTypeVideo:
+		return t.buildVideoGenerationAPIRequest(ctx, llmReq)
+	case llm.RequestTypeCompact:
+		return nil, fmt.Errorf("%w: compact is only supported by OpenAI Responses API", transformer.ErrInvalidRequest)
 	default:
 		return nil, fmt.Errorf("%w: %s is not supported", transformer.ErrInvalidRequest, llmReq.RequestType)
 	}
@@ -124,7 +163,7 @@ func (t *OutboundTransformer) TransformRequest(
 	}
 
 	// Convert llm.Request to openai.Request first
-	oaiReq := openai.RequestFromLLM(llmReq)
+	oaiReq := openai.RequestFromLLM(ctx, llmReq, openai.ReasoningFieldContent)
 
 	// Create Doubao-specific request by adding request_id/user_id
 	doubaoReq := Request{
@@ -136,6 +175,16 @@ func (t *OutboundTransformer) TransformRequest(
 	if llmReq.Metadata != nil {
 		doubaoReq.UserID = llmReq.Metadata["user_id"]
 		doubaoReq.RequestID = llmReq.Metadata["request_id"]
+
+		// Ark validates user_id as 6-128 characters (same constraint family as
+		// GLM's error 1214). Clients like Claude Code send a long JSON blob
+		// (device_id/session_id) here; truncate long values, drop short ones.
+		// An empty value omits the field entirely (json omitempty).
+		if runes := []rune(doubaoReq.UserID); len(runes) > maxUserIDLength {
+			doubaoReq.UserID = string(runes[:maxUserIDLength])
+		} else if len(runes) < minUserIDLength {
+			doubaoReq.UserID = ""
+		}
 	}
 
 	// Generate request ID if not provided
@@ -165,14 +214,23 @@ func (t *OutboundTransformer) TransformRequest(
 		APIKey: apiKey,
 	}
 
-	url := t.BaseURL + "/chat/completions"
+	url := t.BaseURL
+	switch {
+	case t.rawURL:
+		// Base URL is already the full request URL.
+	case t.endpointPath != "":
+		url += t.endpointPath
+	default:
+		url += "/chat/completions"
+	}
 
 	return &httpclient.Request{
-		Method:  http.MethodPost,
-		URL:     url,
-		Headers: headers,
-		Body:    body,
-		Auth:    auth,
+		Method:    http.MethodPost,
+		URL:       url,
+		Headers:   headers,
+		Body:      body,
+		Auth:      auth,
+		APIFormat: string(llm.APIFormatOpenAIChatCompletion),
 	}, nil
 }
 
@@ -272,6 +330,7 @@ func (t *OutboundTransformer) buildImageGenerationAPIRequest(llmReq *llm.Request
 	if request.TransformerMetadata == nil {
 		request.TransformerMetadata = map[string]any{}
 	}
+
 	request.TransformerMetadata["model"] = llmReq.Model
 
 	return request, nil
@@ -282,5 +341,51 @@ func encodeImageBytesToDataURL(b []byte) string {
 		return ""
 	}
 
-	return "data:image/png;base64," + base64.StdEncoding.EncodeToString(b)
+	mediaType := http.DetectContentType(b)
+	if !strings.HasPrefix(mediaType, "image/") {
+		mediaType = "image/png"
+	}
+
+	return xurl.BuildDataURL(mediaType, base64.StdEncoding.EncodeToString(b), true)
+}
+
+func (t *OutboundTransformer) TransformResponse(ctx context.Context, httpResp *httpclient.Response) (*llm.Response, error) {
+	if httpResp != nil && httpResp.Request != nil {
+		switch httpResp.Request.RequestType {
+		case llm.RequestTypeEmbedding.String():
+			return t.transformEmbeddingResponse(ctx, httpResp)
+		case llm.RequestTypeVideo.String():
+			// fall through to video handling below
+		default:
+			return t.Outbound.TransformResponse(ctx, httpResp)
+		}
+	} else {
+		return t.Outbound.TransformResponse(ctx, httpResp)
+	}
+
+	// Video create returns {id}.
+	var resp seedanceCreateResponse
+	if err := json.Unmarshal(httpResp.Body, &resp); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal seedance create response: %w", err)
+	}
+
+	if strings.TrimSpace(resp.ID) == "" {
+		return nil, fmt.Errorf("%w: missing id in seedance create response", transformer.ErrInvalidResponse)
+	}
+
+	return &llm.Response{
+		ID:          resp.ID, // provider task id for persistence
+		Object:      "video.create",
+		Created:     time.Now().Unix(),
+		Model:       llmReqModelOrFallback(httpResp),
+		RequestType: llm.RequestTypeVideo,
+		APIFormat:   llm.APIFormatSeedanceVideo,
+		Choices:     []llm.Choice{},
+		Video: &llm.VideoResponse{
+			ID:        resp.ID,
+			Status:    "queued",
+			Model:     llmReqModelOrFallback(httpResp),
+			CreatedAt: time.Now().Unix(),
+		},
+	}, nil
 }

@@ -12,13 +12,21 @@ import (
 // here.
 
 type Resolver struct {
-	apiKeyService *biz.APIKeyService
+	apiKeyService                *biz.APIKeyService
+	apiKeyProfileTemplateService *biz.APIKeyProfileTemplateService
+	quotaService                 *biz.QuotaService
 }
 
-func NewSchema(apiKeyService *biz.APIKeyService) graphql.ExecutableSchema {
+func NewSchema(
+	apiKeyService *biz.APIKeyService,
+	apiKeyProfileTemplateService *biz.APIKeyProfileTemplateService,
+	quotaService *biz.QuotaService,
+) graphql.ExecutableSchema {
 	return NewExecutableSchema(Config{
 		Resolvers: &Resolver{
-			apiKeyService: apiKeyService,
+			apiKeyService:                apiKeyService,
+			apiKeyProfileTemplateService: apiKeyProfileTemplateService,
+			quotaService:                 quotaService,
 		},
 	})
 }

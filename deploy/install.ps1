@@ -134,12 +134,6 @@ function Ensure-Dirs([string]$path){ if(-not (Test-Path $path)){ New-Item -ItemT
 # Main
 Write-Info 'Starting AxonHub installation...'
 
-$Platform = Get-Platform
-Write-Info "Detected platform: $Platform"
-
-if(-not $Version){ $Version = Get-LatestVersion $IncludeBeta $IncludeRC }
-Write-Info "Using version: $Version"
-
 $BaseDir   = Join-Path $env:LOCALAPPDATA 'AxonHub'
 $ConfigDir = $BaseDir
 $DataDir   = $BaseDir
@@ -147,20 +141,40 @@ $LogDir    = $BaseDir
 Ensure-Dirs $BaseDir
 Ensure-Dirs (Join-Path $BaseDir 'logs')
 
-$AssetUrl = Get-AssetUrl $Version $Platform
-$TempDir = New-Item -ItemType Directory -Path (Join-Path ([IO.Path]::GetTempPath()) ([IO.Path]::GetRandomFileName())) -Force
-$ZipPath = Join-Path $TempDir 'axonhub.zip'
-Write-Info "Downloading: $AssetUrl"
-Invoke-WebRequest -Uri $AssetUrl -OutFile $ZipPath -UseBasicParsing
-
-Write-Info 'Extracting archive...'
-Expand-Archive -Path $ZipPath -DestinationPath $TempDir -Force
-
-$BinaryPath = Get-ChildItem -Path $TempDir -Recurse -Filter 'axonhub.exe' -File | Select-Object -First 1 | ForEach-Object { $_.FullName }
-if(-not $BinaryPath){ Write-Err 'axonhub.exe not found in archive'; exit 1 }
-
 $TargetBinary = Join-Path $BaseDir 'axonhub.exe'
-Copy-Item -Path $BinaryPath -Destination $TargetBinary -Force
+$BundledBinary = Join-Path $PSScriptRoot 'axonhub.exe'
+$UseBundledBinary = (Test-Path -LiteralPath $BundledBinary -PathType Leaf) -and -not $Version -and -not $IncludeBeta -and -not $IncludeRC
+
+if($UseBundledBinary){
+  Write-Info "Using bundled binary: $BundledBinary"
+  $BundledFullPath = [IO.Path]::GetFullPath($BundledBinary)
+  $TargetFullPath = [IO.Path]::GetFullPath($TargetBinary)
+  if(-not [string]::Equals($BundledFullPath, $TargetFullPath, [StringComparison]::OrdinalIgnoreCase)){
+    Copy-Item -LiteralPath $BundledBinary -Destination $TargetBinary -Force
+  } else {
+    Write-Info 'Bundled binary is already in the installation directory'
+  }
+} else {
+  $Platform = Get-Platform
+  Write-Info "Detected platform: $Platform"
+
+  if(-not $Version){ $Version = Get-LatestVersion $IncludeBeta $IncludeRC }
+  Write-Info "Using version: $Version"
+
+  $AssetUrl = Get-AssetUrl $Version $Platform
+  $TempDir = New-Item -ItemType Directory -Path (Join-Path ([IO.Path]::GetTempPath()) ([IO.Path]::GetRandomFileName())) -Force
+  $ZipPath = Join-Path $TempDir 'axonhub.zip'
+  Write-Info "Downloading: $AssetUrl"
+  Invoke-WebRequest -Uri $AssetUrl -OutFile $ZipPath -UseBasicParsing
+
+  Write-Info 'Extracting archive...'
+  Expand-Archive -Path $ZipPath -DestinationPath $TempDir -Force
+
+  $BinaryPath = Get-ChildItem -Path $TempDir -Recurse -Filter 'axonhub.exe' -File | Select-Object -First 1 | ForEach-Object { $_.FullName }
+  if(-not $BinaryPath){ Write-Err 'axonhub.exe not found in archive'; exit 1 }
+
+  Copy-Item -Path $BinaryPath -Destination $TargetBinary -Force
+}
 
 # Create default config if missing
 $ConfigFile = Join-Path $BaseDir 'config.yml'
@@ -175,11 +189,11 @@ server:
 
 db:
   dialect: "sqlite3"
-  dsn: "$baseForDSN/axonhub.db?cache=shared&_fk=1&journal_mode=WAL"
+  dsn: "$baseForDSN/axonhub.db?cache=shared&_fk=1&_pragma=journal_mode(WAL)"
 
 cache:
   mode: "memory"
-  cache:
+  memory:
     expiration: "5s"
     cleanup_interval: "5s"
     
@@ -202,9 +216,14 @@ Write-Success 'AxonHub installation completed!'
 $port = 8090
 if(Test-Path $TargetBinary){
   try {
-    $configPort = & $TargetBinary config get server.port 2>$null
-    if($configPort -match '^[0-9]+$'){
-      $port = $configPort
+    Push-Location -LiteralPath $BaseDir
+    try {
+      $configPort = & $TargetBinary config get server.port 2>$null
+      if($configPort -match '^[0-9]+$'){
+        $port = $configPort
+      }
+    } finally {
+      Pop-Location
     }
   } catch {}
 }
@@ -215,3 +234,4 @@ Write-Host "  2. Start AxonHub: start.bat"
 Write-Host "  3. Stop AxonHub: stop.bat"
 Write-Host "  4. View logs: $BaseDir\axonhub.log (or logs\axonhub.log in config)"
 Write-Host "  5. Access web interface: http://localhost:$port"
+Write-Host "  6. Setup auto-start: setup.bat install-autostart"

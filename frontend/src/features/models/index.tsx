@@ -3,11 +3,11 @@ import { SortingState } from '@tanstack/react-table';
 import { IconPlus, IconSettings, IconAlertCircle } from '@tabler/icons-react';
 import { useTranslation } from 'react-i18next';
 import { useDebounce } from '@/hooks/use-debounce';
-import { usePaginationSearch } from '@/hooks/use-pagination-search';
 import { usePermissions } from '@/hooks/usePermissions';
+import { revealFocusedHorizontalButton, useHorizontalScroll } from '@/hooks/use-horizontal-scroll';
 import { Button } from '@/components/ui/button';
-import { Header } from '@/components/layout/header';
 import { Main } from '@/components/layout/main';
+import { PageHeader } from '@/components/layout/page-header';
 import { PermissionGuard } from '@/components/permission-guard';
 import { useOnboardingInfo } from '@/features/system/data/system';
 import { createColumns } from './components/models-columns';
@@ -15,17 +15,14 @@ import { ModelsDialogs } from './components/models-dialogs';
 import { ModelsOnboardingFlow } from './components/models-onboarding-flow';
 import { ModelsTable } from './components/models-table';
 import ModelsProvider, { useModels } from './context/models-context';
-import { useQueryModels } from './data/models';
+import { useQueryAllModels } from './data/models';
+import { ModelsCatalogStatus } from './components/models-catalog-status';
 import { useDevelopersData } from './data/providers';
 
 function ModelsContent() {
   useDevelopersData();
   const { t } = useTranslation();
   const { modelPermissions } = usePermissions();
-  const { pageSize, setCursors, setPageSize, resetCursor, paginationArgs } = usePaginationSearch({
-    defaultPageSize: 20,
-    pageSizeStorageKey: 'models-table-page-size',
-  });
   const [nameFilter, setNameFilter] = useState<string>('');
   const [sorting, setSorting] = useState<SortingState>(() => {
     const stored = localStorage.getItem('models-table-sorting');
@@ -33,10 +30,10 @@ function ModelsContent() {
       try {
         return JSON.parse(stored);
       } catch {
-        return [{ id: 'createdAt', desc: true }];
+        return [{ id: 'name', desc: false }];
       }
     }
-    return [{ id: 'createdAt', desc: true }];
+    return [{ id: 'name', desc: false }];
   });
 
   useEffect(() => {
@@ -54,54 +51,14 @@ function ModelsContent() {
     return undefined;
   })();
 
-  const currentOrderBy = (() => {
-    if (sorting.length === 0) {
-      return { field: 'CREATED_AT', direction: 'DESC' } as const;
-    }
-    const [primary] = sorting;
-    switch (primary.id) {
-      case 'name':
-        return { field: 'NAME', direction: primary.desc ? 'DESC' : 'ASC' } as const;
-      case 'modelId':
-        return { field: 'MODEL_ID', direction: primary.desc ? 'DESC' : 'ASC' } as const;
-      case 'createdAt':
-        return { field: 'CREATED_AT', direction: primary.desc ? 'DESC' : 'ASC' } as const;
-      default:
-        return { field: 'CREATED_AT', direction: 'DESC' } as const;
-    }
-  })();
-
-  const { data, isLoading } = useQueryModels({
-    ...paginationArgs,
+  const { data, isLoading } = useQueryAllModels({
     where: whereClause,
-    orderBy: currentOrderBy,
   });
-
-  const handleNextPage = useCallback(() => {
-    if (data?.pageInfo?.hasNextPage && data?.pageInfo?.endCursor) {
-      setCursors(data.pageInfo.startCursor ?? undefined, data.pageInfo.endCursor ?? undefined, 'after');
-    }
-  }, [data?.pageInfo, setCursors]);
-
-  const handlePreviousPage = useCallback(() => {
-    if (data?.pageInfo?.hasPreviousPage) {
-      setCursors(data.pageInfo.startCursor ?? undefined, data.pageInfo.endCursor ?? undefined, 'before');
-    }
-  }, [data?.pageInfo, setCursors]);
-
-  const handlePageSizeChange = useCallback(
-    (newPageSize: number) => {
-      setPageSize(newPageSize);
-    },
-    [setPageSize]
-  );
 
   const handleNameFilterChange = useCallback(
     (filter: string) => {
       setNameFilter(filter);
-      resetCursor();
     },
-    // eslint-disable-next-line react-hooks/exhaustive-deps
     [setNameFilter]
   );
 
@@ -113,15 +70,10 @@ function ModelsContent() {
         data={data?.edges?.map((edge) => edge.node) || []}
         columns={columns}
         loading={isLoading}
-        pageInfo={data?.pageInfo}
-        pageSize={pageSize}
         totalCount={data?.totalCount}
         nameFilter={nameFilter}
         sorting={sorting}
         onSortingChange={setSorting}
-        onNextPage={handleNextPage}
-        onPreviousPage={handlePreviousPage}
-        onPageSizeChange={handlePageSizeChange}
         onNameFilterChange={handleNameFilterChange}
         canWrite={modelPermissions.canWrite}
       />
@@ -134,7 +86,7 @@ function CreateButton() {
   const { setOpen } = useModels();
 
   return (
-    <Button onClick={() => setOpen('create')}>
+    <Button className='shrink-0' onClick={() => setOpen('create')}>
       <IconPlus className='mr-2 h-4 w-4' />
       {t('models.actions.create')}
     </Button>
@@ -146,7 +98,7 @@ function BulkAddButton() {
   const { setOpen } = useModels();
 
   return (
-    <Button variant='outline' onClick={() => setOpen('batchCreate')}>
+    <Button variant='outline' className='shrink-0' onClick={() => setOpen('batchCreate')}>
       <IconPlus className='mr-2 h-4 w-4' />
       {t('models.actions.bulkAdd')}
     </Button>
@@ -158,7 +110,7 @@ function SettingsButton() {
   const { setOpen } = useModels();
 
   return (
-    <Button variant='outline' onClick={() => setOpen('settings')} data-settings-button>
+    <Button variant='outline' className='shrink-0' onClick={() => setOpen('settings')} data-settings-button>
       <IconSettings className='mr-2 h-4 w-4' />
       {t('models.actions.settings')}
     </Button>
@@ -170,7 +122,7 @@ function DetectUnassociatedButton() {
   const { setOpen } = useModels();
 
   return (
-    <Button variant='outline' onClick={() => setOpen('unassociated')}>
+    <Button variant='outline' className='shrink-0' onClick={() => setOpen('unassociated')}>
       <IconAlertCircle className='mr-2 h-4 w-4' />
       {t('models.actions.detectUnassociated')}
     </Button>
@@ -178,8 +130,9 @@ function DetectUnassociatedButton() {
 }
 
 function ActionButtons() {
+  const scrollRef = useHorizontalScroll<HTMLDivElement>();
   return (
-    <div className='flex gap-2 overflow-x-auto md:overflow-x-visible'>
+    <div ref={scrollRef} onFocusCapture={revealFocusedHorizontalButton} data-testid='model-actions-scroller' className='flex min-w-0 max-w-full gap-2 overflow-x-auto p-1'>
       <PermissionGuard requiredScope='write_channels'>
         <>
           <DetectUnassociatedButton />
@@ -211,15 +164,13 @@ export default function ModelsManagement() {
 
   return (
     <ModelsProvider>
-      <Header fixed>
-        <div className='flex w-full flex-1 flex-col gap-2 md:flex-row md:items-center md:justify-between md:gap-0'>
-          <div className='min-w-0'>
-            <h2 className='text-xl font-bold tracking-tight'>{t('models.title')}</h2>
-            <p className='text-muted-foreground text-sm'>{t('models.description')}</p>
-          </div>
-          <ActionButtons />
-        </div>
-      </Header>
+      <PageHeader
+        title={t('models.title')}
+        description={t('models.description')}
+        metadata={<ModelsCatalogStatus />}
+        actions={<ActionButtons />}
+        actionLayout='scroll'
+      />
 
       <Main fixed>
         <ModelsContent />

@@ -3,6 +3,8 @@ package biz
 import (
 	"context"
 	"fmt"
+	"slices"
+	"strings"
 
 	"github.com/samber/lo"
 
@@ -10,6 +12,7 @@ import (
 	"github.com/looplj/axonhub/internal/ent/channel"
 	"github.com/looplj/axonhub/internal/log"
 	"github.com/looplj/axonhub/internal/objects"
+	"github.com/looplj/axonhub/internal/pkg/xerrors"
 )
 
 // ChannelOrderingItem represents a channel ordering update.
@@ -35,7 +38,10 @@ func (svc *ChannelService) BulkUpdateChannelOrdering(ctx context.Context, items 
 		updatedChannels = append(updatedChannels, channel)
 	}
 
-	svc.asyncReloadChannels()
+	// The GraphQL Transactioner wraps this mutation in an Ent transaction, so the
+	// refresh must wait for commit: reloading before commit would read a stale
+	// ordering_weight snapshot and keep failover chains on the old ordering.
+	svc.reloadChannelsAfterCommit(ctx)
 
 	return updatedChannels, nil
 }
@@ -91,50 +97,70 @@ func (svc *ChannelService) BulkCreateChannels(ctx context.Context, input BulkCre
 		tagsToUse = []string{input.Name} // Use base name as tag (backward compatible)
 	}
 
-	for _, apiKey := range input.APIKeys {
-		// Generate unique channel name with numbering
-		channelName := fmt.Sprintf("%s - (%d)", input.Name, counter)
-		// Find next available counter
-		for existingNames[channelName] {
-			counter++
-			channelName = fmt.Sprintf("%s - (%d)", input.Name, counter)
-		}
-
-		counter++
-		existingNames[channelName] = true
-
-		// Create channel input
-		createInput := ent.CreateChannelInput{
-			Type:                    input.Type,
-			BaseURL:                 input.BaseURL,
-			Name:                    channelName,
-			Credentials:             objects.ChannelCredentials{APIKeys: []string{apiKey}},
-			SupportedModels:         input.SupportedModels,
-			AutoSyncSupportedModels: input.AutoSyncSupportedModels,
-			Tags:                    tagsToUse,
-			DefaultTestModel:        input.DefaultTestModel,
-			Policies:                input.Policies,
-			Settings:                input.Settings,
-			OrderingWeight:          input.OrderingWeight,
-			Remark:                  input.Remark,
-		}
-
-		// Create the channel without reload
-		ch, err := svc.createChannel(ctx, createInput)
+	err = svc.RunInTransaction(ctx, func(ctx context.Context) error {
+		priceTemplates, err := svc.resolveChannelModelPriceTemplates(ctx, input.SupportedModels)
 		if err != nil {
-			return nil, fmt.Errorf("failed to create channel '%s': %w", channelName, err)
+			return err
 		}
 
-		createdChannels = append(createdChannels, ch)
+		for _, apiKey := range input.APIKeys {
+			// Generate unique channel name with numbering
+			channelName := fmt.Sprintf("%s - (%d)", input.Name, counter)
+			// Find next available counter
+			for existingNames[channelName] {
+				counter++
+				channelName = fmt.Sprintf("%s - (%d)", input.Name, counter)
+			}
+
+			counter++
+			existingNames[channelName] = true
+
+			// Create channel input
+			createInput := ent.CreateChannelInput{
+				Type:                    input.Type,
+				BaseURL:                 input.BaseURL,
+				Name:                    channelName,
+				Credentials:             objects.ChannelCredentials{APIKeys: []string{apiKey}},
+				SupportedModels:         input.SupportedModels,
+				AutoSyncSupportedModels: input.AutoSyncSupportedModels,
+				Tags:                    tagsToUse,
+				DefaultTestModel:        input.DefaultTestModel,
+				Policies:                input.Policies,
+				Settings:                input.Settings,
+				OrderingWeight:          input.OrderingWeight,
+				Remark:                  input.Remark,
+			}
+
+			ch, err := svc.createChannel(ctx, createInput)
+			if err != nil {
+				return fmt.Errorf("failed to create channel '%s': %w", channelName, err)
+			}
+
+			if _, err := svc.applyChannelModelPriceTemplates(ctx, ch.ID, priceTemplates); err != nil {
+				return fmt.Errorf("failed to auto-configure prices for channel '%s': %w", channelName, err)
+			}
+
+			createdChannels = append(createdChannels, ch)
+		}
+
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	if ent.TxFromContext(ctx) == nil {
+		for _, ch := range createdChannels {
+			ch.Unwrap()
+		}
 	}
 
 	// Reload channels once after all successful creations
-	svc.asyncReloadChannels()
+	svc.reloadChannelsAfterCommit(ctx)
 
 	return createdChannels, nil
 }
 
-func (svc *ChannelService) bulkUpdateChannelStatus(ctx context.Context, ids []int, status channel.Status, action string) error {
+func (svc *ChannelService) bulkUpdateChannelStatus(ctx context.Context, ids []int, status channel.Status, action string, clearErrorMessage bool) error {
 	if len(ids) == 0 {
 		return nil
 	}
@@ -153,32 +179,165 @@ func (svc *ChannelService) bulkUpdateChannelStatus(ctx context.Context, ids []in
 		return fmt.Errorf("expected to find %d channels, but found %d", len(ids), count)
 	}
 
-	// Update status
-	if _, err = client.Channel.Update().
+	// Any manual status change hands the channel back to the operator, so the
+	// auto-disable marker is dropped: a manually disabled channel must not be
+	// picked up by the auto-enable schedule.
+	updater := client.Channel.Update().
 		Where(channel.IDIn(ids...)).
 		SetStatus(status).
-		Save(ctx); err != nil {
+		ClearAutoDisabledAt().
+		ClearAutoDisableExpiresAt()
+
+	if clearErrorMessage {
+		updater.ClearErrorMessage()
+	}
+
+	if _, err = updater.Save(ctx); err != nil {
 		return fmt.Errorf("failed to %s channels: %w", action, err)
 	}
 
-	svc.asyncReloadChannels()
+	// Refresh only after the surrounding transaction commits, otherwise a reload
+	// could observe the pre-commit snapshot (see BulkUpdateChannelOrdering).
+	svc.reloadChannelsAfterCommit(ctx)
 
 	return nil
 }
 
 // BulkArchiveChannels updates the status of multiple channels to archived.
 func (svc *ChannelService) BulkArchiveChannels(ctx context.Context, ids []int) error {
-	return svc.bulkUpdateChannelStatus(ctx, ids, channel.StatusArchived, "archive")
+	return svc.bulkUpdateChannelStatus(ctx, ids, channel.StatusArchived, "archive", false)
 }
 
 // BulkDisableChannels updates the status of multiple channels to disabled.
 func (svc *ChannelService) BulkDisableChannels(ctx context.Context, ids []int) error {
-	return svc.bulkUpdateChannelStatus(ctx, ids, channel.StatusDisabled, "disable")
+	return svc.bulkUpdateChannelStatus(ctx, ids, channel.StatusDisabled, "disable", false)
 }
 
 // BulkEnableChannels updates the status of multiple channels to enabled.
 func (svc *ChannelService) BulkEnableChannels(ctx context.Context, ids []int) error {
-	return svc.bulkUpdateChannelStatus(ctx, ids, channel.StatusEnabled, "enable")
+	return svc.bulkUpdateChannelStatus(ctx, ids, channel.StatusEnabled, "enable", false)
+}
+
+// BulkRecoverChannels enables multiple channels and clears their error messages.
+func (svc *ChannelService) BulkRecoverChannels(ctx context.Context, ids []int) error {
+	return svc.bulkUpdateChannelStatus(ctx, ids, channel.StatusEnabled, "recover", true)
+}
+
+// BulkAutoDisableAction is the GraphQL bulk auto-disable operation.
+type BulkAutoDisableAction string
+
+const (
+	BulkAutoDisableActionWriteRules BulkAutoDisableAction = "write_rules"
+	BulkAutoDisableActionInherit    BulkAutoDisableAction = "inherit"
+	BulkAutoDisableActionOff        BulkAutoDisableAction = "off"
+)
+
+// BulkUpdateChannelAutoDisableInput is the GraphQL input for bulk auto-disable writes.
+type BulkUpdateChannelAutoDisableInput struct {
+	ChannelIDs []int                           `json:"channelIDs"`
+	Action     BulkAutoDisableAction           `json:"action"`
+	Rules      []objects.APIKeyAutoDisableRule `json:"rules"`
+}
+
+// BulkUpdateChannelAutoDisable writes the same auto-disable mode/rules to many
+// channels. Only those two policy fields change; Stream and other fields stay.
+func (svc *ChannelService) BulkUpdateChannelAutoDisable(ctx context.Context, input BulkUpdateChannelAutoDisableInput) ([]*ent.Channel, error) {
+	ids := input.ChannelIDs
+	if len(ids) == 0 {
+		return nil, xerrors.ValidationError("channel IDs are required")
+	}
+
+	var normalized []objects.APIKeyAutoDisableRule
+
+	switch input.Action {
+	case BulkAutoDisableActionWriteRules:
+		if len(input.Rules) == 0 {
+			return nil, xerrors.ValidationError("rules are required when writing auto-disable rules")
+		}
+
+		rules, err := normalizeAutoDisableRules(input.Rules, true)
+		if err != nil {
+			return nil, xerrors.ValidationError(err.Error())
+		}
+
+		normalized = rules
+	case BulkAutoDisableActionInherit, BulkAutoDisableActionOff:
+		// inherit/off ignore the submitted rules list.
+	default:
+		return nil, xerrors.ValidationError(fmt.Sprintf("unsupported auto-disable action %q", input.Action))
+	}
+
+	var updatedChannels []*ent.Channel
+
+	err := svc.RunInTransaction(ctx, func(ctx context.Context) error {
+		client := svc.entFromContext(ctx)
+
+		channels, err := client.Channel.Query().
+			Where(channel.IDIn(ids...)).
+			All(ctx)
+		if err != nil {
+			return fmt.Errorf("failed to query channels: %w", err)
+		}
+
+		if len(channels) != len(ids) {
+			return fmt.Errorf("expected to find %d channels, but found %d", len(ids), len(channels))
+		}
+
+		updatedChannels = make([]*ent.Channel, 0, len(channels))
+
+		for _, ch := range channels {
+			policies := ch.Policies
+
+			switch input.Action {
+			case BulkAutoDisableActionWriteRules:
+				policies.APIKeyAutoDisableMode = objects.APIKeyAutoDisableModeCustom
+				policies.APIKeyAutoDisableRules = cloneAPIKeyAutoDisableRules(normalized)
+			case BulkAutoDisableActionInherit:
+				policies.APIKeyAutoDisableMode = objects.APIKeyAutoDisableModeInherit
+				policies.APIKeyAutoDisableRules = nil
+			case BulkAutoDisableActionOff:
+				policies.APIKeyAutoDisableMode = objects.APIKeyAutoDisableModeOff
+				policies.APIKeyAutoDisableRules = cloneAPIKeyAutoDisableRules(ch.Policies.APIKeyAutoDisableRules)
+			}
+
+			updated, err := client.Channel.
+				UpdateOneID(ch.ID).
+				SetPolicies(policies).
+				Save(ctx)
+			if err != nil {
+				return fmt.Errorf("failed to update auto-disable policies for channel %q (%d): %w", ch.Name, ch.ID, err)
+			}
+
+			updatedChannels = append(updatedChannels, updated)
+		}
+
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	svc.reloadChannelsAfterCommit(ctx)
+
+	return updatedChannels, nil
+}
+
+func cloneAPIKeyAutoDisableRules(rules []objects.APIKeyAutoDisableRule) []objects.APIKeyAutoDisableRule {
+	if rules == nil {
+		return nil
+	}
+
+	cloned := slices.Clone(rules)
+	for i := range cloned {
+		cloned[i].StatusCodes = slices.Clone(cloned[i].StatusCodes)
+		cloned[i].KeywordPatterns = slices.Clone(cloned[i].KeywordPatterns)
+		if cloned[i].DisableDurationMinutes != nil {
+			minutes := *cloned[i].DisableDurationMinutes
+			cloned[i].DisableDurationMinutes = &minutes
+		}
+	}
+
+	return cloned
 }
 
 // BulkDeleteChannels deletes multiple channels by their IDs.
@@ -192,10 +351,114 @@ func (svc *ChannelService) BulkDeleteChannels(ctx context.Context, ids []int) er
 		return fmt.Errorf("failed to bulk delete channels: %w", err)
 	}
 
+	for _, id := range ids {
+		svc.forgetLimiter(id)
+	}
+
 	log.Info(ctx, "bulk deleted channels", log.Int("count", deleted))
-	svc.asyncReloadChannels()
+	svc.reloadChannelsAfterCommit(ctx)
 
 	return nil
+}
+
+// BulkManageChannelTags adds and removes tags from multiple channels in one transaction.
+func (svc *ChannelService) BulkManageChannelTags(ctx context.Context, ids []int, addTags []string, removeTags []string) error {
+	channelIDs := lo.Uniq(ids)
+	newTags := normalizeChannelTags(addTags)
+	tagsToRemove := normalizeChannelTags(removeTags)
+	if len(channelIDs) == 0 || (len(newTags) == 0 && len(tagsToRemove) == 0) {
+		return nil
+	}
+
+	tagsToRemoveSet := make(map[string]struct{}, len(tagsToRemove))
+	for _, tag := range tagsToRemove {
+		tagsToRemoveSet[tag] = struct{}{}
+	}
+
+	return svc.RunInTransaction(ctx, func(txCtx context.Context) error {
+		client := svc.entFromContext(txCtx)
+		channels, err := client.Channel.Query().
+			Where(channel.IDIn(channelIDs...)).
+			All(txCtx)
+		if err != nil {
+			return fmt.Errorf("failed to query channels for bulk tag management: %w", err)
+		}
+		if len(channels) != len(channelIDs) {
+			return fmt.Errorf("expected to find %d channels, but found %d", len(channelIDs), len(channels))
+		}
+
+		for _, ch := range channels {
+			managedTags := make([]string, 0, len(ch.Tags)+len(newTags))
+			existingTags := make(map[string]struct{}, len(ch.Tags)+len(newTags))
+			changed := false
+			for _, tag := range ch.Tags {
+				if _, remove := tagsToRemoveSet[tag]; remove {
+					changed = true
+					continue
+				}
+
+				managedTags = append(managedTags, tag)
+				existingTags[tag] = struct{}{}
+			}
+
+			for _, tag := range newTags {
+				if _, exists := existingTags[tag]; exists {
+					continue
+				}
+
+				managedTags = append(managedTags, tag)
+				existingTags[tag] = struct{}{}
+				changed = true
+			}
+
+			if !changed {
+				continue
+			}
+
+			if _, err := client.Channel.UpdateOneID(ch.ID).
+				Where(channel.UpdatedAtEQ(ch.UpdatedAt)).
+				SetTags(managedTags).
+				Save(txCtx); err != nil {
+				if ent.IsNotFound(err) {
+					return fmt.Errorf("channel %d was modified while managing tags; please retry: %w", ch.ID, err)
+				}
+				return fmt.Errorf("failed to manage tags for channel %d: %w", ch.ID, err)
+			}
+		}
+
+		svc.reloadChannelsAfterCommit(txCtx)
+		return nil
+	})
+}
+
+// BulkAddChannelTags appends tags to multiple channels while preserving their
+// existing tags and avoiding duplicates.
+func (svc *ChannelService) BulkAddChannelTags(ctx context.Context, ids []int, tags []string) error {
+	return svc.BulkManageChannelTags(ctx, ids, tags, nil)
+}
+
+// BulkRemoveChannelTags removes the specified tags from multiple channels.
+func (svc *ChannelService) BulkRemoveChannelTags(ctx context.Context, ids []int, tags []string) error {
+	return svc.BulkManageChannelTags(ctx, ids, nil, tags)
+}
+
+func normalizeChannelTags(tags []string) []string {
+	result := make([]string, 0, len(tags))
+	seen := make(map[string]struct{}, len(tags))
+	for _, tag := range tags {
+		tag = strings.TrimSpace(tag)
+		if tag == "" {
+			continue
+		}
+		if _, exists := seen[tag]; exists {
+			continue
+		}
+
+		seen[tag] = struct{}{}
+		result = append(result, tag)
+	}
+
+	return result
 }
 
 // BulkImportChannelItem represents a single channel to be imported.
@@ -252,30 +515,44 @@ func (svc *ChannelService) BulkImportChannels(ctx context.Context, items []*Bulk
 			continue
 		}
 
-		// Prepare credentials (API key is now required)
-		credentials := objects.ChannelCredentials{
-			APIKey: *item.APIKey,
-		}
+		var ch *ent.Channel
+		err := svc.RunInTransaction(ctx, func(ctx context.Context) error {
+			createdChannel, err := svc.entFromContext(ctx).Channel.Create().
+				SetType(channelType).
+				SetName(item.Name).
+				SetBaseURL(*item.BaseURL).
+				SetCredentials(objects.ChannelCredentials{APIKey: *item.APIKey}).
+				SetSupportedModels(item.SupportedModels).
+				SetDefaultTestModel(item.DefaultTestModel).
+				Save(ctx)
+			if err != nil {
+				return err
+			}
 
-		// Create the channel (baseURL is now required)
-		channelBuilder := svc.entFromContext(ctx).Channel.Create().
-			SetType(channelType).
-			SetName(item.Name).
-			SetBaseURL(*item.BaseURL).
-			SetCredentials(credentials).
-			SetSupportedModels(item.SupportedModels).
-			SetDefaultTestModel(item.DefaultTestModel)
+			if _, err := svc.ensureChannelModelPrices(ctx, createdChannel.ID, item.SupportedModels); err != nil {
+				return err
+			}
 
-		ch, err := channelBuilder.Save(ctx)
+			ch = createdChannel
+
+			return nil
+		})
 		if err != nil {
 			errors = append(errors, fmt.Sprintf("Row %d (%s): %s", i+1, item.Name, err.Error()))
 			failed++
 
 			continue
 		}
+		if ent.TxFromContext(ctx) == nil {
+			ch.Unwrap()
+		}
 
 		createdChannels = append(createdChannels, ch)
 		created++
+	}
+
+	if created > 0 {
+		svc.reloadChannelsAfterCommit(ctx)
 	}
 
 	success := failed == 0
@@ -286,8 +563,6 @@ func (svc *ChannelService) BulkImportChannels(ctx context.Context, items []*Bulk
 		Errors:   errors,
 		Channels: createdChannels,
 	}
-
-	svc.asyncReloadChannels()
 
 	return result, nil
 }

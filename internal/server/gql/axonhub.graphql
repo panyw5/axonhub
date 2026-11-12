@@ -25,6 +25,14 @@ type OverrideOperation {
   to: String
   value: String
   condition: String
+  match: OverrideMatch
+  index: Int
+  splat: Boolean
+}
+
+type OverrideMatch {
+  path: String!
+  eq: String!
 }
 
 input OverrideOperationInput {
@@ -34,18 +42,44 @@ input OverrideOperationInput {
   to: String
   value: String
   condition: String
+  match: OverrideMatchInput
+  index: Int
+  splat: Boolean
+}
+
+input OverrideMatchInput {
+  path: String!
+  eq: String!
+}
+
+type ReasoningEffortMapping {
+  from: String!
+  to: String!
 }
 
 type TransformOptions {
   forceArrayInstructions: Boolean!
   forceArrayInputs: Boolean!
   replaceDeveloperRoleWithSystem: Boolean!
+  reasoningEffortMapping: [ReasoningEffortMapping!]
+}
+
+type SyncChannelModelsPayload {
+  channelID: ID!
+  supportedModels: [String!]!
+  manualModels: [String!]!
+}
+
+input ReasoningEffortMappingInput {
+  from: String!
+  to: String!
 }
 
 input TransformOptionsInput {
   forceArrayInstructions: Boolean
   forceArrayInputs: Boolean
   replaceDeveloperRoleWithSystem: Boolean
+  reasoningEffortMapping: [ReasoningEffortMappingInput!]
 }
 
 enum ProxyType {
@@ -59,6 +93,44 @@ type ProxyConfig {
   url: String
   username: String
   password: String
+  disableConnectionReuse: Boolean
+}
+
+type ChannelEndpoint {
+  apiFormat: String!
+  path: String
+  baseURL: String
+  transport: String
+}
+
+input ChannelEndpointInput {
+  apiFormat: String!
+  path: String
+  baseURL: String
+  transport: String
+}
+
+input SaveChannelEndpointsInput {
+  channelID: ID!
+  endpoints: [ChannelEndpointInput!]!
+}
+
+# DetectChannelEndpoints probes the upstream for the relay protocols a channel
+# can expose (chat completions, responses, messages) without persisting them.
+input DetectChannelEndpointsInput {
+  channelID: ID!
+  model: String
+}
+
+type DetectedChannelEndpoint {
+  apiFormat: String!
+  supported: Boolean!
+  statusCode: Int
+  reason: String!
+}
+
+type DetectChannelEndpointsPayload {
+  endpoints: [DetectedChannelEndpoint!]!
 }
 
 input ProxyConfigInput {
@@ -66,6 +138,59 @@ input ProxyConfigInput {
   url: String
   username: String
   password: String
+  disableConnectionReuse: Boolean
+}
+
+type RetryableErrorPattern {
+  pattern: String!
+  regex: Boolean!
+}
+
+input RetryableErrorPatternInput {
+  pattern: String!
+  regex: Boolean
+}
+
+type ModelProtocol {
+  model: String!
+  apiFormats: [String!]!
+  enabled: Boolean
+}
+
+input ModelProtocolInput {
+  model: String!
+  apiFormats: [String!]!
+  enabled: Boolean
+}
+
+# ProviderQuota carries credentials used only for provider quota polling
+# (e.g. the Command Code account session cookie). These are sensitive: the
+# output resolver only returns them to operators with write_channels, and the
+# values are never part of ordinary channel reads.
+type CommandCodeQuotaSettings {
+  authCookie: String
+}
+
+input CommandCodeQuotaSettingsInput {
+  authCookie: String
+}
+
+type OllamaQuotaSettings {
+  authCookie: String
+}
+
+input OllamaQuotaSettingsInput {
+  authCookie: String
+}
+
+type ChannelProviderQuotaSettings {
+  commandCode: CommandCodeQuotaSettings
+  ollama: OllamaQuotaSettings
+}
+
+input ChannelProviderQuotaSettingsInput {
+  commandCode: CommandCodeQuotaSettingsInput
+  ollama: OllamaQuotaSettingsInput
 }
 
 type ChannelSettings {
@@ -74,10 +199,26 @@ type ChannelSettings {
   autoTrimedModelPrefixes: [String!]
   hideOriginalModels: Boolean
   hideMappedModels: Boolean
+  lowercaseModelId: Boolean
   proxy: ProxyConfig
   transformOptions: TransformOptions
   headerOverrideOperations: [OverrideOperation!]! @goField(forceResolver: true)
   bodyOverrideOperations: [OverrideOperation!]! @goField(forceResolver: true)
+  passThroughUserAgent: Boolean
+  passThroughBody: Boolean
+  rateLimit: ChannelRateLimit
+  retryableStatusCodes: [Int!]
+  retryableErrorPatterns: [RetryableErrorPattern!]
+  modelProtocols: [ModelProtocol!]
+  providerQuota: ChannelProviderQuotaSettings @goField(forceResolver: true)
+  quotaRoutingMode: ChannelQuotaRoutingMode
+}
+
+enum ChannelQuotaRoutingMode {
+  INHERIT
+  IGNORE_QUOTA
+  REMOVE_ON_EXHAUSTED
+  BACKPRESSURE
 }
 
 enum CapabilityPolicy {
@@ -86,12 +227,49 @@ enum CapabilityPolicy {
   forbid
 }
 
+enum APIKeyAutoDisableAction {
+  temporary_disable
+  disable_until_cron
+  permanent_disable
+  permanent_disable_delete
+}
+
+enum APIKeyAutoDisableMode {
+  inherit
+  custom
+  off
+}
+
+type APIKeyAutoDisableRule {
+  statusCodes: [Int!]
+  keywordPatterns: [String!]
+  times: Int!
+  action: APIKeyAutoDisableAction!
+  disableDurationMinutes: Int
+  disableUntilCron: String
+  disableUntilTimezone: String
+}
+
+input APIKeyAutoDisableRuleInput {
+  statusCodes: [Int!]
+  keywordPatterns: [String!]
+  times: Int!
+  action: APIKeyAutoDisableAction!
+  disableDurationMinutes: Int
+  disableUntilCron: String
+  disableUntilTimezone: String
+}
+
 type ChannelPolicies {
   stream: CapabilityPolicy
+  apiKeyAutoDisableMode: APIKeyAutoDisableMode
+  apiKeyAutoDisableRules: [APIKeyAutoDisableRule!]
 }
 
 input ChannelPoliciesInput {
   stream: CapabilityPolicy
+  apiKeyAutoDisableMode: APIKeyAutoDisableMode
+  apiKeyAutoDisableRules: [APIKeyAutoDisableRuleInput!]
 }
 
 input ModelMappingInput {
@@ -105,10 +283,35 @@ input ChannelSettingsInput {
   autoTrimedModelPrefixes: [String!]
   hideOriginalModels: Boolean
   hideMappedModels: Boolean
+  lowercaseModelId: Boolean
   proxy: ProxyConfigInput
   transformOptions: TransformOptionsInput
   headerOverrideOperations: [OverrideOperationInput!]
   bodyOverrideOperations: [OverrideOperationInput!]
+  passThroughUserAgent: Boolean
+  passThroughBody: Boolean
+  rateLimit: ChannelRateLimitInput
+  retryableStatusCodes: [Int!]
+  retryableErrorPatterns: [RetryableErrorPatternInput!]
+  modelProtocols: [ModelProtocolInput!]
+  providerQuota: ChannelProviderQuotaSettingsInput
+  quotaRoutingMode: ChannelQuotaRoutingMode
+}
+
+input ChannelRateLimitInput {
+  rpm: Int
+  tpm: Int
+  maxConcurrent: Int
+  queueSize: Int
+  queueTimeoutMs: Int
+}
+
+type ChannelRateLimit {
+  rpm: Int
+  tpm: Int
+  maxConcurrent: Int
+  queueSize: Int
+  queueTimeoutMs: Int
 }
 
 type ChannelCredentials {
@@ -123,6 +326,7 @@ type DisabledAPIKey {
   disabledAt: Time!
   errorCode: Int!
   reason: String
+  expiresAt: Time
 }
 
 type OAuthCredentials {
@@ -145,6 +349,7 @@ input ChannelCredentialsInput {
   apiKeys: [String!]
   gcp: GCPCredentialInput
   oauth: OAuthCredentialsInput
+  managementApiKey: String
 }
 
 input OAuthCredentialsInput {
@@ -183,6 +388,22 @@ type TestChannelPayload {
   success: Boolean!
   message: String
   error: String
+}
+
+type TestAPIKeyResult {
+  keyPrefix: String!
+  success: Boolean!
+  latency: Float!
+  error: String
+  disabled: Boolean!
+}
+
+type TestChannelAPIKeysPayload {
+  channelID: ID!
+  total: Int!
+  successCount: Int!
+  failedCount: Int!
+  results: [TestAPIKeyResult!]!
 }
 
 input BulkImportChannelItem {
@@ -236,6 +457,24 @@ type BulkUpdateChannelOrderingResult {
   channels: [Channel!]!
 }
 
+enum BulkAutoDisableAction {
+  write_rules
+  inherit
+  off
+}
+
+input BulkUpdateChannelAutoDisableInput {
+  channelIDs: [ID!]!
+  action: BulkAutoDisableAction!
+  rules: [APIKeyAutoDisableRuleInput!]
+}
+
+type BulkUpdateChannelAutoDisablePayload {
+  success: Boolean!
+  updated: Int!
+  channels: [Channel!]!
+}
+
 input UpdateAPIKeyProfilesInput {
   activeProfile: String!
   profiles: [APIKeyProfileInput!]
@@ -243,12 +482,40 @@ input UpdateAPIKeyProfilesInput {
 
 input APIKeyProfileInput {
   name: String!
+  templateID: Int
+  templateName: String
   modelMappings: [ModelMappingInput!]
   channelIDs: [Int!]
   channelTags: [String!]
+  channelTagsMatchMode: ChannelTagsMatchMode
   modelIDs: [String!]
   quota: APIKeyQuotaInput
   loadBalanceStrategy: String
+  traceStickyMode: String
+}
+
+input UpdateProjectProfilesInput {
+  activeProfile: String!
+  profiles: [ProjectProfileInput!]
+}
+
+input ProjectProfileInput {
+  name: String!
+  channelIDs: [Int!]
+  channelTags: [String!]
+  channelTagsMatchMode: ChannelTagsMatchMode
+}
+
+type ProjectProfiles {
+  activeProfile: String!
+  profiles: [ProjectProfile!]
+}
+
+type ProjectProfile {
+  name: String!
+  channelIDs: [Int!]
+  channelTags: [String!]
+  channelTagsMatchMode: ChannelTagsMatchMode
 }
 
 input UpdateAPIKeyScopesInput {
@@ -262,12 +529,34 @@ type APIKeyProfiles {
 
 type APIKeyProfile {
   name: String!
+  templateID: Int
+  templateName: String
   modelMappings: [ModelMapping!]
   channelIDs: [Int!]
   channelTags: [String!]
+  channelTagsMatchMode: ChannelTagsMatchMode
   modelIDs: [String!]
   quota: APIKeyQuota
   loadBalanceStrategy: String
+  traceStickyMode: String
+}
+
+enum ChannelTagsMatchMode {
+  any
+  all
+  none
+}
+
+# ApiKeyProfileTemplate uses the Ent-generated type and input types from ent.graphql
+extend type APIKeyProfileTemplate {
+  """Number of API key profiles that currently follow this template."""
+  linkedProfilesCount: Int!
+}
+
+# Load template input - custom input for loading template to API key
+input LoadApiKeyProfileTemplateInput {
+  templateID: ID!
+  apiKeyID: ID!
 }
 
 input APIKeyQuotaInput {
@@ -481,9 +770,17 @@ extend type Trace {
 extend type Thread {
   firstUserQuery: String @goField(forceResolver: true)
   usageMetadata: UsageMetadata @goField(forceResolver: true)
+  archivedTracesCount: Int! @goField(forceResolver: true)
 }
 
 extend type Channel {
+  """
+  Built-in endpoints resolved dynamically from the channel type.
+  The first item is the primary endpoint.
+  These are displayed to users but are not directly editable.
+  """
+  defaultEndpoints: [ChannelEndpoint!]! @goField(forceResolver: true)
+
   """
   All model entries this channel can handle, including direct models, prefixed models, auto-trimmed models, and mapped models
   """
@@ -498,6 +795,34 @@ extend type Channel {
   Disabled API keys for this channel. Sensitive: will be null if user can not access.
   """
   disabledAPIKeys: [DisabledAPIKey!] @goField(forceResolver: true)
+
+  """
+  Real-time per-channel concurrency limiter snapshot. Returns null when the channel
+  has no MaxConcurrent configured (no admission control).
+  """
+  liveLimiterStats: ChannelLimiterStats @goField(forceResolver: true)
+}
+
+"""
+ChannelLimiterStats is a point-in-time snapshot of the per-channel concurrency limiter.
+"""
+type ChannelLimiterStats {
+  """
+  Number of requests currently holding a capacity slot.
+  """
+  inFlight: Int!
+  """
+  Number of requests currently waiting in the FIFO queue.
+  """
+  waiting: Int!
+  """
+  Configured MaxConcurrent (capacity ceiling).
+  """
+  capacity: Int!
+  """
+  Configured QueueSize (0 means soft mode — no waiting queue, only counts).
+  """
+  queueSize: Int!
 }
 
 type Segment {
@@ -579,6 +904,7 @@ type SpanSystemInstruction {
 # Channel Override Template Types
 enum OverrideApplyMode {
   MERGE
+  REPLACE
 }
 
 input ApplyChannelOverrideTemplateInput {
@@ -593,6 +919,16 @@ type ApplyChannelOverrideTemplatePayload {
   channels: [Channel!]!
 }
 
+input ClearChannelOverrideTemplatesInput {
+  channelIDs: [ID!]!
+}
+
+type ClearChannelOverrideTemplatesPayload {
+  success: Boolean!
+  updated: Int!
+  channels: [Channel!]!
+}
+
 type DeleteDisabledAPIKeysPayload {
   success: Boolean!
   message: String
@@ -600,19 +936,31 @@ type DeleteDisabledAPIKeysPayload {
 
 type Mutation {
   createChannel(input: CreateChannelInput!): Channel!
+  duplicateChannel(sourceID: ID!, input: CreateChannelInput!): Channel!
   bulkCreateChannels(input: BulkCreateChannelsInput!): [Channel!]!
   updateChannel(id: ID!, input: UpdateChannelInput!): Channel!
+  saveChannelEndpoints(input: SaveChannelEndpointsInput!): Channel!
+  detectChannelEndpoints(input: DetectChannelEndpointsInput!): DetectChannelEndpointsPayload!
   updateChannelStatus(id: ID!, status: ChannelStatus!): Channel!
   deleteChannel(id: ID!): Boolean!
   bulkArchiveChannels(ids: [ID!]!): Boolean!
   bulkDisableChannels(ids: [ID!]!): Boolean!
   bulkEnableChannels(ids: [ID!]!): Boolean!
+  bulkRecoverChannels(ids: [ID!]!): Boolean!
   bulkDeleteChannels(ids: [ID!]!): Boolean!
+  bulkAddChannelTags(ids: [ID!]!, tags: [String!]!): Boolean!
+  bulkRemoveChannelTags(ids: [ID!]!, tags: [String!]!): Boolean!
+  bulkManageChannelTags(ids: [ID!]!, addTags: [String!]!, removeTags: [String!]!): Boolean!
   testChannel(input: TestChannelInput!): TestChannelPayload!
+  testChannelAPIKeys(channelID: ID!, modelID: String): TestChannelAPIKeysPayload!
+  testChannelAPIKey(channelID: ID!, key: String!, modelID: String): TestAPIKeyResult!
   bulkImportChannels(input: BulkImportChannelsInput!): BulkImportChannelsResult!
   bulkUpdateChannelOrdering(
     input: BulkUpdateChannelOrderingInput!
   ): BulkUpdateChannelOrderingResult!
+  bulkUpdateChannelAutoDisable(
+    input: BulkUpdateChannelAutoDisableInput!
+  ): BulkUpdateChannelAutoDisablePayload!
 
   # Channel API Key Management
   disableChannelAPIKey(channelID: ID!, key: String!): Boolean!
@@ -628,6 +976,7 @@ type Mutation {
   updateAPIKey(id: ID!, input: UpdateAPIKeyInput!): APIKey!
   updateAPIKeyStatus(id: ID!, status: APIKeyStatus!): APIKey!
   updateAPIKeyProfiles(id: ID!, input: UpdateAPIKeyProfilesInput!): APIKey!
+  rotateAPIKey(id: ID!): APIKey!
   bulkDisableAPIKeys(ids: [ID!]!): Boolean!
   bulkEnableAPIKeys(ids: [ID!]!): Boolean!
   bulkArchiveAPIKeys(ids: [ID!]!): Boolean!
@@ -635,6 +984,7 @@ type Mutation {
   createUser(input: CreateUserInput!): User!
   updateUser(id: ID!, input: UpdateUserInput!): User!
   updateUserStatus(id: ID!, status: UserStatus!): User!
+  deleteUser(id: ID!): Boolean!
 
   createRole(input: CreateRoleInput!): Role!
   updateRole(id: ID!, input: UpdateRoleInput!): Role!
@@ -644,6 +994,8 @@ type Mutation {
   createProject(input: CreateProjectInput!): Project!
   updateProject(id: ID!, input: UpdateProjectInput!): Project!
   updateProjectStatus(id: ID!, status: ProjectStatus!): Project!
+  updateProjectProfiles(id: ID!, input: UpdateProjectProfilesInput!): Project!
+  deleteProject(id: ID!): Boolean!
 
   addUserToProject(input: AddUserToProjectInput!): UserProject!
   removeUserFromProject(input: RemoveUserFromProjectInput!): Boolean!
@@ -664,6 +1016,39 @@ type Mutation {
   applyChannelOverrideTemplate(
     input: ApplyChannelOverrideTemplateInput!
   ): ApplyChannelOverrideTemplatePayload!
+  clearChannelOverrideTemplates(
+    input: ClearChannelOverrideTemplatesInput!
+  ): ClearChannelOverrideTemplatesPayload!
+
+  # Trigger immediate model sync for a channel
+  syncChannelModels(channelID: ID!, pattern: String): SyncChannelModelsPayload!
+
+  # API Key Profile Template Mutations
+  createApiKeyProfileTemplate(
+    input: CreateAPIKeyProfileTemplateInput!
+    profile: APIKeyProfileInput!
+  ): APIKeyProfileTemplate!
+  updateApiKeyProfileTemplate(
+    id: ID!
+    input: UpdateAPIKeyProfileTemplateInput!
+    profile: APIKeyProfileInput
+  ): APIKeyProfileTemplate!
+  deleteApiKeyProfileTemplate(id: ID!): APIKeyProfileTemplate!
+  loadApiKeyProfileTemplate(
+    input: LoadApiKeyProfileTemplateInput!
+  ): APIKey!
+
+  # Trace Status Management
+  archiveTrace(id: ID!): Boolean!
+  unarchiveTrace(id: ID!): Boolean!
+  retainTrace(id: ID!): Boolean!
+  unretainTrace(id: ID!): Boolean!
+
+  # Thread Status Management
+  archiveThread(id: ID!): Boolean!
+  unarchiveThread(id: ID!): Boolean!
+  retainThread(id: ID!): Boolean!
+  unretainThread(id: ID!): Boolean!
 }
 
 input QueryChannelInput {
@@ -716,6 +1101,7 @@ input CountChannelsByTypeInput {
 }
 
 extend type Query {
+  allChannelSummarys(includeArchived: Boolean): [Channel!]!
   allChannelTags: [String!]!
   countChannelsByType(input: CountChannelsByTypeInput!): [ChannelTypeCount!]!
   """

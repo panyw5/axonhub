@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/samber/lo"
@@ -15,25 +16,97 @@ import (
 
 // choiceAggregator is a helper struct to aggregate data for each choice.
 type choiceAggregator struct {
-	index            int
-	content          strings.Builder
-	reasoningContent strings.Builder
-	toolCalls        map[int]*llm.ToolCall // Map to track tool calls by their index within the choice
-	finishReason     *string
-	role             string
-	annotations      map[string]llm.Annotation // Map to track unique annotations by URL
+	index               int
+	content             strings.Builder
+	reasoningContent    strings.Builder
+	hasReasoningContent bool             // Tracks whether any delta carried reasoning_content (even an empty string).
+	reasoning           strings.Builder  // Aggregates the reasoning field used by some providers (e.g. Synthetic) instead of reasoning_content.
+	hasReasoning        bool             // Tracks whether any delta carried reasoning (even an empty string).
+	refusal             strings.Builder  // Aggregates refusal text streamed as delta.refusal.
+	audio               *llm.OutputAudio // Reassembles audio output streamed as delta.audio chunks.
+	audioData           strings.Builder
+	audioTranscript     strings.Builder
+	logprobs            []TokenLogprob        // Concatenates per-chunk logprobs content.
+	toolCalls           map[int]*llm.ToolCall // Map to track tool calls by their index within the choice
+	finishReason        *string
+	role                string
+	annotations         map[string]llm.Annotation // Map to track unique annotations by stable annotation key
+}
+
+func buildAnnotationKey(annotation Annotation) string {
+	url := ""
+	if annotation.URLCitation != nil {
+		url = annotation.URLCitation.URL
+	}
+
+	start := "nil"
+	if annotation.StartIndex != nil {
+		start = strconv.FormatInt(*annotation.StartIndex, 10)
+	}
+
+	end := "nil"
+	if annotation.EndIndex != nil {
+		end = strconv.FormatInt(*annotation.EndIndex, 10)
+	}
+
+	return strings.Join([]string{annotation.Type, url, start, end}, "\x00")
+}
+
+func shouldPreferIncomingAnnotationTitle(existing, incoming llm.Annotation) bool {
+	if existing.URLCitation == nil || incoming.URLCitation == nil || incoming.URLCitation.Title == "" {
+		return false
+	}
+
+	return existing.URLCitation.Title == "" || len(incoming.URLCitation.Title) > len(existing.URLCitation.Title)
+}
+
+func compareOptionalAnnotationIndex(left, right *int64) (bool, bool) {
+	switch {
+	case left == nil && right == nil:
+		return false, false
+	case left == nil:
+		return false, true
+	case right == nil:
+		return true, true
+	case *left != *right:
+		return *left < *right, true
+	default:
+		return false, false
+	}
+}
+
+func annotationURL(annotation llm.Annotation) string {
+	if annotation.URLCitation == nil {
+		return ""
+	}
+
+	return annotation.URLCitation.URL
 }
 
 // addAnnotations adds annotations from a message to the choice aggregator,
-// deduplicating by URL.
+// deduplicating by stable annotation key.
 func (ca *choiceAggregator) addAnnotations(msg *Message) {
 	if msg == nil || len(msg.Annotations) == 0 {
 		return
 	}
+
 	for _, annotation := range msg.Annotations {
-		if annotation.URLCitation != nil && annotation.URLCitation.URL != "" {
-			ca.annotations[annotation.URLCitation.URL] = annotation.ToLLMAnnotation()
+		if annotation.URLCitation == nil || annotation.URLCitation.URL == "" {
+			continue
 		}
+
+		key := buildAnnotationKey(annotation)
+		incoming := annotation.ToLLMAnnotation()
+
+		if existing, ok := ca.annotations[key]; ok {
+			if shouldPreferIncomingAnnotationTitle(existing, incoming) {
+				existing.URLCitation.Title = incoming.URLCitation.Title
+				ca.annotations[key] = existing
+			}
+			continue
+		}
+
+		ca.annotations[key] = incoming
 	}
 }
 
@@ -49,6 +122,8 @@ func DefaultTransformChunk(ctx context.Context, chunk *httpclient.StreamEvent) (
 }
 
 // AggregateStreamChunks aggregates OpenAI streaming response chunks into a complete response.
+//
+//nolint:maintidx // Stream aggregation is inherently complex.
 func AggregateStreamChunks(ctx context.Context, chunks []*httpclient.StreamEvent, chunkTransformer ChunkTransformFunc) ([]byte, llm.ResponseMeta, error) {
 	if len(chunks) == 0 {
 		data, err := json.Marshal(&llm.Response{})
@@ -59,6 +134,7 @@ func AggregateStreamChunks(ctx context.Context, chunks []*httpclient.StreamEvent
 		lastChunkResponse *Response
 		usage             *Usage
 		systemFingerprint string
+		serviceTier       string
 		// Map to track choices by their index
 		choicesAggs = make(map[int]*choiceAggregator)
 		// Map to track unique citations
@@ -103,9 +179,43 @@ func AggregateStreamChunks(ctx context.Context, chunks []*httpclient.StreamEvent
 					choiceAgg.content.WriteString(*choice.Delta.Content.Content)
 				}
 
-				// Handle reasoning content
+				// Handle reasoning content. Track presence of the field separately from its
+				// content length so that a semantically meaningful empty string (e.g. DeepSeek
+				// thinking mode emitting reasoning_content: "") is preserved on the aggregated
+				// message rather than being silently dropped.
 				if choice.Delta.ReasoningContent != nil {
+					choiceAgg.hasReasoningContent = true
 					choiceAgg.reasoningContent.WriteString(*choice.Delta.ReasoningContent)
+				}
+
+				// Handle the reasoning field variant (used by providers such as Synthetic).
+				if choice.Delta.Reasoning != nil {
+					choiceAgg.hasReasoning = true
+					choiceAgg.reasoning.WriteString(*choice.Delta.Reasoning)
+				}
+
+				// Handle refusal streamed as delta.refusal chunks.
+				if choice.Delta.Refusal != "" {
+					choiceAgg.refusal.WriteString(choice.Delta.Refusal)
+				}
+
+				// Handle audio output streamed as delta.audio chunks. The audio ID and
+				// expiry arrive on the first chunk; data and transcript are fragmented.
+				if choice.Delta.Audio != nil {
+					if choiceAgg.audio == nil {
+						choiceAgg.audio = &llm.OutputAudio{}
+					}
+
+					if choiceAgg.audio.ID == "" {
+						choiceAgg.audio.ID = choice.Delta.Audio.ID
+					}
+
+					if choiceAgg.audio.ExpiresAt == 0 {
+						choiceAgg.audio.ExpiresAt = choice.Delta.Audio.ExpiresAt
+					}
+
+					choiceAgg.audioData.WriteString(choice.Delta.Audio.Data)
+					choiceAgg.audioTranscript.WriteString(choice.Delta.Audio.Transcript)
 				}
 
 				// Handle tool calls
@@ -153,6 +263,11 @@ func AggregateStreamChunks(ctx context.Context, chunks []*httpclient.StreamEvent
 			choiceAgg.addAnnotations(choice.Delta)
 			choiceAgg.addAnnotations(choice.Message)
 
+			// Concatenate per-chunk logprobs instead of dropping them.
+			if choice.Logprobs != nil {
+				choiceAgg.logprobs = append(choiceAgg.logprobs, choice.Logprobs.Content...)
+			}
+
 			// Capture finish reason
 			if choice.FinishReason != nil {
 				choiceAgg.finishReason = choice.FinishReason
@@ -174,8 +289,17 @@ func AggregateStreamChunks(ctx context.Context, chunks []*httpclient.StreamEvent
 			systemFingerprint = chunk.SystemFingerprint
 		}
 
-		// Keep the last chunk for metadata
-		lastChunkResponse = chunk
+		// Keep the first non-empty service tier
+		if serviceTier == "" && chunk.ServiceTier != "" {
+			serviceTier = chunk.ServiceTier
+		}
+
+		// Keep the last chunk with valid choices for metadata.
+		// Skip non-standard events (e.g. inference-cost) that have empty
+		// choices and would overwrite the real last chunk's ID/Model/Created.
+		if len(chunk.Choices) > 0 {
+			lastChunkResponse = chunk
+		}
 	}
 
 	// Create a complete ChatCompletionResponse based on the last chunk structure
@@ -184,16 +308,30 @@ func AggregateStreamChunks(ctx context.Context, chunks []*httpclient.StreamEvent
 		return data, llm.ResponseMeta{}, err
 	}
 
-	choices := make([]llm.Choice, len(choicesAggs))
+	choiceIndexes := make([]int, 0, len(choicesAggs))
+	for choiceIndex := range choicesAggs {
+		choiceIndexes = append(choiceIndexes, choiceIndex)
+	}
+	sort.Ints(choiceIndexes)
 
-	for choiceIndex := range choices {
+	choices := make([]llm.Choice, len(choiceIndexes))
+	completed := len(choiceIndexes) > 0
+
+	for i, choiceIndex := range choiceIndexes {
 		choiceAgg := choicesAggs[choiceIndex]
 
 		var finalToolCalls []llm.ToolCall
 		if len(choiceAgg.toolCalls) > 0 {
-			finalToolCalls = make([]llm.ToolCall, len(choiceAgg.toolCalls))
-			for index := range finalToolCalls {
-				finalToolCalls[index] = *choiceAgg.toolCalls[index]
+			toolCallIndexes := make([]int, 0, len(choiceAgg.toolCalls))
+			for toolCallIndex := range choiceAgg.toolCalls {
+				toolCallIndexes = append(toolCallIndexes, toolCallIndex)
+			}
+			sort.Ints(toolCallIndexes)
+
+			finalToolCalls = make([]llm.ToolCall, 0, len(toolCallIndexes))
+			for _, toolCallIndex := range toolCallIndexes {
+				toolCall := choiceAgg.toolCalls[toolCallIndex]
+				finalToolCalls = append(finalToolCalls, *toolCall)
 			}
 		}
 
@@ -202,10 +340,30 @@ func AggregateStreamChunks(ctx context.Context, chunks []*httpclient.StreamEvent
 			Role: choiceAgg.role,
 		}
 
-		// Set reasoning content if available
-		if choiceAgg.reasoningContent.Len() > 0 {
+		// Set reasoning content if any delta carried the field, preserving an empty
+		// string when present (required for round-tripping providers like DeepSeek
+		// thinking mode that may emit reasoning_content: "").
+		if choiceAgg.hasReasoningContent {
 			reasoningContent := choiceAgg.reasoningContent.String()
 			message.ReasoningContent = &reasoningContent
+		}
+
+		// Set the reasoning field variant if any delta carried it.
+		if choiceAgg.hasReasoning {
+			reasoning := choiceAgg.reasoning.String()
+			message.Reasoning = &reasoning
+		}
+
+		// Set refusal if any delta carried refusal text.
+		if choiceAgg.refusal.Len() > 0 {
+			message.Refusal = choiceAgg.refusal.String()
+		}
+
+		// Set audio output if any delta carried audio chunks.
+		if choiceAgg.audio != nil {
+			message.Audio = choiceAgg.audio
+			message.Audio.Data = choiceAgg.audioData.String()
+			message.Audio.Transcript = choiceAgg.audioTranscript.String()
 		}
 
 		// Set content if available
@@ -225,11 +383,25 @@ func AggregateStreamChunks(ctx context.Context, chunks []*httpclient.StreamEvent
 			for _, annotation := range choiceAgg.annotations {
 				message.Annotations = append(message.Annotations, annotation)
 			}
+			sort.Slice(message.Annotations, func(i, j int) bool {
+				if less, decided := compareOptionalAnnotationIndex(message.Annotations[i].StartIndex, message.Annotations[j].StartIndex); decided {
+					return less
+				}
+				if less, decided := compareOptionalAnnotationIndex(message.Annotations[i].EndIndex, message.Annotations[j].EndIndex); decided {
+					return less
+				}
+				if message.Annotations[i].Type != message.Annotations[j].Type {
+					return message.Annotations[i].Type < message.Annotations[j].Type
+				}
+
+				return annotationURL(message.Annotations[i]) < annotationURL(message.Annotations[j])
+			})
 		}
 
 		// Determine finish reason
 		finishReason := choiceAgg.finishReason
 		if finishReason == nil {
+			completed = false
 			if len(finalToolCalls) > 0 {
 				finishReason = lo.ToPtr("tool_calls")
 			} else {
@@ -237,45 +409,64 @@ func AggregateStreamChunks(ctx context.Context, chunks []*httpclient.StreamEvent
 			}
 		}
 
-		choices[choiceIndex] = llm.Choice{
+		choices[i] = llm.Choice{
 			Index:        choiceIndex,
 			Message:      message,
 			FinishReason: finishReason,
 		}
+
+		// Attach aggregated logprobs if any chunk carried them.
+		if len(choiceAgg.logprobs) > 0 {
+			choices[i].Logprobs = toLLMLogprobs(&Logprobs{Content: choiceAgg.logprobs})
+		}
 	}
 
 	// Build the final response using llm.Response struct
+	var responseUsage *llm.Usage
+	if usage != nil {
+		responseUsage = usage.ToLLMUsage()
+	}
+
 	response := &llm.Response{
 		ID:                lastChunkResponse.ID,
 		Model:             lastChunkResponse.Model,
 		Object:            "chat.completion", // Change from "chat.completion.chunk" to "chat.completion"
 		Created:           lastChunkResponse.Created,
 		SystemFingerprint: systemFingerprint,
+		ServiceTier:       serviceTier,
 		Choices:           choices,
-		Usage:             usage.ToLLMUsage(),
+		Usage:             responseUsage,
 	}
 
-	// Add citations to response if any were collected
+	// Collect the deduplicated, sorted citations for the final response.
+	var citations []string
 	if len(citationsMap) > 0 {
-		citations := make([]string, 0, len(citationsMap))
+		citations = make([]string, 0, len(citationsMap))
 		for citation := range citationsMap {
 			citations = append(citations, citation)
 		}
-		sort.Strings(citations)
 
-		if response.TransformerMetadata == nil {
-			response.TransformerMetadata = make(map[string]any)
-		}
-		response.TransformerMetadata[TransformerMetadataKeyCitations] = citations
+		sort.Strings(citations)
 	}
 
-	data, err := json.Marshal(response)
+	data, err := json.Marshal(aggregatedChatResponse{Response: response, Citations: citations})
 	if err != nil {
 		return nil, llm.ResponseMeta{}, err
 	}
 
 	return data, llm.ResponseMeta{
-		ID:    response.ID,
-		Usage: usage.ToLLMUsage(),
+		ID:        response.ID,
+		Usage:     responseUsage,
+		Completed: completed,
 	}, nil
+}
+
+// aggregatedChatResponse is the client-facing shape of an aggregated chat
+// completion. Response-level provider extensions that the unified model
+// carries internally in TransformerMetadata (e.g. Perplexity/OpenRouter
+// citations) are projected back to their OpenAI wire position here; the
+// internal metadata envelope is never serialized to clients.
+type aggregatedChatResponse struct {
+	*llm.Response
+	Citations []string `json:"citations,omitempty"`
 }

@@ -1,9 +1,9 @@
 import { format } from 'date-fns';
 import { ColumnDef, Table, Row } from '@tanstack/react-table';
-import { Copy, Eye } from 'lucide-react';
+import { Copy, Eye, Settings } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
-import { toast } from 'sonner';
-import { cn, extractNumberID } from '@/lib/utils';
+import { cn, extractNumberID, formatUserName } from '@/lib/utils';
+import { useCopyToClipboard } from '@/hooks/use-copy-to-clipboard';
 import { Button } from '@/components/ui/button';
 import { Checkbox } from '@/components/ui/checkbox';
 import { DataTableColumnHeader } from '@/components/data-table-column-header';
@@ -16,13 +16,13 @@ function ApiKeyCell({ apiKey, fullApiKey }: { apiKey: string; fullApiKey: ApiKey
   const { t } = useTranslation();
   const { openDialog } = useApiKeysContext();
 
-  // 显示前8个字符和后4个字符，中间用省略号
-  const maskedKey = apiKey.replace(/./g, '*').slice(0, -4) + apiKey.slice(-4);
+  // Keep the masked value compact so the identifying suffix is never clipped by the table cell.
+  const maskedKey = apiKey.length > 4 ? `${'•'.repeat(8)}${apiKey.slice(-4)}` : '•'.repeat(apiKey.length);
 
-  const copyToClipboard = () => {
-    navigator.clipboard.writeText(apiKey);
-    toast.success(t('apikeys.messages.copied'));
-  };
+  const { handleCopy: copyToClipboard } = useCopyToClipboard({
+    text: apiKey,
+    copyMessage: t('apikeys.messages.copied'),
+  });
 
   const handleViewKey = () => {
     openDialog('view', fullApiKey);
@@ -30,7 +30,7 @@ function ApiKeyCell({ apiKey, fullApiKey }: { apiKey: string; fullApiKey: ApiKey
 
   return (
     <div className='flex max-w-48 items-center space-x-2'>
-      <code className='bg-muted truncate rounded px-2 py-1 font-mono text-sm'>{maskedKey}</code>
+      <code className='bg-muted shrink-0 rounded px-2 py-1 font-mono text-sm'>{maskedKey}</code>
       <Button variant='ghost' size='sm' onClick={handleViewKey} className='h-6 w-6 flex-shrink-0 p-0' title={t('apikeys.actions.view')}>
         <Eye className='h-3 w-3' />
       </Button>
@@ -41,7 +41,57 @@ function ApiKeyCell({ apiKey, fullApiKey }: { apiKey: string; fullApiKey: ApiKey
   );
 }
 
-export const createColumns = (t: ReturnType<typeof useTranslation>['t'], canWrite: boolean = true): ColumnDef<ApiKey>[] => [
+function ActiveProfileCell({ apiKey, canWrite }: { apiKey: ApiKey; canWrite: boolean }) {
+  const { t } = useTranslation();
+  const { openDialog } = useApiKeysContext();
+  const activeProfile = apiKey.profiles?.activeProfile?.trim();
+  const activeProfileConfig = apiKey.profiles?.profiles?.find((profile) => profile.name === activeProfile);
+  const templateName = activeProfileConfig?.templateName?.trim();
+  const canOpenProfiles = canWrite && apiKey.type !== 'service_account';
+
+  if (!canOpenProfiles) {
+    return activeProfile ? (
+      <div className='min-w-0'>
+        <LongText className='max-w-36 font-medium'>{activeProfile}</LongText>
+        {templateName && (
+          <div className='text-muted-foreground max-w-36 truncate text-xs'>
+            {t('apikeys.columns.linkedTemplate', { name: templateName })}
+          </div>
+        )}
+      </div>
+    ) : (
+      <span className='text-muted-foreground text-sm'>{t('apikeys.columns.noActiveProfile')}</span>
+    );
+  }
+
+  return (
+    <Button
+      variant='ghost'
+      size='sm'
+      className='h-8 max-w-44 justify-start gap-1.5 px-2 font-medium'
+      onClick={() => openDialog('profiles', apiKey)}
+      title={t('apikeys.columns.activeProfileHint')}
+    >
+      <Settings className='h-3.5 w-3.5 shrink-0' />
+      <span className='min-w-0 text-left'>
+        <span className={cn('block truncate', !activeProfile && 'text-muted-foreground')}>
+          {activeProfile || t('apikeys.columns.noActiveProfile')}
+        </span>
+        {templateName && (
+          <span className='text-muted-foreground block truncate text-xs font-normal'>
+            {t('apikeys.columns.linkedTemplate', { name: templateName })}
+          </span>
+        )}
+      </span>
+    </Button>
+  );
+}
+
+export const createColumns = (
+  t: ReturnType<typeof useTranslation>['t'],
+  canWrite: boolean = true,
+  canViewCreators: boolean = false
+): ColumnDef<ApiKey>[] => [
   ...(canWrite
     ? [
         {
@@ -94,21 +144,25 @@ export const createColumns = (t: ReturnType<typeof useTranslation>['t'], canWrit
       className: 'max-w-48',
     },
   },
-  {
-    accessorKey: 'creator',
-    header: ({ column }) => <DataTableColumnHeader column={column} title={t('apikeys.columns.creator')} />,
-    cell: ({ row }) => {
-      const creator = row.original.user;
-      const displayName = creator ? `${creator.firstName} ${creator.lastName}` : '-';
-      return <LongText className='text-muted-foreground max-w-24'>{displayName}</LongText>;
-    },
-    filterFn: (row, _id, value) => {
-      const creator = row.original.user;
-      if (!creator) return false;
-      return value.includes(creator.id);
-    },
-    enableSorting: false,
-  },
+  ...(canViewCreators
+    ? ([
+        {
+          accessorKey: 'creator',
+          header: ({ column }) => <DataTableColumnHeader column={column} title={t('apikeys.columns.creator')} />,
+          cell: ({ row }) => {
+            const creator = row.original.user;
+            const displayName = creator ? formatUserName(creator.firstName, creator.lastName) : t('apikeys.user.deleted');
+            return <LongText className='text-muted-foreground max-w-24'>{displayName}</LongText>;
+          },
+          filterFn: (row, _id, value) => {
+            const creator = row.original.user;
+            if (!creator) return false;
+            return value.includes(creator.id);
+          },
+          enableSorting: false,
+        },
+      ] as ColumnDef<ApiKey>[])
+    : []),
   {
     accessorKey: 'type',
     header: ({ column }) => <DataTableColumnHeader column={column} title={t('apikeys.columns.type')} />,
@@ -117,12 +171,15 @@ export const createColumns = (t: ReturnType<typeof useTranslation>['t'], canWrit
       const typeText =
         {
           user: t('apikeys.type.user'),
+          personal: t('apikeys.type.personal'),
           service_account: t('apikeys.type.service_account'),
+          noauth: t('apikeys.type.noauth'),
         }[type] || type;
 
       const typeColor =
         {
           user: 'text-blue-600',
+          personal: 'text-emerald-600',
           service_account: 'text-purple-600',
         }[type] || 'text-muted-foreground';
 
@@ -157,6 +214,13 @@ export const createColumns = (t: ReturnType<typeof useTranslation>['t'], canWrit
     filterFn: (row, _id, value) => {
       return value.includes(row.getValue('status'));
     },
+    enableSorting: false,
+  },
+  {
+    id: 'activeProfile',
+    accessorFn: (row) => row.profiles?.activeProfile || '',
+    header: ({ column }) => <DataTableColumnHeader column={column} title={t('apikeys.columns.activeProfile')} />,
+    cell: ({ row }) => <ActiveProfileCell apiKey={row.original} canWrite={canWrite} />,
     enableSorting: false,
   },
   {

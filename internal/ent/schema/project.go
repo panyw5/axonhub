@@ -9,6 +9,7 @@ import (
 	"entgo.io/ent/schema/index"
 
 	"github.com/looplj/axonhub/internal/ent/schema/schematype"
+	"github.com/looplj/axonhub/internal/objects"
 	"github.com/looplj/axonhub/internal/scopes"
 )
 
@@ -26,7 +27,7 @@ func (Project) Mixin() []ent.Mixin {
 
 func (Project) Indexes() []ent.Index {
 	return []ent.Index{
-		index.Fields("name").
+		index.Fields("name", "deleted_at").
 			StorageKey("projects_by_name").
 			Unique(),
 	}
@@ -36,8 +37,7 @@ func (Project) Indexes() []ent.Index {
 func (Project) Fields() []ent.Field {
 	return []ent.Field{
 		field.String("name").
-			Comment("project name").
-			Unique(),
+			Comment("project name"),
 		field.String("description").
 			Default("").
 			Comment("project description"),
@@ -45,6 +45,12 @@ func (Project) Fields() []ent.Field {
 			Values("active", "archived").
 			Default("active").
 			Comment("project status"),
+		field.JSON("profiles", &objects.ProjectProfiles{}).
+			Default(&objects.ProjectProfiles{}).
+			Optional().
+			Annotations(
+				entgql.Skip(entgql.SkipMutationCreateInput, entgql.SkipMutationUpdateInput),
+			),
 	}
 }
 
@@ -56,6 +62,10 @@ func (Project) Edges() []ent.Edge {
 			StorageKey(edge.Symbol("user_projects_by_user_id_project_id")).
 			Annotations(
 				entgql.RelayConnection(),
+			),
+		edge.To("invitations", Invitation.Type).
+			Annotations(
+				entgql.Skip(entgql.SkipMutationCreateInput, entgql.SkipMutationUpdateInput),
 			),
 		edge.To("roles", Role.Type).
 			Annotations(
@@ -88,6 +98,11 @@ func (Project) Edges() []ent.Edge {
 				entgql.RelayConnection(),
 			),
 		edge.To("prompts", Prompt.Type).
+			Annotations(
+				entgql.Skip(entgql.SkipMutationCreateInput, entgql.SkipMutationUpdateInput),
+				entgql.RelayConnection(),
+			),
+		edge.To("api_key_profile_templates", APIKeyProfileTemplate.Type).
 			Annotations(
 				entgql.Skip(entgql.SkipMutationCreateInput, entgql.SkipMutationUpdateInput),
 				entgql.RelayConnection(),

@@ -2,22 +2,25 @@ package biz
 
 import (
 	"context"
+	"fmt"
+	"strings"
 	"sync"
 	"time"
 
-	"entgo.io/ent/dialect/sql"
-	"github.com/samber/lo"
-	"github.com/zhenzou/executors"
+	"entgo.io/ent/dialect"
 	"go.uber.org/fx"
 
+	entsql "entgo.io/ent/dialect/sql"
+
+	"github.com/looplj/axonhub/internal/authz"
 	"github.com/looplj/axonhub/internal/ent"
 	"github.com/looplj/axonhub/internal/ent/channel"
 	"github.com/looplj/axonhub/internal/ent/channelprobe"
-	"github.com/looplj/axonhub/internal/ent/privacy"
-	"github.com/looplj/axonhub/internal/ent/requestexecution"
-	"github.com/looplj/axonhub/internal/ent/usagelog"
 	"github.com/looplj/axonhub/internal/log"
 	"github.com/looplj/axonhub/internal/pkg/xtime"
+	"github.com/looplj/axonhub/internal/scopes"
+	"github.com/looplj/axonhub/internal/server/gql/qb"
+	"github.com/looplj/axonhub/internal/server/scheduler"
 )
 
 // ChannelProbePoint represents a single probe data point for a channel.
@@ -48,7 +51,6 @@ type ChannelProbeService struct {
 	*AbstractService
 
 	SystemService     *SystemService
-	Executor          executors.ScheduledExecutor
 	mu                sync.Mutex
 	lastExecutionTime time.Time
 }
@@ -60,26 +62,19 @@ func NewChannelProbeService(params ChannelProbeServiceParams) *ChannelProbeServi
 			db: params.Ent,
 		},
 		SystemService:     params.SystemService,
-		Executor:          executors.NewPoolScheduleExecutor(executors.WithMaxConcurrent(1)),
 		lastExecutionTime: time.Time{},
 	}
 
 	return svc
 }
 
-// Start starts the channel probe service with scheduled task.
-func (svc *ChannelProbeService) Start(ctx context.Context) error {
-	_, err := svc.Executor.ScheduleFuncAtCronRate(
-		svc.runProbe,
-		executors.CRONRule{Expr: "* * * * *"},
-	)
-
-	return err
-}
-
-// Stop stops the channel probe service.
-func (svc *ChannelProbeService) Stop(ctx context.Context) error {
-	return svc.Executor.Shutdown(ctx)
+func (svc *ChannelProbeService) RegisterScheduledTasks(ctx context.Context, s *scheduler.Scheduler) error {
+	return s.Register(ctx, scheduler.TaskSpec{
+		Name:        "channel-probe",
+		Description: "Collect channel performance metrics every minute",
+		CronExpr:    "* * * * *",
+		Timezone:    "UTC",
+	}, svc.runProbePeriodically)
 }
 
 // shouldRunProbe determines if a probe should be executed based on frequency, current time, and last execution time.
@@ -116,8 +111,8 @@ type channelProbeStats struct {
 }
 
 // computeAllChannelProbeStats computes probe stats for all channels in a single batch query.
-// This uses request_execution table for more accurate per-channel execution metrics,
-// including retry attempts. This aligns with channel_performance data source.
+// Uses CTE with ROW_NUMBER to get only successful execution per request, includes all token types,
+// and applies different TPS formulas for streaming vs non-streaming.
 func (svc *ChannelProbeService) computeAllChannelProbeStats(
 	ctx context.Context,
 	channelIDs []int,
@@ -128,127 +123,112 @@ func (svc *ChannelProbeService) computeAllChannelProbeStats(
 		return nil, nil
 	}
 
-	// Query 1: Get total and success counts per channel from request_execution
-	type countResult struct {
-		ChannelID    int `json:"channel_id"`
-		TotalCount   int `json:"total_count"`
-		SuccessCount int `json:"success_count"`
+	// Use raw SQL query with CTE pattern (same as Task 1 FastestChannels)
+	type probeResult struct {
+		ChannelID              int   `json:"channel_id"`
+		TotalCount             int   `json:"total_count"`
+		SuccessCount           int   `json:"success_count"`
+		TotalTokens            int64 `json:"total_tokens"`
+		EffectiveLatencyMs     int64 `json:"effective_latency_ms"`
+		TotalFirstTokenLatency int64 `json:"total_first_token_latency"`
+		RequestCount           int   `json:"request_count"`
+		StreamingRequestCount  int   `json:"streaming_request_count"`
 	}
 
-	var countRes []countResult
+	dbDriver := svc.db.Driver()
+	sqlDB, ok := dbDriver.(*entsql.Driver)
+	if !ok {
+		return nil, fmt.Errorf("failed to get underlying SQL driver")
+	}
 
-	err := svc.db.RequestExecution.Query().
-		Where(
-			requestexecution.ChannelIDIn(channelIDs...),
-			requestexecution.CreatedAtGTE(startTime),
-			requestexecution.CreatedAtLT(endTime),
-			requestexecution.StatusNotIn(requestexecution.StatusPending, requestexecution.StatusProcessing),
-		).
-		Modify(func(s *sql.Selector) {
-			s.Select(
-				s.C(requestexecution.FieldChannelID),
-				sql.As(sql.Count("*"), "total_count"),
-				sql.As("SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END)", "success_count"),
-			).GroupBy(s.C(requestexecution.FieldChannelID))
-		}).
-		Scan(ctx, &countRes)
+	// Detect dialect to use appropriate placeholder syntax
+	// PostgreSQL uses $1, $2, etc. while SQLite uses ? placeholders
+	dialectName := sqlDB.Dialect()
+	useDollarPlaceholders := dialectName == dialect.Postgres
+
+	// Build args slice for parameterized query
+	startUTC := startTime.UTC()
+	endUTC := endTime.UTC()
+	args := make([]any, 0, len(channelIDs)+3)
+	if useDollarPlaceholders {
+		args = append(args, startUTC, endUTC)
+	} else {
+		// For ? placeholders, the usage_logs start bound appears before the
+		// outer request_executions time window in the SQL text.
+		args = append(args, startUTC, startUTC, endUTC)
+	}
+
+	// Build channel ID filter with dialect-aware parameterized placeholders
+	// Note: PostgreSQL placeholders start at $3 because $1 and $2 are reserved
+	// for startTime and endTime timestamps.
+	channelIDFilter := ""
+	if len(channelIDs) > 0 {
+		placeholders := make([]string, len(channelIDs))
+		for i, id := range channelIDs {
+			if useDollarPlaceholders {
+				placeholders[i] = fmt.Sprintf("$%d", i+3) // $3, $4, etc. for PostgreSQL (offset by 2 for timestamps)
+			} else {
+				placeholders[i] = "?" // ? for SQLite
+			}
+			args = append(args, id)
+		}
+		channelIDFilter = fmt.Sprintf("AND se.channel_id IN (%s)", strings.Join(placeholders, ","))
+	}
+
+	queryMode := qb.ThroughputModeRowNumber
+	if !useDollarPlaceholders {
+		queryMode = qb.ThroughputModeMaxID
+	}
+
+	query := qb.BuildProbeStatsQuery(useDollarPlaceholders, channelIDFilter, queryMode)
+
+	rows, err := sqlDB.DB().QueryContext(ctx, query, args...)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to query channel probe stats: %w", err)
 	}
 
-	// Initialize result map
+	defer func() { _ = rows.Close() }()
+
 	result := make(map[int]*channelProbeStats)
-	for _, r := range countRes {
-		result[r.ChannelID] = &channelProbeStats{
+	for rows.Next() {
+		var r probeResult
+		if err := rows.Scan(
+			&r.ChannelID,
+			&r.TotalCount,
+			&r.SuccessCount,
+			&r.TotalTokens,
+			&r.EffectiveLatencyMs,
+			&r.TotalFirstTokenLatency,
+			&r.RequestCount,
+			&r.StreamingRequestCount,
+		); err != nil {
+			return nil, fmt.Errorf("failed to scan probe result: %w", err)
+		}
+
+		stats := &channelProbeStats{
 			total:   r.TotalCount,
 			success: r.SuccessCount,
 		}
-	}
 
-	// Query 2: Get latency and first token latency per channel from request_execution
-	type latencyResult struct {
-		ChannelID                int   `json:"channel_id"`
-		TotalLatencyMs           int64 `json:"total_latency_ms"`
-		TotalFirstTokenLatencyMs int64 `json:"total_first_token_latency_ms"`
-		StreamingCount           int   `json:"streaming_count"`
-	}
-
-	var latencyRes []latencyResult
-
-	err = svc.db.RequestExecution.Query().
-		Where(
-			requestexecution.ChannelIDIn(channelIDs...),
-			requestexecution.CreatedAtGTE(startTime),
-			requestexecution.CreatedAtLT(endTime),
-			requestexecution.StatusEQ(requestexecution.StatusCompleted),
-		).
-		Modify(func(s *sql.Selector) {
-			s.Select(
-				s.C(requestexecution.FieldChannelID),
-				sql.As(sql.Sum(s.C(requestexecution.FieldMetricsLatencyMs)), "total_latency_ms"),
-				sql.As(sql.Sum(s.C(requestexecution.FieldMetricsFirstTokenLatencyMs)), "total_first_token_latency_ms"),
-				sql.As("SUM(CASE WHEN metrics_first_token_latency_ms IS NOT NULL THEN 1 ELSE 0 END)", "streaming_count"),
-			).GroupBy(s.C(requestexecution.FieldChannelID))
-		}).
-		Scan(ctx, &latencyRes)
-	if err != nil {
-		return nil, err
-	}
-
-	// Build latency map for later use
-	latencyMap := make(map[int]*latencyResult)
-	for i := range latencyRes {
-		latencyMap[latencyRes[i].ChannelID] = &latencyRes[i]
-	}
-
-	// Query 3: Get completion tokens per channel from usage_log
-	// Note: usage_log is linked to request, not request_execution, so we filter by channel_id and time range
-	type tokenResult struct {
-		ChannelID        int   `json:"channel_id"`
-		CompletionTokens int64 `json:"completion_tokens"`
-	}
-
-	var tokenRes []tokenResult
-
-	err = svc.db.UsageLog.Query().
-		Where(
-			usagelog.ChannelIDIn(channelIDs...),
-			usagelog.CreatedAtGTE(startTime),
-			usagelog.CreatedAtLT(endTime),
-		).
-		Modify(func(s *sql.Selector) {
-			s.Select(
-				s.C(usagelog.FieldChannelID),
-				sql.As(sql.Sum(s.C(usagelog.FieldCompletionTokens)), "completion_tokens"),
-			).GroupBy(s.C(usagelog.FieldChannelID))
-		}).
-		Scan(ctx, &tokenRes)
-	if err != nil {
-		return nil, err
-	}
-
-	// Build completion token map
-	completionTokenMap := make(map[int]int64)
-	for _, r := range tokenRes {
-		completionTokenMap[r.ChannelID] = r.CompletionTokens
-	}
-
-	// Compute derived metrics
-	for channelID, stats := range result {
-		latency := latencyMap[channelID]
-		completionTokens := completionTokenMap[channelID]
-
-		// Calculate avg tokens per second
-		if latency != nil && latency.TotalLatencyMs > 0 && completionTokens > 0 {
-			tps := float64(completionTokens) / (float64(latency.TotalLatencyMs) / 1000.0)
+		// Calculate avg tokens per second using effective latency
+		// For streaming: tokens / ((latency - first_token_latency) / 1000)
+		// For non-streaming: tokens / (latency / 1000)
+		if r.TotalTokens > 0 && r.EffectiveLatencyMs > 0 {
+			tps := float64(r.TotalTokens) / (float64(r.EffectiveLatencyMs) / 1000.0)
 			stats.avgTokensPerSecond = &tps
 		}
 
-		// Calculate avg time to first token
-		if latency != nil && latency.StreamingCount > 0 {
-			avgTTFT := float64(latency.TotalFirstTokenLatencyMs) / float64(latency.StreamingCount)
+		// Calculate avg time to first token (only for streaming requests)
+		if r.TotalFirstTokenLatency > 0 && r.StreamingRequestCount > 0 {
+			avgTTFT := float64(r.TotalFirstTokenLatency) / float64(r.StreamingRequestCount)
 			stats.avgTimeToFirstTokenMs = &avgTTFT
 		}
+
+		result[r.ChannelID] = stats
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating probe results: %w", err)
 	}
 
 	return result, nil
@@ -287,7 +267,6 @@ func (svc *ChannelProbeService) runProbe(ctx context.Context) {
 	svc.mu.Unlock()
 
 	ctx = ent.NewContext(ctx, svc.db)
-	ctx = privacy.DecisionContext(ctx, privacy.Allow)
 
 	log.Debug(ctx, "Starting channel probe",
 		log.Int("interval_minutes", intervalMinutes),
@@ -379,9 +358,12 @@ func generateTimestamps(setting ChannelProbeSetting, currentTime time.Time) []in
 
 // QueryChannelProbes queries probe data for multiple channels with time range alignment.
 func (svc *ChannelProbeService) QueryChannelProbes(ctx context.Context, channelIDs []int) ([]*ChannelProbeData, error) {
-	ctx = privacy.DecisionContext(ctx, privacy.Allow)
-
-	setting := svc.SystemService.ChannelSettingOrDefault(ctx)
+	setting, err := authz.RunWithScopeDecision(ctx, scopes.ScopeReadChannels, func(ctx context.Context) (*SystemChannelSettings, error) {
+		return svc.SystemService.ChannelSettingOrDefault(ctx), nil
+	})
+	if err != nil {
+		return nil, err
+	}
 	rangeMinutes := setting.Probe.GetQueryRangeMinutes()
 	intervalMinutes := setting.Probe.GetIntervalMinutes()
 	now := xtime.UTCNow()
@@ -479,7 +461,5 @@ func (svc *ChannelProbeService) BatchQueryChannelProbes(ctx context.Context, inp
 		return []*ChannelProbeData{}, nil
 	}
 
-	return svc.QueryChannelProbes(ctx, lo.Map(input.ChannelIDs, func(id int, _ int) int {
-		return id
-	}))
+	return svc.QueryChannelProbes(ctx, input.ChannelIDs)
 }

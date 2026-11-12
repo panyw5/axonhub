@@ -12,6 +12,8 @@ import (
 	"entgo.io/ent/dialect/sql/sqlgraph"
 	"entgo.io/ent/schema/field"
 	"github.com/looplj/axonhub/internal/ent/apikey"
+	"github.com/looplj/axonhub/internal/ent/apikeyprofiletemplate"
+	"github.com/looplj/axonhub/internal/ent/invitation"
 	"github.com/looplj/axonhub/internal/ent/project"
 	"github.com/looplj/axonhub/internal/ent/prompt"
 	"github.com/looplj/axonhub/internal/ent/request"
@@ -21,6 +23,7 @@ import (
 	"github.com/looplj/axonhub/internal/ent/usagelog"
 	"github.com/looplj/axonhub/internal/ent/user"
 	"github.com/looplj/axonhub/internal/ent/userproject"
+	"github.com/looplj/axonhub/internal/objects"
 )
 
 // ProjectCreate is the builder for creating a Project entity.
@@ -107,6 +110,12 @@ func (_c *ProjectCreate) SetNillableStatus(v *project.Status) *ProjectCreate {
 	return _c
 }
 
+// SetProfiles sets the "profiles" field.
+func (_c *ProjectCreate) SetProfiles(v *objects.ProjectProfiles) *ProjectCreate {
+	_c.mutation.SetProfiles(v)
+	return _c
+}
+
 // AddUserIDs adds the "users" edge to the User entity by IDs.
 func (_c *ProjectCreate) AddUserIDs(ids ...int) *ProjectCreate {
 	_c.mutation.AddUserIDs(ids...)
@@ -120,6 +129,21 @@ func (_c *ProjectCreate) AddUsers(v ...*User) *ProjectCreate {
 		ids[i] = v[i].ID
 	}
 	return _c.AddUserIDs(ids...)
+}
+
+// AddInvitationIDs adds the "invitations" edge to the Invitation entity by IDs.
+func (_c *ProjectCreate) AddInvitationIDs(ids ...int) *ProjectCreate {
+	_c.mutation.AddInvitationIDs(ids...)
+	return _c
+}
+
+// AddInvitations adds the "invitations" edges to the Invitation entity.
+func (_c *ProjectCreate) AddInvitations(v ...*Invitation) *ProjectCreate {
+	ids := make([]int, len(v))
+	for i := range v {
+		ids[i] = v[i].ID
+	}
+	return _c.AddInvitationIDs(ids...)
 }
 
 // AddRoleIDs adds the "roles" edge to the Role entity by IDs.
@@ -227,6 +251,21 @@ func (_c *ProjectCreate) AddPrompts(v ...*Prompt) *ProjectCreate {
 	return _c.AddPromptIDs(ids...)
 }
 
+// AddAPIKeyProfileTemplateIDs adds the "api_key_profile_templates" edge to the APIKeyProfileTemplate entity by IDs.
+func (_c *ProjectCreate) AddAPIKeyProfileTemplateIDs(ids ...int) *ProjectCreate {
+	_c.mutation.AddAPIKeyProfileTemplateIDs(ids...)
+	return _c
+}
+
+// AddAPIKeyProfileTemplates adds the "api_key_profile_templates" edges to the APIKeyProfileTemplate entity.
+func (_c *ProjectCreate) AddAPIKeyProfileTemplates(v ...*APIKeyProfileTemplate) *ProjectCreate {
+	ids := make([]int, len(v))
+	for i := range v {
+		ids[i] = v[i].ID
+	}
+	return _c.AddAPIKeyProfileTemplateIDs(ids...)
+}
+
 // AddProjectUserIDs adds the "project_users" edge to the UserProject entity by IDs.
 func (_c *ProjectCreate) AddProjectUserIDs(ids ...int) *ProjectCreate {
 	_c.mutation.AddProjectUserIDs(ids...)
@@ -305,17 +344,15 @@ func (_c *ProjectCreate) defaults() error {
 		v := project.DefaultStatus
 		_c.mutation.SetStatus(v)
 	}
+	if _, ok := _c.mutation.Profiles(); !ok {
+		v := project.DefaultProfiles
+		_c.mutation.SetProfiles(v)
+	}
 	return nil
 }
 
 // check runs all checks and user-defined validators on the builder.
 func (_c *ProjectCreate) check() error {
-	if _, ok := _c.mutation.CreatedAt(); !ok {
-		return &ValidationError{Name: "created_at", err: errors.New(`ent: missing required field "Project.created_at"`)}
-	}
-	if _, ok := _c.mutation.UpdatedAt(); !ok {
-		return &ValidationError{Name: "updated_at", err: errors.New(`ent: missing required field "Project.updated_at"`)}
-	}
 	if _, ok := _c.mutation.DeletedAt(); !ok {
 		return &ValidationError{Name: "deleted_at", err: errors.New(`ent: missing required field "Project.deleted_at"`)}
 	}
@@ -384,6 +421,10 @@ func (_c *ProjectCreate) createSpec() (*Project, *sqlgraph.CreateSpec) {
 		_spec.SetField(project.FieldStatus, field.TypeEnum, value)
 		_node.Status = value
 	}
+	if value, ok := _c.mutation.Profiles(); ok {
+		_spec.SetField(project.FieldProfiles, field.TypeJSON, value)
+		_node.Profiles = value
+	}
 	if nodes := _c.mutation.UsersIDs(); len(nodes) > 0 {
 		edge := &sqlgraph.EdgeSpec{
 			Rel:     sqlgraph.M2M,
@@ -402,6 +443,22 @@ func (_c *ProjectCreate) createSpec() (*Project, *sqlgraph.CreateSpec) {
 		_ = createE.defaults()
 		_, specE := createE.createSpec()
 		edge.Target.Fields = specE.Fields
+		_spec.Edges = append(_spec.Edges, edge)
+	}
+	if nodes := _c.mutation.InvitationsIDs(); len(nodes) > 0 {
+		edge := &sqlgraph.EdgeSpec{
+			Rel:     sqlgraph.O2M,
+			Inverse: false,
+			Table:   project.InvitationsTable,
+			Columns: []string{project.InvitationsColumn},
+			Bidi:    false,
+			Target: &sqlgraph.EdgeTarget{
+				IDSpec: sqlgraph.NewFieldSpec(invitation.FieldID, field.TypeInt),
+			},
+		}
+		for _, k := range nodes {
+			edge.Target.Nodes = append(edge.Target.Nodes, k)
+		}
 		_spec.Edges = append(_spec.Edges, edge)
 	}
 	if nodes := _c.mutation.RolesIDs(); len(nodes) > 0 {
@@ -502,13 +559,29 @@ func (_c *ProjectCreate) createSpec() (*Project, *sqlgraph.CreateSpec) {
 	}
 	if nodes := _c.mutation.PromptsIDs(); len(nodes) > 0 {
 		edge := &sqlgraph.EdgeSpec{
-			Rel:     sqlgraph.M2M,
+			Rel:     sqlgraph.O2M,
 			Inverse: false,
 			Table:   project.PromptsTable,
-			Columns: project.PromptsPrimaryKey,
+			Columns: []string{project.PromptsColumn},
 			Bidi:    false,
 			Target: &sqlgraph.EdgeTarget{
 				IDSpec: sqlgraph.NewFieldSpec(prompt.FieldID, field.TypeInt),
+			},
+		}
+		for _, k := range nodes {
+			edge.Target.Nodes = append(edge.Target.Nodes, k)
+		}
+		_spec.Edges = append(_spec.Edges, edge)
+	}
+	if nodes := _c.mutation.APIKeyProfileTemplatesIDs(); len(nodes) > 0 {
+		edge := &sqlgraph.EdgeSpec{
+			Rel:     sqlgraph.O2M,
+			Inverse: false,
+			Table:   project.APIKeyProfileTemplatesTable,
+			Columns: []string{project.APIKeyProfileTemplatesColumn},
+			Bidi:    false,
+			Target: &sqlgraph.EdgeTarget{
+				IDSpec: sqlgraph.NewFieldSpec(apikeyprofiletemplate.FieldID, field.TypeInt),
 			},
 		}
 		for _, k := range nodes {
@@ -650,6 +723,24 @@ func (u *ProjectUpsert) UpdateStatus() *ProjectUpsert {
 	return u
 }
 
+// SetProfiles sets the "profiles" field.
+func (u *ProjectUpsert) SetProfiles(v *objects.ProjectProfiles) *ProjectUpsert {
+	u.Set(project.FieldProfiles, v)
+	return u
+}
+
+// UpdateProfiles sets the "profiles" field to the value that was provided on create.
+func (u *ProjectUpsert) UpdateProfiles() *ProjectUpsert {
+	u.SetExcluded(project.FieldProfiles)
+	return u
+}
+
+// ClearProfiles clears the value of the "profiles" field.
+func (u *ProjectUpsert) ClearProfiles() *ProjectUpsert {
+	u.SetNull(project.FieldProfiles)
+	return u
+}
+
 // UpdateNewValues updates the mutable fields using the new values that were set on create.
 // Using this option is equivalent to using:
 //
@@ -769,6 +860,27 @@ func (u *ProjectUpsertOne) SetStatus(v project.Status) *ProjectUpsertOne {
 func (u *ProjectUpsertOne) UpdateStatus() *ProjectUpsertOne {
 	return u.Update(func(s *ProjectUpsert) {
 		s.UpdateStatus()
+	})
+}
+
+// SetProfiles sets the "profiles" field.
+func (u *ProjectUpsertOne) SetProfiles(v *objects.ProjectProfiles) *ProjectUpsertOne {
+	return u.Update(func(s *ProjectUpsert) {
+		s.SetProfiles(v)
+	})
+}
+
+// UpdateProfiles sets the "profiles" field to the value that was provided on create.
+func (u *ProjectUpsertOne) UpdateProfiles() *ProjectUpsertOne {
+	return u.Update(func(s *ProjectUpsert) {
+		s.UpdateProfiles()
+	})
+}
+
+// ClearProfiles clears the value of the "profiles" field.
+func (u *ProjectUpsertOne) ClearProfiles() *ProjectUpsertOne {
+	return u.Update(func(s *ProjectUpsert) {
+		s.ClearProfiles()
 	})
 }
 
@@ -1057,6 +1169,27 @@ func (u *ProjectUpsertBulk) SetStatus(v project.Status) *ProjectUpsertBulk {
 func (u *ProjectUpsertBulk) UpdateStatus() *ProjectUpsertBulk {
 	return u.Update(func(s *ProjectUpsert) {
 		s.UpdateStatus()
+	})
+}
+
+// SetProfiles sets the "profiles" field.
+func (u *ProjectUpsertBulk) SetProfiles(v *objects.ProjectProfiles) *ProjectUpsertBulk {
+	return u.Update(func(s *ProjectUpsert) {
+		s.SetProfiles(v)
+	})
+}
+
+// UpdateProfiles sets the "profiles" field to the value that was provided on create.
+func (u *ProjectUpsertBulk) UpdateProfiles() *ProjectUpsertBulk {
+	return u.Update(func(s *ProjectUpsert) {
+		s.UpdateProfiles()
+	})
+}
+
+// ClearProfiles clears the value of the "profiles" field.
+func (u *ProjectUpsertBulk) ClearProfiles() *ProjectUpsertBulk {
+	return u.Update(func(s *ProjectUpsert) {
+		s.ClearProfiles()
 	})
 }
 

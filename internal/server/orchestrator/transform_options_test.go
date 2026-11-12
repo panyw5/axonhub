@@ -1,3 +1,4 @@
+//nolint:exhaustruct_v5 // Test fixtures intentionally set only fields relevant to each scenario.
 package orchestrator
 
 import (
@@ -8,6 +9,7 @@ import (
 
 	"github.com/looplj/axonhub/internal/objects"
 	"github.com/looplj/axonhub/llm"
+	"github.com/looplj/axonhub/llm/transformer/anthropic"
 )
 
 func TestApplyTransformOptions_ReplaceDeveloperRoleWithSystem(t *testing.T) {
@@ -91,6 +93,158 @@ func TestApplyTransformOptions_ForceArrayInputs(t *testing.T) {
 
 	require.NotSame(t, req, result)
 	require.Equal(t, lo.ToPtr(true), result.TransformOptions.ArrayInputs)
+}
+
+func TestApplyModelDefaultMaxTokens(t *testing.T) {
+	candidate := &ChannelModelsCandidate{DefaultMaxTokens: 131072}
+
+	t.Run("sets default for anthropic when client omitted an output cap", func(t *testing.T) {
+		req := &llm.Request{Model: "glm-5.3"}
+
+		result := applyModelDefaultMaxTokens(req, candidate, llm.APIFormatAnthropicMessage)
+
+		require.NotSame(t, req, result)
+		require.Equal(t, lo.ToPtr(int64(131072)), result.TransformOptions.DefaultMaxTokens)
+		require.Nil(t, req.TransformOptions.DefaultMaxTokens)
+	})
+
+	t.Run("does not apply to openai outbound", func(t *testing.T) {
+		req := &llm.Request{Model: "glm-5.3"}
+
+		result := applyModelDefaultMaxTokens(req, candidate, llm.APIFormatOpenAIChatCompletion)
+
+		require.Same(t, req, result)
+		require.Nil(t, result.TransformOptions.DefaultMaxTokens)
+	})
+
+	t.Run("keeps client max_tokens", func(t *testing.T) {
+		req := &llm.Request{Model: "glm-5.3", MaxTokens: lo.ToPtr(int64(1024))}
+
+		result := applyModelDefaultMaxTokens(req, candidate, llm.APIFormatAnthropicMessage)
+
+		require.Same(t, req, result)
+		require.Nil(t, result.TransformOptions.DefaultMaxTokens)
+	})
+
+	t.Run("keeps client max_completion_tokens", func(t *testing.T) {
+		req := &llm.Request{Model: "glm-5.3", MaxCompletionTokens: lo.ToPtr(int64(2048))}
+
+		result := applyModelDefaultMaxTokens(req, candidate, llm.APIFormatAnthropicMessage)
+
+		require.Same(t, req, result)
+	})
+
+	t.Run("skips missing or non-positive model limit", func(t *testing.T) {
+		req := &llm.Request{Model: "glm-5.3"}
+
+		require.Same(t, req, applyModelDefaultMaxTokens(req, nil, llm.APIFormatAnthropicMessage))
+		require.Same(t, req, applyModelDefaultMaxTokens(req, &ChannelModelsCandidate{}, llm.APIFormatAnthropicMessage))
+	})
+}
+
+func TestApplyReasoningEffortMapping(t *testing.T) {
+	settings := &objects.ChannelSettings{TransformOptions: objects.TransformOptions{
+		ReasoningEffortMapping: []llm.ReasoningEffortMapping{
+			{From: "xhigh", To: "max"},
+			{From: "max", To: "high"},
+		},
+	}}
+
+	t.Run("maps the unified request effort", func(t *testing.T) {
+		req := &llm.Request{Model: "test-model", ReasoningEffort: "xhigh"}
+
+		result := applyReasoningEffortMapping(req, settings)
+
+		require.NotSame(t, req, result)
+		require.Equal(t, "max", result.ReasoningEffort)
+	})
+
+	t.Run("first matching entry wins", func(t *testing.T) {
+		req := &llm.Request{Model: "test-model", ReasoningEffort: "max"}
+
+		result := applyReasoningEffortMapping(req, settings)
+
+		require.Equal(t, "high", result.ReasoningEffort)
+	})
+
+	t.Run("unmapped effort keeps the same request", func(t *testing.T) {
+		req := &llm.Request{Model: "test-model", ReasoningEffort: "low"}
+
+		result := applyReasoningEffortMapping(req, settings)
+
+		require.Same(t, req, result)
+	})
+
+	t.Run("empty effort keeps the same request", func(t *testing.T) {
+		req := &llm.Request{Model: "test-model"}
+
+		result := applyReasoningEffortMapping(req, settings)
+
+		require.Same(t, req, result)
+	})
+
+	t.Run("empty mapping keeps the original request", func(t *testing.T) {
+		req := &llm.Request{Model: "test-model", ReasoningEffort: "xhigh"}
+
+		result := applyReasoningEffortMapping(req, &objects.ChannelSettings{})
+
+		require.Same(t, req, result)
+	})
+
+	t.Run("nil settings keeps the original request", func(t *testing.T) {
+		req := &llm.Request{Model: "test-model", ReasoningEffort: "xhigh"}
+
+		result := applyReasoningEffortMapping(req, nil)
+
+		require.Same(t, req, result)
+	})
+
+	t.Run("syncs the anthropic output_config effort metadata", func(t *testing.T) {
+		req := &llm.Request{
+			Model:           "test-model",
+			ReasoningEffort: "max",
+			TransformerMetadata: map[string]any{
+				anthropic.TransformerMetadataKeyOutputConfigEffort: "max",
+				anthropic.TransformerMetadataKeyThinkingType:       "adaptive",
+			},
+		}
+
+		result := applyReasoningEffortMapping(req, settings)
+
+		require.Equal(t, "high", result.ReasoningEffort)
+		// The outbound transformer rebuilds output_config.effort from this marker;
+		// keeping the original "max" would bypass the mapping entirely.
+		require.Equal(t, "high", result.TransformerMetadata[anthropic.TransformerMetadataKeyOutputConfigEffort])
+		require.Equal(t, "adaptive", result.TransformerMetadata[anthropic.TransformerMetadataKeyThinkingType])
+	})
+
+	t.Run("mapping does not mutate the original request metadata", func(t *testing.T) {
+		metadata := map[string]any{
+			anthropic.TransformerMetadataKeyOutputConfigEffort: "max",
+		}
+		req := &llm.Request{
+			Model:               "test-model",
+			ReasoningEffort:     "max",
+			TransformerMetadata: metadata,
+		}
+
+		result := applyReasoningEffortMapping(req, settings)
+
+		require.Equal(t, "high", result.ReasoningEffort)
+		require.Equal(t, "high", result.TransformerMetadata[anthropic.TransformerMetadataKeyOutputConfigEffort])
+		// The shallow request copy shares the map with the original request; the
+		// sync must clone before writing.
+		require.Equal(t, "max", req.TransformerMetadata[anthropic.TransformerMetadataKeyOutputConfigEffort])
+	})
+
+	t.Run("no anthropic metadata marker keeps metadata untouched", func(t *testing.T) {
+		req := &llm.Request{Model: "test-model", ReasoningEffort: "xhigh"}
+
+		result := applyReasoningEffortMapping(req, settings)
+
+		require.Equal(t, "max", result.ReasoningEffort)
+		require.Nil(t, result.TransformerMetadata)
+	})
 }
 
 func TestReplaceDeveloperRoleWithSystem(t *testing.T) {

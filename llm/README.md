@@ -171,7 +171,6 @@ AxonHub 的 LLM Pipeline 采用**转换器链（Transformer Chain）**模式，�
 **OpenAI 兼容**：
 - `openai` - OpenAI 官方 API
 - `openai_responses` - OpenAI Responses API
-- `openai_fake` - 测试用模拟渠道
 - `vercel` - Vercel AI SDK
 - `deepseek` - DeepSeek
 - `deepinfra` - DeepInfra
@@ -184,13 +183,16 @@ AxonHub 的 LLM Pipeline 采用**转换器链（Transformer Chain）**模式，�
 - `aihubmix` - AIHubMix
 - `burncloud` - BurnCloud
 - `github` - GitHub Models
-- `claudecode` - Claude Code
+- `github_copilot` - GitHub Copilot
+- `codex` - OpenAI Codex
+- `claudecode` - Claude Code ⚠️ (不再重点维护)
+- `cerebras` - Cerebras
+- `nanogpt` - NanoGPT
 
 **Anthropic 兼容**：
 - `anthropic` - Anthropic 官方 API
 - `anthropic_aws` - AWS Bedrock (Claude)
 - `anthropic_gcp` - Google Vertex AI (Claude)
-- `anthropic_fake` - 测试用模拟渠道
 - `deepseek_anthropic` - DeepSeek (Anthropic 格式)
 - `doubao_anthropic` - 豆包 (Anthropic 格式)
 - `moonshot_anthropic` - Moonshot (Anthropic 格式)
@@ -209,6 +211,7 @@ AxonHub 的 LLM Pipeline 采用**转换器链（Transformer Chain）**模式，�
 - `zai` - Zai
 - `xai` - xAI (Grok)
 - `openrouter` - OpenRouter
+- `xiaomi` - Xiaomi MIMO (OpenAI 兼容格式)
 - `longcat` - Longcat
 - `modelscope` - ModelScope
 - `bailian` - 阿里百炼
@@ -591,7 +594,6 @@ type Retryable interface {
 每个 Transformer 都有完整的测试套件：
 - 单元测试（`*_test.go`）
 - 集成测试（`*_integration_test.go`）
-- 假数据测试（`fake.go`, `fake_test.go`）
 
 运行测试：
 ```bash
@@ -622,4 +624,4 @@ go test -tags=integration ./llm/transformer/anthropic/...
 
 ## 许可证
 
-本项目采用 MIT 许可证。详见 LICENSE 文件。
+本目录采用 LGPL 许可证。详见 LICENSE 文件。

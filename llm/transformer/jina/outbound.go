@@ -27,6 +27,11 @@ func (e *RerankError) Error() string {
 type Config struct {
 	BaseURL        string              `json:"base_url,omitempty"`
 	APIKeyProvider auth.APIKeyProvider `json:"-"`
+
+	// EndpointPath is an optional custom path override for this endpoint.
+	// When set, it replaces the default API path (e.g., "/rerank", "/embeddings").
+	// Must start with "/". Skips default version normalization when set.
+	EndpointPath string `json:"endpoint_path,omitempty"`
 }
 
 // OutboundTransformer implements the outbound transformer for Jina APIs (Rerank and Embedding).
@@ -50,7 +55,11 @@ func NewOutboundTransformerWithConfig(config *Config) (*OutboundTransformer, err
 		return nil, fmt.Errorf("invalid config: %w", err)
 	}
 
-	config.BaseURL = transformer.NormalizeBaseURL(config.BaseURL, "v1")
+	if config.EndpointPath != "" {
+		config.BaseURL = transformer.NormalizeBaseURL(config.BaseURL, "")
+	} else {
+		config.BaseURL = transformer.NormalizeBaseURL(config.BaseURL, "v1")
+	}
 
 	return &OutboundTransformer{
 		config: config,
@@ -92,6 +101,8 @@ func (t *OutboundTransformer) TransformRequest(
 		return t.transformRerankRequest(ctx, llmReq)
 	case llm.RequestTypeEmbedding:
 		return t.transformEmbeddingRequest(ctx, llmReq)
+	case llm.RequestTypeCompact:
+		return nil, fmt.Errorf("%w: compact is only supported by OpenAI Responses API", transformer.ErrInvalidRequest)
 	default:
 		return nil, fmt.Errorf("%w: %s is not supported", transformer.ErrInvalidRequest, llmReq.RequestType)
 	}
@@ -224,11 +235,19 @@ func (t *OutboundTransformer) transformEmbeddingRequest(
 
 // buildRerankURL constructs the rerank API URL.
 func (t *OutboundTransformer) buildRerankURL() string {
+	if t.config.EndpointPath != "" {
+		return t.config.BaseURL + t.config.EndpointPath
+	}
+
 	return t.config.BaseURL + "/rerank"
 }
 
 // buildEmbeddingURL constructs the embedding API URL.
 func (t *OutboundTransformer) buildEmbeddingURL() string {
+	if t.config.EndpointPath != "" {
+		return t.config.BaseURL + t.config.EndpointPath
+	}
+
 	return t.config.BaseURL + "/embeddings"
 }
 
@@ -299,14 +318,6 @@ func (t *OutboundTransformer) transformRerankResponse(
 		}
 	}
 
-	// Convert usage
-	if jinaResp.Usage != nil {
-		llmRerankResp.Usage = &llm.RerankUsage{
-			PromptTokens: jinaResp.Usage.PromptTokens,
-			TotalTokens:  jinaResp.Usage.TotalTokens,
-		}
-	}
-
 	// Build unified response
 	llmResp := &llm.Response{
 		RequestType: llm.RequestTypeRerank,
@@ -315,12 +326,11 @@ func (t *OutboundTransformer) transformRerankResponse(
 		Model:       jinaResp.Model,
 	}
 
-	// Map usage if available
+	// Set usage on Response
 	if jinaResp.Usage != nil {
 		llmResp.Usage = &llm.Usage{
-			PromptTokens:     int64(jinaResp.Usage.PromptTokens),
-			CompletionTokens: 0,
-			TotalTokens:      int64(jinaResp.Usage.TotalTokens),
+			PromptTokens: int64(jinaResp.Usage.PromptTokens),
+			TotalTokens:  int64(jinaResp.Usage.TotalTokens),
 		}
 	}
 
@@ -353,14 +363,6 @@ func (t *OutboundTransformer) transformEmbeddingResponse(
 		}
 	}
 
-	// Convert usage
-	if jinaResp.Usage.PromptTokens > 0 || jinaResp.Usage.TotalTokens > 0 {
-		llmEmbeddingResp.Usage = &llm.EmbeddingUsage{
-			PromptTokens: jinaResp.Usage.PromptTokens,
-			TotalTokens:  jinaResp.Usage.TotalTokens,
-		}
-	}
-
 	llmResp := &llm.Response{
 		RequestType: llm.RequestTypeEmbedding,
 		APIFormat:   llm.APIFormatJinaEmbedding,
@@ -368,11 +370,11 @@ func (t *OutboundTransformer) transformEmbeddingResponse(
 		Model:       jinaResp.Model,
 	}
 
+	// Set usage on Response
 	if jinaResp.Usage.PromptTokens > 0 || jinaResp.Usage.TotalTokens > 0 {
 		llmResp.Usage = &llm.Usage{
-			PromptTokens:     jinaResp.Usage.PromptTokens,
-			CompletionTokens: 0,
-			TotalTokens:      jinaResp.Usage.TotalTokens,
+			PromptTokens: jinaResp.Usage.PromptTokens,
+			TotalTokens:  jinaResp.Usage.TotalTokens,
 		}
 	}
 
@@ -382,6 +384,7 @@ func (t *OutboundTransformer) transformEmbeddingResponse(
 // TransformStream - Rerank doesn't support streaming.
 func (t *OutboundTransformer) TransformStream(
 	ctx context.Context,
+	req *httpclient.Request,
 	stream streams.Stream[*httpclient.StreamEvent],
 ) (streams.Stream[*llm.Response], error) {
 	return nil, fmt.Errorf("rerank does not support streaming")
@@ -389,7 +392,7 @@ func (t *OutboundTransformer) TransformStream(
 
 // AggregateStreamChunks - Rerank doesn't support streaming.
 func (t *OutboundTransformer) AggregateStreamChunks(
-	ctx context.Context,
+	ctx context.Context, _ *httpclient.Request,
 	chunks []*httpclient.StreamEvent,
 ) ([]byte, llm.ResponseMeta, error) {
 	return nil, llm.ResponseMeta{}, fmt.Errorf("rerank does not support streaming")

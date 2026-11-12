@@ -5,12 +5,14 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/zhenzou/executors"
+	"entgo.io/ent/dialect"
 	"go.uber.org/fx"
+
+	entsql "entgo.io/ent/dialect/sql"
 
 	"github.com/looplj/axonhub/internal/ent"
 	"github.com/looplj/axonhub/internal/ent/channelprobe"
-	"github.com/looplj/axonhub/internal/ent/privacy"
+	"github.com/looplj/axonhub/internal/ent/datastorage"
 	"github.com/looplj/axonhub/internal/ent/request"
 	"github.com/looplj/axonhub/internal/ent/requestexecution"
 	"github.com/looplj/axonhub/internal/ent/schema/schematype"
@@ -19,24 +21,37 @@ import (
 	"github.com/looplj/axonhub/internal/ent/usagelog"
 	"github.com/looplj/axonhub/internal/log"
 	"github.com/looplj/axonhub/internal/server/biz"
+	"github.com/looplj/axonhub/internal/server/scheduler"
 )
 
-// defaultBatchSize is the default batch size for cleanup operations
-// This can be overridden for testing.
 var defaultBatchSize = 500
 
-type Config struct {
-	CRON string `json:"cron" yaml:"cron" conf:"cron" validate:"required"`
+type TriggerGcCleanupInput struct {
+	RequestsCleanupDays       int `json:"requests_cleanup_days"`
+	UsageLogsCleanupDays      int `json:"usage_logs_cleanup_days"`
+	RequestBodiesCleanupDays  int `json:"request_bodies_cleanup_days"`
+	ResponseBodiesCleanupDays int `json:"response_bodies_cleanup_days"`
+	ResponseChunksCleanupDays int `json:"response_chunks_cleanup_days"`
 }
 
-// Worker handles garbage collection and cleanup operations.
+type GcCleanupPreviewItem struct {
+	ResourceType   string    `json:"resource_type"`
+	EstimatedCount int       `json:"estimated_count"`
+	CutoffTime     time.Time `json:"cutoff_time"`
+	RetentionDays  int       `json:"retention_days"`
+}
+
+type Config struct {
+	CRON          string `json:"cron" yaml:"cron" conf:"cron" validate:"required"`
+	VacuumEnabled bool   `json:"vacuum_enabled" yaml:"vacuum_enabled" conf:"vacuum_enabled"`
+	VacuumFull    bool   `json:"vacuum_full" yaml:"vacuum_full" conf:"vacuum_full"`
+}
+
 type Worker struct {
 	SystemService      *biz.SystemService
 	DataStorageService *biz.DataStorageService
-	Executor           executors.ScheduledExecutor
 	Ent                *ent.Client
 	Config             Config
-	CancelFunc         context.CancelFunc
 }
 
 type Params struct {
@@ -48,32 +63,37 @@ type Params struct {
 	Client             *ent.Client
 }
 
-// NewWorker creates a new GCService with daily cleanup scheduling.
 func NewWorker(params Params) *Worker {
-	return &Worker{
+	w := &Worker{
 		SystemService:      params.SystemService,
 		DataStorageService: params.DataStorageService,
-		Executor:           executors.NewPoolScheduleExecutor(executors.WithMaxConcurrent(1)),
 		Ent:                params.Client,
 		Config:             params.Config,
 	}
+
+	return w
 }
 
-// deleteInBatches deletes records in batches to avoid memory issues
-// This function repeatedly executes the delete query until no more records are deleted.
+func (w *Worker) RegisterScheduledTasks(ctx context.Context, s *scheduler.Scheduler) error {
+	return s.Register(ctx, scheduler.TaskSpec{
+		Name:        "gc",
+		Description: "Garbage collection — cleanup old requests, stored bodies, traces, usage logs, and channel probes",
+		CronExpr:    w.Config.CRON,
+		Timezone:    "UTC",
+	}, w.runAutomaticCleanup)
+}
+
+// deleteInBatches deletes records in batches to avoid memory issues.
 func (w *Worker) deleteInBatches(ctx context.Context, deleteFunc func() (int, error)) (int, error) {
-	ctx = privacy.DecisionContext(ctx, privacy.Allow)
 	totalDeleted := 0
 
 	for {
-		// Delete a batch of records
 		deleted, err := deleteFunc()
 		if err != nil {
 			return totalDeleted, fmt.Errorf("failed to delete batch: %w", err)
 		}
 
 		if deleted == 0 {
-			// No more records to delete
 			break
 		}
 
@@ -84,54 +104,19 @@ func (w *Worker) deleteInBatches(ctx context.Context, deleteFunc func() (int, er
 	return totalDeleted, nil
 }
 
-// getBatchSize returns the appropriate batch size for cleanup operations
-// Returns 10 for test environment, 500 for production.
+// getBatchSize returns the appropriate batch size for cleanup operations.
 func (w *Worker) getBatchSize() int {
-	// Check if running in test mode by checking context or environment
-	// For now, use a default batch size that can be overridden via config if needed
-	// In production, this should return 500
-	// In tests, it can be overridden to 10
 	return defaultBatchSize
 }
 
-func (w *Worker) Start(ctx context.Context) error {
-	cancelFunc, err := w.Executor.ScheduleFuncAtCronRate(
-		w.runCleanup,
-		executors.CRONRule{Expr: w.Config.CRON},
-	)
-	if err != nil {
-		return err
-	}
-
-	w.CancelFunc = cancelFunc
-
-	log.Info(ctx, "GC worker started", log.String("cron", w.Config.CRON),
-		log.Bool("cancel_func", w.CancelFunc != nil),
-		log.Bool("ent", w.Ent != nil),
-		log.Bool("executor", w.Executor != nil),
-		log.Bool("system_service", w.SystemService != nil),
-	)
-
-	return nil
-}
-
-func (w *Worker) Stop(ctx context.Context) error {
-	if w.CancelFunc != nil {
-		w.CancelFunc()
-	}
-
-	return w.Executor.Shutdown(ctx)
-}
-
 // runCleanup executes the cleanup process based on storage policy.
-func (w *Worker) runCleanup(ctx context.Context) {
-	log.Info(ctx, "Starting automatic cleanup process")
+// When manual is true and manualDays is provided, those days override the policy values.
+func (w *Worker) runCleanup(ctx context.Context, manual bool, manualDays map[string]int) {
+	log.Info(ctx, "Starting cleanup process", log.Bool("manual", manual))
 
 	ctx = ent.NewContext(ctx, w.Ent)
 	ctx = schematype.SkipSoftDelete(ctx)
-	ctx = privacy.DecisionContext(ctx, privacy.Allow)
 
-	// Get storage policy
 	policy, err := w.SystemService.StoragePolicy(ctx)
 	if err != nil {
 		log.Error(ctx, "Failed to get storage policy for cleanup", log.Cause(err))
@@ -140,12 +125,55 @@ func (w *Worker) runCleanup(ctx context.Context) {
 
 	log.Debug(ctx, "Storage policy for cleanup", log.Any("policy", policy))
 
-	// Execute cleanup for each resource type
 	for _, option := range policy.CleanupOptions {
-		if option.Enabled {
+		if option.Enabled || manual {
+			if manual && manualDays != nil {
+				if _, ok := manualDays[option.ResourceType]; !ok {
+					continue
+				}
+			}
+			days := option.CleanupDays
+			if manual && manualDays != nil {
+				if d, ok := manualDays[option.ResourceType]; ok {
+					days = d
+				}
+			}
 			switch option.ResourceType {
-			case "requests":
-				err := w.cleanupRequests(ctx, option.CleanupDays)
+			case biz.CleanupResourceRequestBodies:
+				err := w.cleanupRequestBodies(ctx, days)
+				if err != nil {
+					log.Error(ctx, "Failed to cleanup request bodies",
+						log.String("resource", option.ResourceType),
+						log.Cause(err))
+				} else {
+					log.Info(ctx, "Successfully cleaned up request bodies",
+						log.String("resource", option.ResourceType),
+						log.Int("cleanup_days", days))
+				}
+			case biz.CleanupResourceResponseBodies:
+				err := w.cleanupResponseBodies(ctx, days)
+				if err != nil {
+					log.Error(ctx, "Failed to cleanup response bodies",
+						log.String("resource", option.ResourceType),
+						log.Cause(err))
+				} else {
+					log.Info(ctx, "Successfully cleaned up response bodies",
+						log.String("resource", option.ResourceType),
+						log.Int("cleanup_days", days))
+				}
+			case biz.CleanupResourceResponseChunks:
+				err := w.cleanupResponseChunks(ctx, days)
+				if err != nil {
+					log.Error(ctx, "Failed to cleanup response chunks",
+						log.String("resource", option.ResourceType),
+						log.Cause(err))
+				} else {
+					log.Info(ctx, "Successfully cleaned up response chunks",
+						log.String("resource", option.ResourceType),
+						log.Int("cleanup_days", days))
+				}
+			case biz.CleanupResourceRequests:
+				err := w.cleanupRequests(ctx, days, manual)
 				if err != nil {
 					log.Error(ctx, "Failed to cleanup requests",
 						log.String("resource", option.ResourceType),
@@ -153,10 +181,10 @@ func (w *Worker) runCleanup(ctx context.Context) {
 				} else {
 					log.Info(ctx, "Successfully cleaned up requests",
 						log.String("resource", option.ResourceType),
-						log.Int("cleanup_days", option.CleanupDays))
+						log.Int("cleanup_days", days))
 				}
 
-				err = w.cleanupThreads(ctx, option.CleanupDays)
+				err = w.cleanupThreads(ctx, days, manual)
 				if err != nil {
 					log.Error(ctx, "Failed to cleanup threads",
 						log.String("resource", "threads"),
@@ -164,10 +192,10 @@ func (w *Worker) runCleanup(ctx context.Context) {
 				} else {
 					log.Info(ctx, "Successfully cleaned up threads",
 						log.String("resource", "threads"),
-						log.Int("cleanup_days", option.CleanupDays))
+						log.Int("cleanup_days", days))
 				}
 
-				err = w.cleanupTraces(ctx, option.CleanupDays)
+				err = w.cleanupTraces(ctx, days, manual)
 				if err != nil {
 					log.Error(ctx, "Failed to cleanup traces",
 						log.String("resource", "traces"),
@@ -175,10 +203,10 @@ func (w *Worker) runCleanup(ctx context.Context) {
 				} else {
 					log.Info(ctx, "Successfully cleaned up traces",
 						log.String("resource", "traces"),
-						log.Int("cleanup_days", option.CleanupDays))
+						log.Int("cleanup_days", days))
 				}
-			case "usage_logs":
-				err := w.cleanupUsageLogs(ctx, option.CleanupDays)
+			case biz.CleanupResourceUsageLogs:
+				err := w.cleanupUsageLogs(ctx, days, manual)
 				if err != nil {
 					log.Error(ctx, "Failed to cleanup usage logs",
 						log.String("resource", option.ResourceType),
@@ -186,7 +214,7 @@ func (w *Worker) runCleanup(ctx context.Context) {
 				} else {
 					log.Info(ctx, "Successfully cleaned up usage logs",
 						log.String("resource", option.ResourceType),
-						log.Int("cleanup_days", option.CleanupDays))
+						log.Int("cleanup_days", days))
 				}
 			default:
 				log.Warn(ctx, "Unknown resource type for cleanup",
@@ -195,8 +223,7 @@ func (w *Worker) runCleanup(ctx context.Context) {
 		}
 	}
 
-	// Always cleanup channel probe data older than 3 days
-	err = w.cleanupChannelProbes(ctx, 3)
+	err = w.cleanupChannelProbes(ctx, 3, manual)
 	if err != nil {
 		log.Error(ctx, "Failed to cleanup channel probes",
 			log.Cause(err))
@@ -205,17 +232,23 @@ func (w *Worker) runCleanup(ctx context.Context) {
 			log.Int("cleanup_days", 3))
 	}
 
-	log.Info(ctx, "Automatic cleanup process completed")
+	if w.Config.VacuumEnabled {
+		if err := w.runVacuum(ctx); err != nil {
+			log.Error(ctx, "Failed to run VACUUM after cleanup",
+				log.Cause(err))
+		}
+	}
+
+	log.Info(ctx, "Cleanup process completed")
 }
 
 // cleanupRequests deletes requests older than the specified number of days.
-func (w *Worker) cleanupRequests(ctx context.Context, cleanupDays int) error {
+func (w *Worker) cleanupRequests(ctx context.Context, cleanupDays int, manual bool) error {
 	if cleanupDays <= 0 {
 		log.Debug(ctx, "No cleanup needed for requests")
-		return nil // No cleanup needed
+		return nil
 	}
 
-	ctx = privacy.DecisionContext(ctx, privacy.Allow)
 	cutoffTime := time.Now().AddDate(0, 0, -cleanupDays)
 
 	execResult, err := w.cleanupOldRequestExecutions(ctx, cutoffTime)
@@ -247,7 +280,18 @@ func (w *Worker) cleanupOldRequestExecutions(ctx context.Context, cutoffTime tim
 
 	for {
 		executions, err := w.Ent.RequestExecution.Query().
-			Where(requestexecution.CreatedAtLT(cutoffTime)).
+			Select(
+				requestexecution.FieldID,
+				requestexecution.FieldProjectID,
+				requestexecution.FieldDataStorageID,
+				requestexecution.FieldRequestID,
+			).
+			Where(
+				requestexecution.CreatedAtLT(cutoffTime),
+				requestexecution.Not(requestexecution.HasRequestWith(
+					request.HasTraceWith(trace.StatusEQ(trace.StatusRetained)),
+				)),
+			).
 			Order(ent.Asc(requestexecution.FieldID)).
 			Limit(batchSize).
 			All(ctx)
@@ -290,7 +334,15 @@ func (w *Worker) cleanupOldRequestsRecords(ctx context.Context, cutoffTime time.
 
 	for {
 		reqs, err := w.Ent.Request.Query().
-			Where(request.CreatedAtLT(cutoffTime)).
+			Select(
+				request.FieldID,
+				request.FieldProjectID,
+				request.FieldDataStorageID,
+			).
+			Where(
+				request.CreatedAtLT(cutoffTime),
+				request.Not(request.HasTraceWith(trace.StatusEQ(trace.StatusRetained))),
+			).
 			Order(ent.Asc(request.FieldID)).
 			Limit(batchSize).
 			All(ctx)
@@ -343,7 +395,13 @@ func (w *Worker) cleanupExecutionExternalStorage(ctx context.Context, exec *ent.
 		biz.GenerateExecutionRequestBodyKey(exec.ProjectID, exec.RequestID, exec.ID),
 		biz.GenerateExecutionResponseBodyKey(exec.ProjectID, exec.RequestID, exec.ID),
 		biz.GenerateExecutionResponseChunksKey(exec.ProjectID, exec.RequestID, exec.ID),
-		biz.GenerateExecutionRequestDirKey(exec.ProjectID, exec.RequestID, exec.ID),
+	}
+
+	// Directory-marker keys only exist as real directories on filesystem-like
+	// backends. On object stores (S3/GCS) they were never created, so deleting
+	// them only wastes a ListObjectsV2 (Class A); skip them there.
+	if hasRealDirectories(ds.Type) {
+		keys = append(keys, biz.GenerateExecutionRequestDirKey(exec.ProjectID, exec.RequestID, exec.ID))
 	}
 
 	for _, key := range keys {
@@ -380,8 +438,15 @@ func (w *Worker) cleanupRequestExternalStorage(ctx context.Context, req *ent.Req
 		biz.GenerateRequestBodyKey(req.ProjectID, req.ID),
 		biz.GenerateResponseBodyKey(req.ProjectID, req.ID),
 		biz.GenerateResponseChunksKey(req.ProjectID, req.ID),
-		biz.GenerateRequestExecutionsDirKey(req.ProjectID, req.ID),
-		biz.GenerateRequestDirKey(req.ProjectID, req.ID),
+	}
+
+	// See cleanupExecutionExternalStorage: object stores have no real
+	// directories, so only attempt directory-marker deletes on FS/WebDAV.
+	if hasRealDirectories(ds.Type) {
+		keys = append(keys,
+			biz.GenerateRequestExecutionsDirKey(req.ProjectID, req.ID),
+			biz.GenerateRequestDirKey(req.ProjectID, req.ID),
+		)
 	}
 
 	for _, key := range keys {
@@ -393,6 +458,16 @@ func (w *Worker) cleanupRequestExternalStorage(ctx context.Context, req *ent.Req
 			)
 		}
 	}
+}
+
+// hasRealDirectories reports whether the storage backend materializes
+// directories as real entries that must be explicitly removed during cleanup.
+// Object stores (S3/GCS) have no real directories — the "*DirKey" paths are
+// never created, so attempting to delete them only costs a wasted
+// ListObjectsV2 (Class A). Filesystem and WebDAV backends do create real
+// directories that should be removed.
+func hasRealDirectories(t datastorage.Type) bool {
+	return t == datastorage.TypeFs || t == datastorage.TypeWebdav
 }
 
 func (w *Worker) getDataStorageCached(ctx context.Context, id int, cache map[int]*ent.DataStorage) (*ent.DataStorage, error) {
@@ -411,17 +486,33 @@ func (w *Worker) getDataStorageCached(ctx context.Context, id int, cache map[int
 }
 
 // cleanupUsageLogs deletes usage logs older than the specified number of days.
-func (w *Worker) cleanupUsageLogs(ctx context.Context, cleanupDays int) error {
+func (w *Worker) cleanupUsageLogs(ctx context.Context, cleanupDays int, manual bool) error {
 	if cleanupDays <= 0 {
-		return nil // No cleanup needed
+		return nil
 	}
 
-	ctx = privacy.DecisionContext(ctx, privacy.Allow)
 	cutoffTime := time.Now().AddDate(0, 0, -cleanupDays)
+	batchSize := w.getBatchSize()
 
-	// Delete usage logs in batches
 	result, err := w.deleteInBatches(ctx, func() (int, error) {
-		return w.Ent.UsageLog.Delete().Where(usagelog.CreatedAtLT(cutoffTime)).Exec(ctx)
+		ids, err := w.Ent.UsageLog.Query().
+			Where(
+				usagelog.CreatedAtLT(cutoffTime),
+				usagelog.Not(usagelog.HasRequestWith(
+					request.HasTraceWith(trace.StatusEQ(trace.StatusRetained)),
+				)),
+			).
+			Order(ent.Asc(usagelog.FieldID)).
+			Limit(batchSize).
+			IDs(ctx)
+		if err != nil {
+			return 0, fmt.Errorf("failed to query old usage logs: %w", err)
+		}
+		if len(ids) == 0 {
+			return 0, nil
+		}
+
+		return w.Ent.UsageLog.Delete().Where(usagelog.IDIn(ids...)).Exec(ctx)
 	})
 	if err != nil {
 		return fmt.Errorf("failed to delete old usage logs: %w", err)
@@ -435,18 +526,32 @@ func (w *Worker) cleanupUsageLogs(ctx context.Context, cleanupDays int) error {
 }
 
 // cleanupThreads deletes threads older than the specified number of days.
-func (w *Worker) cleanupThreads(ctx context.Context, cleanupDays int) error {
+func (w *Worker) cleanupThreads(ctx context.Context, cleanupDays int, manual bool) error {
 	if cleanupDays <= 0 {
 		log.Debug(ctx, "No cleanup needed for threads")
-		return nil // No cleanup needed
+		return nil
 	}
 
-	ctx = privacy.DecisionContext(ctx, privacy.Allow)
 	cutoffTime := time.Now().AddDate(0, 0, -cleanupDays)
+	batchSize := w.getBatchSize()
 
-	// Delete threads in batches
 	result, err := w.deleteInBatches(ctx, func() (int, error) {
-		return w.Ent.Thread.Delete().Where(thread.CreatedAtLT(cutoffTime)).Exec(ctx)
+		ids, err := w.Ent.Thread.Query().
+			Where(
+				thread.CreatedAtLT(cutoffTime),
+				thread.StatusNEQ(thread.StatusRetained),
+			).
+			Order(ent.Asc(thread.FieldID)).
+			Limit(batchSize).
+			IDs(ctx)
+		if err != nil {
+			return 0, fmt.Errorf("failed to query old threads: %w", err)
+		}
+		if len(ids) == 0 {
+			return 0, nil
+		}
+
+		return w.Ent.Thread.Delete().Where(thread.IDIn(ids...)).Exec(ctx)
 	})
 	if err != nil {
 		return fmt.Errorf("failed to delete old threads: %w", err)
@@ -460,18 +565,32 @@ func (w *Worker) cleanupThreads(ctx context.Context, cleanupDays int) error {
 }
 
 // cleanupTraces deletes traces older than the specified number of days.
-func (w *Worker) cleanupTraces(ctx context.Context, cleanupDays int) error {
+func (w *Worker) cleanupTraces(ctx context.Context, cleanupDays int, manual bool) error {
 	if cleanupDays <= 0 {
 		log.Debug(ctx, "No cleanup needed for traces")
-		return nil // No cleanup needed
+		return nil
 	}
 
-	ctx = privacy.DecisionContext(ctx, privacy.Allow)
 	cutoffTime := time.Now().AddDate(0, 0, -cleanupDays)
+	batchSize := w.getBatchSize()
 
-	// Delete traces in batches
 	result, err := w.deleteInBatches(ctx, func() (int, error) {
-		return w.Ent.Trace.Delete().Where(trace.CreatedAtLT(cutoffTime)).Exec(ctx)
+		ids, err := w.Ent.Trace.Query().
+			Where(
+				trace.CreatedAtLT(cutoffTime),
+				trace.StatusNEQ(trace.StatusRetained),
+			).
+			Order(ent.Asc(trace.FieldID)).
+			Limit(batchSize).
+			IDs(ctx)
+		if err != nil {
+			return 0, fmt.Errorf("failed to query old traces: %w", err)
+		}
+		if len(ids) == 0 {
+			return 0, nil
+		}
+
+		return w.Ent.Trace.Delete().Where(trace.IDIn(ids...)).Exec(ctx)
 	})
 	if err != nil {
 		return fmt.Errorf("failed to delete old traces: %w", err)
@@ -485,17 +604,29 @@ func (w *Worker) cleanupTraces(ctx context.Context, cleanupDays int) error {
 }
 
 // cleanupChannelProbes deletes channel probes older than the specified number of days.
-func (w *Worker) cleanupChannelProbes(ctx context.Context, cleanupDays int) error {
+func (w *Worker) cleanupChannelProbes(ctx context.Context, cleanupDays int, manual bool) error {
 	if cleanupDays <= 0 {
 		log.Debug(ctx, "No cleanup needed for channel probes")
 		return nil
 	}
 
-	ctx = privacy.DecisionContext(ctx, privacy.Allow)
 	cutoffTime := time.Now().AddDate(0, 0, -cleanupDays)
+	batchSize := w.getBatchSize()
 
 	result, err := w.deleteInBatches(ctx, func() (int, error) {
-		return w.Ent.ChannelProbe.Delete().Where(channelprobe.TimestampLT(cutoffTime.Unix())).Exec(ctx)
+		ids, err := w.Ent.ChannelProbe.Query().
+			Where(channelprobe.TimestampLT(cutoffTime.Unix())).
+			Order(ent.Asc(channelprobe.FieldID)).
+			Limit(batchSize).
+			IDs(ctx)
+		if err != nil {
+			return 0, fmt.Errorf("failed to query old channel probes: %w", err)
+		}
+		if len(ids) == 0 {
+			return 0, nil
+		}
+
+		return w.Ent.ChannelProbe.Delete().Where(channelprobe.IDIn(ids...)).Exec(ctx)
 	})
 	if err != nil {
 		return fmt.Errorf("failed to delete old channel probes: %w", err)
@@ -508,9 +639,157 @@ func (w *Worker) cleanupChannelProbes(ctx context.Context, cleanupDays int) erro
 	return nil
 }
 
-// RunCleanupNow manually triggers the cleanup process.
-// This can be useful for testing or manual execution.
-func (w *Worker) RunCleanupNow(ctx context.Context) error {
-	w.runCleanup(ctx)
+// runVacuum executes VACUUM command on SQLite/PostgreSQL database.
+func (w *Worker) runVacuum(ctx context.Context) error {
+	if !w.Config.VacuumEnabled {
+		log.Debug(ctx, "VACUUM is disabled, skipping")
+		return nil
+	}
+
+	dbDriver := w.Ent.Driver()
+	if dbDriver == nil {
+		return fmt.Errorf("failed to get database driver")
+	}
+
+	sqlDriver, ok := dbDriver.(*entsql.Driver)
+	if !ok {
+		log.Debug(ctx, "Database driver is not *entsql.Driver, skipping VACUUM")
+		return nil
+	}
+
+	if sqlDriver.Dialect() != dialect.SQLite && sqlDriver.Dialect() != dialect.Postgres {
+		log.Debug(ctx, "Database does not support VACUUM, skipping",
+			log.String("dialect", sqlDriver.Dialect()))
+
+		return nil
+	}
+
+	log.Info(ctx, "Starting database VACUUM operation",
+		log.String("dialect", sqlDriver.Dialect()),
+		log.Bool("vacuum_full", w.Config.VacuumFull))
+
+	startTime := time.Now()
+
+	var vacuumSQL string
+	if sqlDriver.Dialect() == dialect.Postgres && w.Config.VacuumFull {
+		vacuumSQL = "VACUUM FULL"
+	} else {
+		vacuumSQL = "VACUUM"
+	}
+
+	if _, err := sqlDriver.ExecContext(ctx, vacuumSQL); err != nil {
+		return fmt.Errorf("failed to execute %s: %w", vacuumSQL, err)
+	}
+
+	duration := time.Since(startTime)
+	log.Info(ctx, "Database VACUUM completed successfully",
+		log.Duration("duration", duration),
+		log.String("command", vacuumSQL))
+
 	return nil
+}
+
+// RunVacuumNow manually triggers the VACUUM operation.
+func (w *Worker) RunVacuumNow(ctx context.Context) error {
+	return w.runVacuum(ctx)
+}
+
+// RunCleanupNow manually triggers the cleanup process with the specified days.
+func (w *Worker) RunCleanupNow(ctx context.Context, input TriggerGcCleanupInput) error {
+	manualDays := make(map[string]int)
+	if input.RequestsCleanupDays > 0 {
+		manualDays[biz.CleanupResourceRequests] = input.RequestsCleanupDays
+	}
+	if input.UsageLogsCleanupDays > 0 {
+		manualDays[biz.CleanupResourceUsageLogs] = input.UsageLogsCleanupDays
+	}
+	if input.RequestBodiesCleanupDays > 0 {
+		manualDays[biz.CleanupResourceRequestBodies] = input.RequestBodiesCleanupDays
+	}
+	if input.ResponseBodiesCleanupDays > 0 {
+		manualDays[biz.CleanupResourceResponseBodies] = input.ResponseBodiesCleanupDays
+	}
+	if input.ResponseChunksCleanupDays > 0 {
+		manualDays[biz.CleanupResourceResponseChunks] = input.ResponseChunksCleanupDays
+	}
+	w.runCleanup(ctx, true, manualDays)
+	return nil
+}
+
+// PreviewCleanup estimates how many records would be deleted without actually deleting them.
+func (w *Worker) PreviewCleanup(ctx context.Context, input TriggerGcCleanupInput) ([]GcCleanupPreviewItem, error) {
+	ctx = ent.NewContext(ctx, w.Ent)
+	ctx = schematype.SkipSoftDelete(ctx)
+
+	var items []GcCleanupPreviewItem
+	now := time.Now()
+
+	if input.RequestsCleanupDays > 0 {
+		cutoff := now.AddDate(0, 0, -input.RequestsCleanupDays)
+		count, err := w.Ent.Request.Query().Where(
+			request.CreatedAtLT(cutoff),
+			request.Not(request.HasTraceWith(trace.StatusEQ(trace.StatusRetained))),
+		).Count(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("failed to count requests for preview: %w", err)
+		}
+		items = append(items, GcCleanupPreviewItem{
+			ResourceType:   biz.CleanupResourceRequests,
+			EstimatedCount: count,
+			CutoffTime:     cutoff,
+			RetentionDays:  input.RequestsCleanupDays,
+		})
+	}
+
+	if input.UsageLogsCleanupDays > 0 {
+		cutoff := now.AddDate(0, 0, -input.UsageLogsCleanupDays)
+		count, err := w.Ent.UsageLog.Query().Where(
+			usagelog.CreatedAtLT(cutoff),
+			usagelog.Not(usagelog.HasRequestWith(
+				request.HasTraceWith(trace.StatusEQ(trace.StatusRetained)),
+			)),
+		).Count(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("failed to count usage logs for preview: %w", err)
+		}
+		items = append(items, GcCleanupPreviewItem{
+			ResourceType:   biz.CleanupResourceUsageLogs,
+			EstimatedCount: count,
+			CutoffTime:     cutoff,
+			RetentionDays:  input.UsageLogsCleanupDays,
+		})
+	}
+
+	bodySpecs := []struct {
+		resourceType string
+		days         int
+	}{
+		{biz.CleanupResourceRequestBodies, input.RequestBodiesCleanupDays},
+		{biz.CleanupResourceResponseBodies, input.ResponseBodiesCleanupDays},
+		{biz.CleanupResourceResponseChunks, input.ResponseChunksCleanupDays},
+	}
+	bodyWindows := make(map[int]GcCleanupPreviewItem, 3)
+
+	for _, spec := range bodySpecs {
+		if spec.days <= 0 {
+			continue
+		}
+
+		item, ok := bodyWindows[spec.days]
+		if !ok {
+			var err error
+
+			item, err = w.previewBodyCleanup(ctx, spec.resourceType, spec.days, now)
+			if err != nil {
+				return nil, err
+			}
+
+			bodyWindows[spec.days] = item
+		}
+
+		item.ResourceType = spec.resourceType
+		items = append(items, item)
+	}
+
+	return items, nil
 }

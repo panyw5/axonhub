@@ -95,6 +95,15 @@ type Request struct {
 
 	// Verbosity constrains response verbosity.
 	Verbosity *string `json:"verbosity,omitempty"`
+
+	// Thinking controls reasoning/thinking behavior (used by DeepSeek and compatible providers).
+	Thinking *Thinking `json:"thinking,omitempty"`
+}
+
+// Thinking represents the thinking configuration for reasoning models.
+type Thinking struct {
+	// Type is "enabled" or "disabled".
+	Type string `json:"type"`
 }
 
 // StreamOptions for streaming responses.
@@ -104,6 +113,8 @@ type StreamOptions struct {
 
 // Stop represents stop sequences.
 type Stop struct {
+	// Stop and MultipleStop are mutually exclusive representations of the same field.
+	// If both are populated, Stop takes precedence during marshaling.
 	Stop         *string
 	MultipleStop []string
 }
@@ -126,6 +137,8 @@ func (s *Stop) UnmarshalJSON(data []byte) error {
 	err := json.Unmarshal(data, &str)
 	if err == nil {
 		s.Stop = &str
+		s.MultipleStop = nil
+
 		return nil
 	}
 
@@ -133,7 +146,9 @@ func (s *Stop) UnmarshalJSON(data []byte) error {
 
 	err = json.Unmarshal(data, &strs)
 	if err == nil {
+		s.Stop = nil
 		s.MultipleStop = strs
+
 		return nil
 	}
 
@@ -160,15 +175,25 @@ type Message struct {
 	// ReasoningContent for deepseek-reasoner support.
 	ReasoningContent *string `json:"reasoning_content,omitempty"`
 
+	// Reasoning is used by some providers (e.g., Synthetic) instead of reasoning_content.
+	Reasoning *string `json:"reasoning,omitempty"`
+
 	// Annotations contains citation information for the message.
 	// This is used by providers like Perplexity to provide source URLs.
 	Annotations []Annotation `json:"annotations,omitempty"`
+
+	// Audio contains model-generated audio metadata for assistant messages.
+	Audio *OutputAudio `json:"audio,omitempty"`
 }
 
 // Annotation represents a citation or reference annotation in a message.
 type Annotation struct {
 	// Type is the type of annotation, e.g., "url_citation"
 	Type string `json:"type,omitempty"`
+	// StartIndex is the start byte offset of the annotated span in the message content.
+	StartIndex *int64 `json:"start_index,omitempty"`
+	// EndIndex is the end byte offset of the annotated span in the message content.
+	EndIndex *int64 `json:"end_index,omitempty"`
 	// URLCitation contains URL citation details when Type is "url_citation"
 	URLCitation *URLCitation `json:"url_citation,omitempty"`
 }
@@ -183,6 +208,8 @@ type URLCitation struct {
 
 // MessageContent represents message content (string or array of parts).
 type MessageContent struct {
+	// Content and MultipleContent are mutually exclusive representations of the same payload.
+	// If both are populated, MultipleContent takes precedence during marshaling.
 	Content         *string              `json:"content,omitempty"`
 	MultipleContent []MessageContentPart `json:"multiple_content,omitempty"`
 }
@@ -212,6 +239,8 @@ func (c *MessageContent) UnmarshalJSON(data []byte) error {
 	err := json.Unmarshal(data, &str)
 	if err == nil {
 		c.Content = &str
+		c.MultipleContent = nil
+
 		return nil
 	}
 
@@ -219,19 +248,29 @@ func (c *MessageContent) UnmarshalJSON(data []byte) error {
 
 	err = json.Unmarshal(data, &parts)
 	if err == nil {
+		c.Content = nil
 		c.MultipleContent = parts
+
 		return nil
 	}
 
 	return errors.New("invalid content type")
 }
 
-// MessageContentPart represents different types of content (text, image, etc.)
+// MessageContentPart represents different types of content (text, image, video, etc.)
 type MessageContentPart struct {
-	Type     string    `json:"type"`
-	Text     *string   `json:"text,omitempty"`
-	ImageURL *ImageURL `json:"image_url,omitempty"`
-	Audio    *Audio    `json:"audio,omitempty"`
+	Type       string      `json:"type"`
+	Text       *string     `json:"text,omitempty"`
+	ImageURL   *ImageURL   `json:"image_url,omitempty"`
+	VideoURL   *VideoURL   `json:"video_url,omitempty"`
+	InputAudio *InputAudio `json:"input_audio,omitempty"`
+	File       *File       `json:"file,omitempty"`
+}
+
+type File struct {
+	FileData string `json:"file_data,omitempty"`
+	FileID   string `json:"file_id,omitempty"`
+	Filename string `json:"filename,omitempty"`
 }
 
 // ImageURL represents an image URL with optional detail level.
@@ -240,10 +279,26 @@ type ImageURL struct {
 	Detail *string `json:"detail,omitempty"`
 }
 
-// Audio represents audio content.
-type Audio struct {
+// VideoURL represents a video URL.
+type VideoURL struct {
+	URL string `json:"url"`
+}
+
+// InputAudio represents audio content.
+type InputAudio struct {
+	// Format of the audio data, e.g., "wav" or "mp3".
 	Format string `json:"format"`
-	Data   string `json:"data"`
+
+	// Base64-encoded audio data.
+	Data string `json:"data"`
+}
+
+// OutputAudio contains model-generated audio metadata for assistant messages.
+type OutputAudio struct {
+	ID         string `json:"id,omitempty"`
+	Data       string `json:"data,omitempty"`
+	ExpiresAt  int64  `json:"expires_at,omitempty"`
+	Transcript string `json:"transcript,omitempty"`
 }
 
 // ResponseFormat specifies the format of the response.
@@ -334,8 +389,18 @@ type Function struct {
 
 // FunctionCall represents a function call.
 type FunctionCall struct {
-	Name      string `json:"name"`
+	Name      string `json:"name,omitempty"`
 	Arguments string `json:"arguments"`
+}
+
+// ToolCallExtraContent represents provider-specific extension fields for tool calls.
+type ToolCallExtraContent struct {
+	Google *ToolCallGoogleExtraContent `json:"google,omitempty"`
+}
+
+// ToolCallExtraFields represents wrapped extension fields used by some providers.
+type ToolCallExtraFields struct {
+	ExtraContent *ToolCallExtraContent `json:"extra_content,omitempty"`
 }
 
 // ToolCall represents a tool call in the response.
@@ -344,6 +409,10 @@ type ToolCall struct {
 	Type     string       `json:"type,omitempty"`
 	Function FunctionCall `json:"function"`
 	Index    int          `json:"index"`
+	// ExtraContent carries provider-specific extension fields, such as Gemini OpenAI thought signature.
+	ExtraContent *ToolCallExtraContent `json:"extra_content,omitempty"`
+	// ExtraFields is a compatibility wrapper for payloads that nest extra_content under extra_fields.
+	ExtraFields *ToolCallExtraFields `json:"extra_fields,omitempty"`
 }
 
 // ToolFunction represents a tool function reference.
@@ -355,6 +424,9 @@ type ToolFunction struct {
 type ToolChoice struct {
 	ToolChoice      *string          `json:"tool_choice,omitempty"`
 	NamedToolChoice *NamedToolChoice `json:"named_tool_choice,omitempty"`
+	// AllowedTools carries the mode and tool subset of an "allowed_tools"
+	// choice, which the Chat Completions wire nests under "allowed_tools".
+	AllowedTools *AllowedTools `json:"allowed_tools,omitempty"`
 }
 
 // NamedToolChoice represents a named tool choice.
@@ -363,7 +435,32 @@ type NamedToolChoice struct {
 	Function ToolFunction `json:"function"`
 }
 
+// AllowedTools is the nested object of an "allowed_tools" tool choice.
+// Each entry references a permitted tool with the same shape as a named choice.
+type AllowedTools struct {
+	Mode  *string           `json:"mode,omitempty"`
+	Tools []NamedToolChoice `json:"tools,omitempty"`
+}
+
+// allowedToolsToolChoiceJSON is the Chat Completions wire shape of an
+// "allowed_tools" choice; the mode and tool subset live in a nested object.
+type allowedToolsToolChoiceJSON struct {
+	Type         string        `json:"type"`
+	AllowedTools *AllowedTools `json:"allowed_tools"`
+}
+
 func (t ToolChoice) MarshalJSON() ([]byte, error) {
+	// An allowed_tools choice must keep the nested shape; marshaling it as a
+	// plain named choice would emit an empty function name and drop the subset.
+	if t.NamedToolChoice != nil && t.NamedToolChoice.Type == "allowed_tools" {
+		allowed := t.AllowedTools
+		if allowed == nil {
+			allowed = &AllowedTools{}
+		}
+
+		return json.Marshal(allowedToolsToolChoiceJSON{Type: "allowed_tools", AllowedTools: allowed})
+	}
+
 	if t.ToolChoice != nil {
 		return json.Marshal(t.ToolChoice)
 	}
@@ -377,6 +474,16 @@ func (t *ToolChoice) UnmarshalJSON(data []byte) error {
 	err := json.Unmarshal(data, &str)
 	if err == nil {
 		t.ToolChoice = &str
+		return nil
+	}
+
+	// An allowed_tools choice nests its mode and tool subset; decode it before
+	// the plain named shape, which would silently drop the nested object.
+	var allowed allowedToolsToolChoiceJSON
+	if err := json.Unmarshal(data, &allowed); err == nil && allowed.Type == "allowed_tools" && allowed.AllowedTools != nil {
+		t.NamedToolChoice = &NamedToolChoice{Type: allowed.Type}
+		t.AllowedTools = allowed.AllowedTools
+
 		return nil
 	}
 

@@ -2,6 +2,7 @@ package objects
 
 import (
 	"fmt"
+	"time"
 
 	"github.com/shopspring/decimal"
 )
@@ -17,9 +18,16 @@ const (
 	PricingModeUsagePerUnit PricingMode = "usage_per_unit"
 
 	// PricingModeTiered means the request is charged a fee based on the token usage tiers.
-	// e.g. a tier price is [1,000, 2,000, 3,000] for [$0.01, $0.02, $0.03], if the usage is 1,500 then the fee is
-	// $0.01 x 1000 + $0.02 x (1500-1000) = $20.00.
+	// Each tier segment is billed separately at its own rate.
+	// e.g. tiers are [{upTo: 1000, pricePerUnit: $0.01}, {upTo: nil, pricePerUnit: $0.02}],
+	// if usage is 1,500 then the fee is (1000/1e6)*$0.01 + (500/1e6)*$0.02.
 	PricingModeTiered PricingMode = "usage_tiered"
+
+	// PricingModeVolume means the request is charged a fee based on the token usage volume tiers.
+	// The tier matched by the total token count determines the unit price for ALL tokens.
+	// e.g. tiers are [{upTo: 1000, pricePerUnit: $0.01}, {upTo: nil, pricePerUnit: $0.02}],
+	// if usage is 1,500 then all tokens are billed at $0.02 => (1500/1e6)*$0.02.
+	PricingModeVolume PricingMode = "usage_volume"
 )
 
 type Pricing struct {
@@ -32,6 +40,8 @@ type Pricing struct {
 	UsagePerUnit *decimal.Decimal `json:"usagePerUnit,omitempty"`
 
 	// UsageTiered is the tiered pricing for the pricing.
+	// Used by both UsageTiered and UsageVolume modes — they share the same data structure
+	// but differ in calculation logic.
 	UsageTiered *TieredPricing `json:"usageTiered,omitempty"`
 }
 
@@ -61,7 +71,7 @@ func (p *Pricing) Equals(other *Pricing) bool {
 		if p.UsagePerUnit != nil && !p.UsagePerUnit.Equal(*other.UsagePerUnit) {
 			return false
 		}
-	case PricingModeTiered:
+	case PricingModeTiered, PricingModeVolume:
 		return p.UsageTiered.Equals(other.UsageTiered)
 	}
 
@@ -82,7 +92,7 @@ func (p *Pricing) Validate() error {
 		if p.UsagePerUnit == nil {
 			return fmt.Errorf("usagePerUnit is required")
 		}
-	case PricingModeTiered:
+	case PricingModeTiered, PricingModeVolume:
 		if p.UsageTiered == nil {
 			return fmt.Errorf("usageTiered is required")
 		}
@@ -163,6 +173,12 @@ func (p *ModelPrice) Validate() error {
 	for idx := range p.Items {
 		if err := p.Items[idx].Validate(); err != nil {
 			return fmt.Errorf("items[%d]: %w", idx, err)
+		}
+	}
+
+	if p.Schedule != nil {
+		if err := p.Schedule.Validate(); err != nil {
+			return fmt.Errorf("schedule: %w", err)
 		}
 	}
 
@@ -319,6 +335,9 @@ func (i *ModelPriceItem) Equals(other *ModelPriceItem) bool {
 type ModelPrice struct {
 	// Items is the list of price items for the price.
 	Items []ModelPriceItem `json:"items"`
+
+	// Schedule is the optional time-based price override configuration.
+	Schedule *PriceSchedule `json:"schedule,omitempty"`
 }
 
 func (p *ModelPrice) Equals(other ModelPrice) bool {
@@ -332,5 +351,314 @@ func (p *ModelPrice) Equals(other ModelPrice) bool {
 		}
 	}
 
+	if (p.Schedule == nil) != (other.Schedule == nil) {
+		return false
+	}
+
+	if p.Schedule != nil && !p.Schedule.Equals(other.Schedule) {
+		return false
+	}
+
 	return true
+}
+
+// PriceSchedule defines time-based price override configuration.
+type PriceSchedule struct {
+	// Timezone is the IANA timezone name, e.g. "Asia/Shanghai".
+	Timezone string `json:"timezone"`
+
+	// Overrides is the list of time-based price override rules.
+	Overrides []PriceOverride `json:"overrides"`
+}
+
+func (s *PriceSchedule) Equals(other *PriceSchedule) bool {
+	if s == nil || other == nil {
+		return s == other
+	}
+
+	if s.Timezone != other.Timezone {
+		return false
+	}
+
+	if len(s.Overrides) != len(other.Overrides) {
+		return false
+	}
+
+	for i := range s.Overrides {
+		if !s.Overrides[i].Equals(&other.Overrides[i]) {
+			return false
+		}
+	}
+
+	return true
+}
+
+func (s *PriceSchedule) Validate() error {
+	if s == nil {
+		return nil
+	}
+
+	if s.Timezone == "" {
+		return fmt.Errorf("schedule timezone is required")
+	}
+
+	if _, err := time.LoadLocation(s.Timezone); err != nil {
+		return fmt.Errorf("invalid timezone: %s", s.Timezone)
+	}
+
+	if len(s.Overrides) == 0 {
+		return fmt.Errorf("schedule overrides is required")
+	}
+
+	for i, o := range s.Overrides {
+		if err := o.Validate(); err != nil {
+			return fmt.Errorf("overrides[%d]: %w", i, err)
+		}
+	}
+
+	return nil
+}
+
+// PriceOverride defines a single time-based price override rule.
+type PriceOverride struct {
+	// Name is the human-readable name for this override, e.g. "Night Discount".
+	Name string `json:"name"`
+
+	// Priority determines the order of evaluation. Lower values have higher priority.
+	Priority int `json:"priority"`
+
+	// When defines the conditions for this override to take effect.
+	When OverrideWhen `json:"when"`
+
+	// Items is the price configuration to use when this override is active.
+	Items []ModelPriceItem `json:"items"`
+}
+
+func (o *PriceOverride) Equals(other *PriceOverride) bool {
+	if o == nil || other == nil {
+		return o == other
+	}
+
+	if o.Name != other.Name {
+		return false
+	}
+
+	if o.Priority != other.Priority {
+		return false
+	}
+
+	if !o.When.Equals(&other.When) {
+		return false
+	}
+
+	if len(o.Items) != len(other.Items) {
+		return false
+	}
+
+	for i := range o.Items {
+		if !o.Items[i].Equals(&other.Items[i]) {
+			return false
+		}
+	}
+
+	return true
+}
+
+func (o *PriceOverride) Validate() error {
+	if o == nil {
+		return nil
+	}
+
+	if err := o.When.Validate(); err != nil {
+		return fmt.Errorf("when: %w", err)
+	}
+
+	if len(o.Items) == 0 {
+		return fmt.Errorf("items is required")
+	}
+
+	for j, item := range o.Items {
+		if err := item.Validate(); err != nil {
+			return fmt.Errorf("items[%d]: %w", j, err)
+		}
+	}
+
+	return nil
+}
+
+// OverrideWhen defines the conditions for a price override to take effect.
+type OverrideWhen struct {
+	// DailyTime is the daily time range with structured start/end times.
+	DailyTime *DailyTimeRange `json:"dailyTime,omitempty"`
+
+	// Weekdays is the list of weekdays (1=Monday, 7=Sunday) when the override is active.
+	Weekdays []int `json:"weekdays,omitempty"`
+
+	// DateRange is the date range when the override is active.
+	DateRange *DateRange `json:"dateRange,omitempty"`
+}
+
+func (w *OverrideWhen) Equals(other *OverrideWhen) bool {
+	if w == nil || other == nil {
+		return w == other
+	}
+
+	if (w.DailyTime == nil) != (other.DailyTime == nil) {
+		return false
+	}
+
+	if w.DailyTime != nil && !w.DailyTime.Equals(other.DailyTime) {
+		return false
+	}
+
+	if len(w.Weekdays) != len(other.Weekdays) {
+		return false
+	}
+
+	for i := range w.Weekdays {
+		if w.Weekdays[i] != other.Weekdays[i] {
+			return false
+		}
+	}
+
+	if (w.DateRange == nil) != (other.DateRange == nil) {
+		return false
+	}
+
+	if w.DateRange != nil && !w.DateRange.Equals(other.DateRange) {
+		return false
+	}
+
+	return true
+}
+
+func (w *OverrideWhen) Validate() error {
+	if w == nil {
+		return fmt.Errorf("when is required")
+	}
+
+	if w.DailyTime == nil && len(w.Weekdays) == 0 && w.DateRange == nil {
+		return fmt.Errorf("at least one condition (dailyTime, weekdays, or dateRange) is required")
+	}
+
+	if w.DailyTime != nil {
+		if err := w.DailyTime.Validate(); err != nil {
+			return fmt.Errorf("dailyTime: %w", err)
+		}
+	}
+
+	for i, d := range w.Weekdays {
+		if d < 1 || d > 7 {
+			return fmt.Errorf("weekdays[%d] must be between 1 and 7, got %d", i, d)
+		}
+	}
+
+	if w.DateRange != nil {
+		if err := w.DateRange.Validate(); err != nil {
+			return fmt.Errorf("dateRange: %w", err)
+		}
+	}
+
+	return nil
+}
+
+// DailyTimeRange defines a daily time range.
+// Start and End are in "HH:mm" format (e.g. "03:00", "18:30").
+type DailyTimeRange struct {
+	// Start is the start time in "HH:mm" format.
+	Start string `json:"start"`
+
+	// End is the end time in "HH:mm" format.
+	End string `json:"end"`
+}
+
+func (d *DailyTimeRange) Equals(other *DailyTimeRange) bool {
+	if d == nil || other == nil {
+		return d == other
+	}
+
+	return d.Start == other.Start && d.End == other.End
+}
+
+func (d *DailyTimeRange) Validate() error {
+	if d == nil {
+		return nil
+	}
+
+	if err := validateDailyTime(d.Start); err != nil {
+		return fmt.Errorf("start: %w", err)
+	}
+
+	if err := validateDailyTime(d.End); err != nil {
+		return fmt.Errorf("end: %w", err)
+	}
+
+	return nil
+}
+
+// validateDailyTime checks that a string is in "HH:mm" format with valid hour (0-23) and minute (0-59).
+func validateDailyTime(s string) error {
+	if len(s) != 5 || s[2] != ':' {
+		return fmt.Errorf("invalid time format %q, expected \"HH:mm\"", s)
+	}
+
+	hour := int(s[0]-'0')*10 + int(s[1]-'0')
+	minute := int(s[3]-'0')*10 + int(s[4]-'0')
+
+	if hour < 0 || hour > 23 {
+		return fmt.Errorf("hour must be between 0 and 23, got %d", hour)
+	}
+
+	if minute < 0 || minute > 59 {
+		return fmt.Errorf("minute must be between 0 and 59, got %d", minute)
+	}
+
+	return nil
+}
+
+// DateRange defines a date range.
+type DateRange struct {
+	// Start is the start date in "YYYY-MM-DD" format (inclusive).
+	Start string `json:"start"`
+
+	// End is the end date in "YYYY-MM-DD" format (inclusive).
+	End string `json:"end"`
+}
+
+func (d *DateRange) Equals(other *DateRange) bool {
+	if d == nil || other == nil {
+		return d == other
+	}
+
+	return d.Start == other.Start && d.End == other.End
+}
+
+func (d *DateRange) Validate() error {
+	if d == nil {
+		return nil
+	}
+
+	if d.Start == "" {
+		return fmt.Errorf("start is required")
+	}
+
+	if d.End == "" {
+		return fmt.Errorf("end is required")
+	}
+
+	start, err := time.Parse("2006-01-02", d.Start)
+	if err != nil {
+		return fmt.Errorf("invalid start date format: %s", d.Start)
+	}
+
+	end, err := time.Parse("2006-01-02", d.End)
+	if err != nil {
+		return fmt.Errorf("invalid end date format: %s", d.End)
+	}
+
+	if end.Before(start) {
+		return fmt.Errorf("end date must be after or equal to start date")
+	}
+
+	return nil
 }

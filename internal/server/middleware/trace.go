@@ -5,16 +5,19 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"regexp"
 	"strings"
 
 	"github.com/gin-gonic/gin"
 	"github.com/tidwall/gjson"
 
+	"github.com/looplj/axonhub/internal/authz"
 	"github.com/looplj/axonhub/internal/contexts"
 	"github.com/looplj/axonhub/internal/log"
 	"github.com/looplj/axonhub/internal/server/biz"
 	"github.com/looplj/axonhub/internal/tracing"
+	"github.com/looplj/axonhub/llm/transformer/anthropic/claudecode"
+	"github.com/looplj/axonhub/llm/transformer/openai/codex"
+	"github.com/looplj/axonhub/llm/transformer/opencode"
 	"github.com/looplj/axonhub/llm/transformer/shared"
 )
 
@@ -76,6 +79,10 @@ func tryGetTraceIDFromBody(c *gin.Context, config tracing.Config) (string, error
 func WithTrace(config tracing.Config, traceService *biz.TraceService) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		traceID := getTraceIDFromHeader(c, config)
+		if traceID == "" && config.OpenCodeTraceEnabled {
+			traceID = tryExtractTraceIDFromOpenCodeRequest(c)
+		}
+
 		if traceID == "" && config.ClaudeCodeTraceEnabled {
 			var err error
 
@@ -101,8 +108,22 @@ func WithTrace(config tracing.Config, traceService *biz.TraceService) gin.Handle
 		}
 
 		if traceID == "" {
+			// WithLoggingTracing creates an ID for log correlation, but that alone
+			// must not opt the request into persisted tracing. Only explicitly
+			// configured trace sources should create a trace record.
 			c.Next()
+
 			return
+		}
+
+		// The trace middleware can resolve a more specific ID from fallback headers
+		// or request bodies. Keep the request context in sync with that final value.
+		c.Request = c.Request.WithContext(tracing.WithTraceID(c.Request.Context(), traceID))
+
+		for _, header := range config.ResponseTraceHeaders {
+			if header = strings.TrimSpace(header); header != "" {
+				c.Header(header, traceID)
+			}
 		}
 
 		// Get project ID from context
@@ -112,14 +133,26 @@ func WithTrace(config tracing.Config, traceService *biz.TraceService) gin.Handle
 			return
 		}
 
+		// Tool endpoints such as embeddings carry a trace ID header from generic API
+		// clients but are not conversation turns: keep the resolved trace ID and
+		// response headers for client correlation, but never persist a trace for them.
+		if isNonMessageEndpoint(c.Request.URL.Path) {
+			c.Next()
+
+			return
+		}
+
 		// Get thread ID from context if available
 		var threadID *int
 		if thread, ok := contexts.GetThread(c.Request.Context()); ok && thread != nil {
 			threadID = &thread.ID
 		}
 
+		// Bypass privacy policy so tokens without write_requests scope can still trigger tracing.
+		bypassCtx := authz.WithSystemBypass(c.Request.Context(), "trace-middleware")
+
 		// Get or create trace (errors are logged but don't block the request)
-		trace, err := traceService.GetOrCreateTrace(c.Request.Context(), projectID, traceID, threadID)
+		trace, err := traceService.GetOrCreateTrace(bypassCtx, projectID, traceID, threadID)
 		if err != nil {
 			log.Warn(c.Request.Context(), "Failed to get or create trace", log.Cause(err))
 			c.Next()
@@ -171,47 +204,56 @@ func tryExtractTraceIDFromClaudeCodeRequest(c *gin.Context, config tracing.Confi
 		return "", nil
 	}
 
-	traceID := extractClaudeTraceID(userID)
-	if traceID == "" {
+	uid := claudecode.ParseUserID(userID)
+	if uid == nil {
 		return "", nil
 	}
+
+	traceID := uid.SessionID
 
 	log.Debug(c.Request.Context(), "Extracted trace ID from claude code payload", log.String("trace_id", traceID))
 
 	return traceID, nil
 }
 
-var claudeUserIDPattern = regexp.MustCompile(`(?i)^user_[0-9a-f]{64}_account__session_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
-
-const codexTraceHeader = "Session_id"
-
-// extractClaudeTraceID parses the Claude Code user ID format to extract the session ID
-// which is used as the trace ID.
-func extractClaudeTraceID(userID string) string {
-	if !claudeUserIDPattern.MatchString(userID) {
-		return ""
-	}
-
-	traceID := userID
-	if idx := strings.LastIndex(traceID, "__"); idx >= 0 && idx+2 < len(traceID) {
-		traceID = traceID[idx+2:]
-	}
-
-	if idx := strings.LastIndex(traceID, "_"); idx >= 0 && idx+1 < len(traceID) {
-		traceID = traceID[idx+1:]
-	}
-
-	return strings.TrimSpace(traceID)
-}
-
-// tryExtractTraceIDFromCodexRequest extracts the trace ID from the Codex session header.
-func tryExtractTraceIDFromCodexRequest(c *gin.Context) string {
-	traceID := strings.TrimSpace(c.GetHeader(codexTraceHeader))
+// tryExtractTraceIDFromOpenCodeRequest extracts the trace ID from OpenCode session headers.
+func tryExtractTraceIDFromOpenCodeRequest(c *gin.Context) string {
+	traceID := opencode.GetSessionIDFromHeaders(c.Request.Header)
 	if traceID == "" {
 		return ""
 	}
 
-	log.Debug(c.Request.Context(), "Extracted trace ID from codex header", log.String("trace_id", traceID))
+	log.Debug(c.Request.Context(), "Extracted trace ID from opencode header", log.String("trace_id", traceID))
 
 	return traceID
+}
+
+// tryExtractTraceIDFromCodexRequest extracts the trace ID from the Codex session header.
+func tryExtractTraceIDFromCodexRequest(c *gin.Context) string {
+	traceID := codex.GetSessionIDFromHeaders(c.Request.Header)
+	if traceID == "" {
+		return ""
+	}
+
+	traceSource := "codex header"
+	if strings.TrimSpace(c.GetHeader(codex.SessionHeader)) == "" {
+		traceSource = "codex turn metadata"
+	}
+	log.Debug(c.Request.Context(), "Extracted trace ID from "+traceSource, log.String("trace_id", traceID))
+
+	return traceID
+}
+
+// isNonMessageEndpoint reports whether the request targets an endpoint whose
+// payload is not message-shaped (e.g. /v1/embeddings). Such requests may carry
+// a trace ID header from generic API clients, but must not create a persisted
+// trace: they are tool calls rather than conversation turns and have no
+// displayable content in the trace UI.
+func isNonMessageEndpoint(path string) bool {
+	if strings.HasSuffix(path, "/embeddings") {
+		return true
+	}
+
+	// Gemini serves embeddings through model actions instead of an /embeddings path.
+	return strings.Contains(path, ":embedContent") || strings.Contains(path, ":batchEmbedContents")
 }

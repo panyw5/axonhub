@@ -9,57 +9,30 @@ import (
 	"time"
 
 	"github.com/spf13/afero"
-	"github.com/zhenzou/executors"
 
 	"github.com/looplj/axonhub/internal/ent"
-	"github.com/looplj/axonhub/internal/ent/privacy"
+	"github.com/looplj/axonhub/internal/ent/datastorage"
 	"github.com/looplj/axonhub/internal/log"
 	"github.com/looplj/axonhub/internal/server/biz"
+	"github.com/looplj/axonhub/internal/server/scheduler"
 )
 
-func (svc *BackupService) Start(ctx context.Context) error {
-	return svc.runBackupPeriodic(ctx)
+// Reschedule cancels and re-creates the backup cron job. Call after the
+// system timezone or backup settings change.
+func (svc *BackupService) Reschedule(ctx context.Context, s *scheduler.Scheduler) {
+	tz := svc.systemService.TimeLocation(ctx).String()
+	if err := s.Reschedule(ctx, "backup", scheduler.TaskSpec{
+		Name:        "backup",
+		Description: "Auto backup to configured data storage",
+		CronExpr:    "0 2 * * *",
+		Timezone:    tz,
+	}); err != nil {
+		log.Error(ctx, "Failed to reschedule backup cron", log.Cause(err))
+	}
 }
 
-func (svc *BackupService) Stop(ctx context.Context) error {
-	if svc.cancelFunc != nil {
-		svc.cancelFunc()
-	}
-
-	if svc.executor == nil {
-		return nil
-	}
-
-	return svc.executor.Shutdown(ctx)
-}
-
-func (svc *BackupService) runBackupPeriodic(ctx context.Context) error {
-	if svc.cancelFunc != nil {
-		return nil
-	}
-
-	cronExpr := "0 2 * * *" // Always run daily at 2 AM
-
-	cancelFunc, err := svc.executor.ScheduleFuncAtCronRate(
-		svc.runBackup,
-		executors.CRONRule{Expr: cronExpr},
-	)
-	if err != nil {
-		return fmt.Errorf("failed to schedule backup: %w", err)
-	}
-
-	svc.cancelFunc = cancelFunc
-
-	log.Info(ctx, "Auto backup scheduled", log.String("cron", cronExpr))
-
-	return nil
-}
-
-func (svc *BackupService) runBackup(ctx context.Context) {
-	log.Info(ctx, "Checking if backup is needed")
-
+func (svc *BackupService) triggerAutoBackup(ctx context.Context) {
 	ctx = ent.NewContext(ctx, svc.db)
-	ctx = privacy.DecisionContext(ctx, privacy.Allow)
 
 	settings, err := svc.systemService.AutoBackupSettings(ctx)
 	if err != nil {
@@ -74,8 +47,9 @@ func (svc *BackupService) runBackup(ctx context.Context) {
 
 	if !svc.shouldRunBackup(time.Now(), settings) {
 		log.Info(ctx, "Backup not needed based on frequency",
-			log.String("frequency", string(settings.Frequency)))
-
+			log.String("frequency",
+				string(settings.Frequency)),
+		)
 		return
 	}
 
@@ -107,7 +81,6 @@ func (svc *BackupService) shouldRunBackup(now time.Time, settings *biz.AutoBacku
 	case biz.BackupFrequencyMonthly:
 		return now.Day() == 1
 	default:
-		// Unknown frequency, default to daily to be safe.
 		return true
 	}
 }
@@ -119,28 +92,56 @@ func (svc *BackupService) performBackup(ctx context.Context, settings *biz.AutoB
 	}
 
 	opts := BackupOptions{
-		IncludeChannels:    settings.IncludeChannels,
-		IncludeModels:      settings.IncludeModels,
-		IncludeAPIKeys:     settings.IncludeAPIKeys,
-		IncludeModelPrices: settings.IncludeModelPrices,
-	}
-
-	data, err := svc.BackupWithoutAuth(ctx, opts)
-	if err != nil {
-		return fmt.Errorf("failed to create backup: %w", err)
+		IncludeSystemConfigs: settings.IncludeSystemConfigs,
+		IncludeChannels:      settings.IncludeChannels,
+		IncludeModels:        settings.IncludeModels,
+		IncludeAPIKeys:       settings.IncludeAPIKeys,
+		IncludeModelPrices:   settings.IncludeModelPrices,
+		IncludeUsageStats:    settings.IncludeUsageStats,
+		IncludeRequestLogs:   settings.IncludeRequestLogs,
 	}
 
 	timestamp := time.Now().Format("2006-01-02_15-04-05")
 	filename := fmt.Sprintf("axonhub-backup-%s.json", timestamp)
 
-	if _, err := svc.dataStorageService.SaveData(ctx, ds, filename, data); err != nil {
-		return fmt.Errorf("failed to write backup file: %w", err)
-	}
+	if ds.Type == datastorage.TypeDatabase {
+		data, err := svc.doBackup(ctx, opts)
+		if err != nil {
+			return fmt.Errorf("failed to create backup: %w", err)
+		}
+		if err := svc.dataStorageService.SaveData(ctx, ds, filename, data); err != nil {
+			return fmt.Errorf("failed to write backup file: %w", err)
+		}
+		log.Info(ctx, "Backup uploaded to storage",
+			log.String("path", filename),
+			log.Int("size", len(data)),
+		)
+	} else {
+		f, err := os.CreateTemp("", "axonhub-backup-*.json")
+		if err != nil {
+			return fmt.Errorf("failed to create temp backup file: %w", err)
+		}
+		tmpPath := f.Name()
+		defer os.Remove(tmpPath)
 
-	log.Info(ctx, "Backup uploaded to storage",
-		log.String("path", filename),
-		log.Int("size", len(data)),
-	)
+		if err := svc.doBackupToWriter(ctx, opts, f); err != nil {
+			f.Close()
+			return fmt.Errorf("failed to create backup: %w", err)
+		}
+		if _, err := f.Seek(0, 0); err != nil {
+			f.Close()
+			return fmt.Errorf("failed to seek backup file: %w", err)
+		}
+		key, n, err := svc.dataStorageService.SaveDataFromReader(ctx, ds, filename, f)
+		f.Close()
+		if err != nil {
+			return fmt.Errorf("failed to write backup file: %w", err)
+		}
+		log.Info(ctx, "Backup uploaded to storage",
+			log.String("path", key),
+			log.Int64("size", n),
+		)
+	}
 
 	if settings.RetentionDays > 0 {
 		if err := svc.cleanupOldBackups(ctx, ds, settings.RetentionDays); err != nil {
@@ -196,6 +197,8 @@ func (svc *BackupService) cleanupOldBackups(ctx context.Context, ds *ent.DataSto
 
 // RunBackupNow triggers an immediate backup.
 func (svc *BackupService) RunBackupNow(ctx context.Context) error {
+	ctx = ent.NewContext(ctx, svc.db)
+
 	settings, err := svc.systemService.AutoBackupSettings(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to get auto backup settings: %w", err)
@@ -205,5 +208,15 @@ func (svc *BackupService) RunBackupNow(ctx context.Context) error {
 		return fmt.Errorf("data storage not configured for backup")
 	}
 
-	return svc.performBackup(ctx, settings)
+	err = svc.performBackup(ctx, settings)
+
+	var errMsg string
+	if err != nil {
+		errMsg = err.Error()
+	}
+	if updateErr := svc.systemService.UpdateAutoBackupLastRun(ctx, errMsg); updateErr != nil {
+		log.Error(ctx, "Failed to update auto backup status", log.Cause(updateErr))
+	}
+
+	return err
 }

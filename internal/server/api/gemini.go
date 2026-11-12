@@ -1,13 +1,14 @@
 package api
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 
-	"github.com/gin-contrib/sse"
 	"github.com/gin-gonic/gin"
 	"go.uber.org/fx"
 
+	entprivacy "github.com/looplj/axonhub/internal/ent/privacy"
 	"github.com/looplj/axonhub/internal/log"
 	"github.com/looplj/axonhub/internal/server/biz"
 	"github.com/looplj/axonhub/internal/server/orchestrator"
@@ -21,12 +22,17 @@ type GeminiHandlersParams struct {
 
 	ChannelService  *biz.ChannelService
 	ModelService    *biz.ModelService
+	DefaultSelector *orchestrator.DefaultSelector
 	RequestService  *biz.RequestService
 	SystemService   *biz.SystemService
 	UsageLogService *biz.UsageLogService
 	PromptService   *biz.PromptService
+	PromptProtectionRuleService *biz.PromptProtectionRuleService
 	QuotaService    *biz.QuotaService
 	HttpClient      *httpclient.HttpClient
+	LiveStreamRegistry *biz.LiveStreamRegistry
+	ChannelLimiterManager       *orchestrator.ChannelLimiterManager
+	ProviderQuotaStatusProvider orchestrator.ProviderQuotaStatusProvider
 }
 
 type GeminiHandlers struct {
@@ -40,7 +46,7 @@ func NewGeminiHandlers(params GeminiHandlersParams) *GeminiHandlers {
 		ChatCompletionHandlers: NewChatCompletionHandlers(
 			orchestrator.NewChatCompletionOrchestrator(
 				params.ChannelService,
-				params.ModelService,
+				params.DefaultSelector,
 				params.RequestService,
 				params.HttpClient,
 				gemini.NewInboundTransformer(),
@@ -48,6 +54,10 @@ func NewGeminiHandlers(params GeminiHandlersParams) *GeminiHandlers {
 				params.UsageLogService,
 				params.PromptService,
 				params.QuotaService,
+				params.PromptProtectionRuleService,
+				params.LiveStreamRegistry,
+				params.ChannelLimiterManager,
+				params.ProviderQuotaStatusProvider,
 			),
 		),
 		ChannelService: params.ChannelService,
@@ -59,7 +69,7 @@ func (handlers *GeminiHandlers) GenerateContent(c *gin.Context) {
 	alt := c.Query("alt")
 	switch alt {
 	case "sse":
-		handlers.ChatCompletionHandlers.WithStreamWriter(WriteGeminiSSEStream).ChatCompletion(c)
+		handlers.ChatCompletionHandlers.WithStreamWriter(WriteSSEStream).ChatCompletion(c)
 	default:
 		handlers.ChatCompletionHandlers.WithStreamWriter(WriteGeminiStream).ChatCompletion(c)
 	}
@@ -115,60 +125,6 @@ func WriteGeminiStream(c *gin.Context, stream streams.Stream[*httpclient.StreamE
 	}
 }
 
-// WriteGeminiSSEStream
-// Gemini js sdk need more whitespace after data: to work properly.
-// This prepends a space to each data payload to ensure compatibility.
-func WriteGeminiSSEStream(c *gin.Context, stream streams.Stream[*httpclient.StreamEvent]) {
-	ctx := c.Request.Context()
-	clientDisconnected := false
-
-	defer func() {
-		if clientDisconnected {
-			log.Warn(ctx, "Client disconnected")
-		}
-	}()
-
-	c.Header("Content-Type", sse.ContentType)
-	c.Header("Cache-Control", "no-cache")
-	c.Header("Connection", "keep-alive")
-
-	for {
-		select {
-		case <-ctx.Done():
-			clientDisconnected = true
-
-			log.Warn(ctx, "Context done, stopping stream")
-
-			return
-		default:
-			if stream.Next() {
-				cur := stream.Current()
-				c.SSEvent(cur.Type, prependSpace(cur.Data))
-				log.Debug(ctx, "write stream event", log.Any("event", cur))
-				c.Writer.Flush()
-			} else {
-				if stream.Err() != nil {
-					log.Error(ctx, "Error in stream", log.Cause(stream.Err()))
-					c.SSEvent("error", stream.Err())
-				}
-
-				c.Writer.Flush()
-
-				return
-			}
-		}
-	}
-}
-
-// prependSpace adds a leading space to the data payload for Gemini JS SDK compatibility.
-func prependSpace(b []byte) []byte {
-	result := make([]byte, len(b)+1)
-	result[0] = ' '
-	copy(result[1:], b)
-
-	return result
-}
-
 // GeminiModel represents a model in the list models response.
 type GeminiModel struct {
 	Name                       string   `json:"name"`
@@ -187,11 +143,18 @@ func (handlers *GeminiHandlers) ListModels(c *gin.Context) {
 
 	models, err := handlers.ModelService.ListEnabledModels(ctx)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gemini.GeminiError{
+		status := http.StatusInternalServerError
+		errorStatus := "internal_server_error"
+		if errors.Is(err, entprivacy.Deny) {
+			status = http.StatusForbidden
+			errorStatus = "permission_error"
+		}
+		_ = c.Error(err)
+		c.JSON(status, gemini.GeminiError{
 			Error: gemini.ErrorDetail{
 				Message: err.Error(),
-				Code:    http.StatusInternalServerError,
-				Status:  "internal_server_error",
+				Code:    status,
+				Status:  errorStatus,
 			},
 		})
 

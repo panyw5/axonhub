@@ -4,8 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"net/url"
 	"strings"
+
+	"github.com/samber/lo"
 
 	"github.com/looplj/axonhub/llm"
 	"github.com/looplj/axonhub/llm/httpclient"
@@ -23,27 +26,34 @@ const (
 // claudeCodeHeaders contains all headers to set for Claude Code requests.
 // Each entry is a [name, value] pair.
 var claudeCodeHeaders = [][]string{
-	{"Anthropic-Beta", "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14"},
-	{"Anthropic-Version", "2023-06-01"},
-	{"Anthropic-Dangerous-Direct-Browser-Access", "true"},
-	{"X-App", "cli"},
+	{"Anthropic-Beta", ClaudeCodeBetaHeader},
+	{"Anthropic-Version", ClaudeCodeVersionHeader},
+	{"Anthropic-Dangerous-Direct-Browser-Access", ClaudeCodeBrowserAccessHeader},
+	{"X-App", ClaudeCodeAppHeader},
 	{"X-Stainless-Helper-Method", "stream"},
 	{"X-Stainless-Retry-Count", "0"},
 	{"X-Stainless-Runtime-Version", "v24.3.0"},
-	{"X-Stainless-Package-Version", "0.55.1"},
+	{"X-Stainless-Package-Version", "0.94.0"},
 	{"X-Stainless-Runtime", "node"},
 	{"X-Stainless-Lang", "js"},
 	{"X-Stainless-Arch", "arm64"},
 	{"X-Stainless-Os", "MacOS"},
-	{"X-Stainless-Timeout", "60"},
-	{"Connection", "keep-alive"},
-	{"Accept-Encoding", "gzip, deflate, br, zstd"},
+	{"X-Stainless-Timeout", "600"},
 }
+
+// PassthroughHeaders lists headers that should be forwarded from inbound
+// requests to the upstream Anthropic API. Inbound values override defaults.
+var PassthroughHeaders = append(
+	lo.Map(claudeCodeHeaders, func(entry []string, _ int) string { return entry[0] }),
+	"X-Claude-Code-Session-Id",
+)
 
 // Params contains parameters for creating a ClaudeCodeTransformer.
 type Params struct {
-	TokenProvider oauth.TokenGetter // OAuth token provider (required)
-	BaseURL       string            // Base URL for the Anthropic API (optional)
+	TokenProvider   oauth.TokenGetter // OAuth token provider (required)
+	BaseURL         string            // Base URL for the Anthropic API (optional)
+	IsOfficial      bool              // Whether the channel uses official OAuth credentials
+	AccountIdentity string            // Stable channel identity for deterministic user_id (optional)
 }
 
 // NewOutboundTransformer creates a new ClaudeCodeTransformer with OAuth authentication.
@@ -67,8 +77,10 @@ func NewOutboundTransformer(params Params) (*ClaudeCodeTransformer, error) {
 	}
 
 	return &ClaudeCodeTransformer{
-		Outbound: outbound,
-		tokens:   params.TokenProvider,
+		Outbound:        outbound,
+		tokens:          params.TokenProvider,
+		isOfficial:      params.IsOfficial,
+		accountIdentity: params.AccountIdentity,
 	}, nil
 }
 
@@ -76,7 +88,10 @@ func NewOutboundTransformer(params Params) (*ClaudeCodeTransformer, error) {
 // It wraps an OutboundTransformer and adds Claude Code specific headers and system message.
 type ClaudeCodeTransformer struct {
 	transformer.Outbound
-	tokens oauth.TokenGetter
+
+	tokens          oauth.TokenGetter
+	isOfficial      bool
+	accountIdentity string
 }
 
 // TransformRequest overrides the base TransformRequest to add Claude Code specific modifications.
@@ -91,13 +106,12 @@ func (t *ClaudeCodeTransformer) TransformRequest(
 	rawUA := ""
 	keepClientUA := false
 
-	if llmReq.RawRequest != nil && llmReq.RawRequest.Headers != nil {
-		rawUA = llmReq.RawRequest.Headers.Get("User-Agent")
-		keepClientUA = isClaudeCLIUserAgent(rawUA)
+	var rawHeaders http.Header
 
-		for _, header := range claudeCodeHeaders {
-			llmReq.RawRequest.Headers.Del(header[0])
-		}
+	if llmReq.RawRequest != nil && llmReq.RawRequest.Headers != nil {
+		rawHeaders = llmReq.RawRequest.Headers
+		rawUA = rawHeaders.Get("User-Agent")
+		keepClientUA = isClaudeCLIUserAgent(rawUA)
 
 		if !keepClientUA {
 			llmReq.RawRequest.Headers.Del("User-Agent")
@@ -112,13 +126,16 @@ func (t *ClaudeCodeTransformer) TransformRequest(
 	if err != nil {
 		return nil, fmt.Errorf("failed to get oauth token: %w", err)
 	}
+
 	apiKey := creds.AccessToken
 
 	// Apply structured transformations before serialization
 	reqCopy = *disableThinkingIfToolChoiceForcedStructured(&reqCopy)
+
 	reqCopy = *injectClaudeCodeSystemMessageStructured(&reqCopy)
-	reqCopy = *injectFakeUserIDStructured(&reqCopy)
-	if isClaudeOAuthToken(apiKey) && !keepClientUA {
+
+	reqCopy = injectFakeUserIDStructured(ctx, reqCopy, t.accountIdentity)
+	if t.isOfficial && !keepClientUA {
 		reqCopy = *applyClaudeToolPrefixStructured(&reqCopy, toolPrefix)
 	}
 
@@ -126,27 +143,6 @@ func (t *ClaudeCodeTransformer) TransformRequest(
 	httpReq, err := t.Outbound.TransformRequest(ctx, &reqCopy)
 	if err != nil {
 		return nil, err
-	}
-
-	// Post-process: extract and merge betas (Anthropic-specific, not in llm.Request)
-	if len(httpReq.Body) > 0 {
-		bodyBytes := httpReq.Body
-
-		// Extract and remove betas array from body
-		extraBetas, bodyBytes := extractAndRemoveBetas(bodyBytes)
-
-		// Replace the body
-		httpReq.Body = bodyBytes
-
-		// Merge extra betas into Anthropic-Beta header
-		if len(extraBetas) > 0 {
-			baseBetas := httpReq.Headers.Get("Anthropic-Beta")
-			if baseBetas == "" {
-				baseBetas = claudeCodeHeaders[0][1] // Use default
-			}
-
-			httpReq.Headers.Set("Anthropic-Beta", mergeBetasIntoHeader(baseBetas, extraBetas))
-		}
 	}
 
 	// Add beta=true query parameter if not present
@@ -163,13 +159,27 @@ func (t *ClaudeCodeTransformer) TransformRequest(
 		httpReq.Metadata = make(map[string]string)
 	}
 
-	if isClaudeOAuthToken(apiKey) && !keepClientUA {
+	if t.isOfficial && !keepClientUA {
 		httpReq.Metadata["strip_tool_prefix"] = "true"
 	}
 
 	// Add/overwrite Claude Code specific headers
 	for _, header := range claudeCodeHeaders {
 		httpReq.Headers.Set(header[0], header[1])
+	}
+
+	// Passthrough inbound request headers, overriding defaults.
+	// Anthropic-Beta is merged instead of replaced to preserve required betas.
+	if rawHeaders != nil {
+		for _, header := range PassthroughHeaders {
+			if value := rawHeaders.Get(header); value != "" {
+				if header == "Anthropic-Beta" {
+					httpReq.Headers.Set(header, mergeBetasIntoHeader(httpReq.Headers.Get(header), []string{value}))
+				} else {
+					httpReq.Headers.Set(header, value)
+				}
+			}
+		}
 	}
 
 	// Set Accept header based on streaming
@@ -224,10 +234,11 @@ func (t *ClaudeCodeTransformer) TransformResponse(
 // TransformStream overrides the base TransformStream to strip tool prefixes from streaming responses.
 func (t *ClaudeCodeTransformer) TransformStream(
 	ctx context.Context,
+	req *httpclient.Request,
 	stream streams.Stream[*httpclient.StreamEvent],
 ) (streams.Stream[*llm.Response], error) {
 	// Call the base transformer to get the response stream
-	baseStream, err := t.Outbound.TransformStream(ctx, stream)
+	baseStream, err := t.Outbound.TransformStream(ctx, req, stream)
 	if err != nil {
 		return nil, err
 	}
@@ -275,6 +286,7 @@ func (s *toolPrefixStripperStream) Next() bool {
 	}
 
 	s.current = resp
+
 	return true
 }
 
@@ -292,7 +304,7 @@ func (s *toolPrefixStripperStream) Close() error {
 
 // AggregateStreamChunks overrides the base AggregateStreamChunks to strip tool prefixes from stream chunks.
 func (t *ClaudeCodeTransformer) AggregateStreamChunks(
-	ctx context.Context,
+	ctx context.Context, req *httpclient.Request,
 	chunks []*httpclient.StreamEvent,
 ) ([]byte, llm.ResponseMeta, error) {
 	// Note: We can't access request metadata here, so we blindly strip proxy_ prefix
@@ -309,7 +321,7 @@ func (t *ClaudeCodeTransformer) AggregateStreamChunks(
 	}
 
 	// Call the base transformer
-	return t.Outbound.AggregateStreamChunks(ctx, chunks)
+	return t.Outbound.AggregateStreamChunks(ctx, req, chunks)
 }
 
 // stripClaudeToolPrefixFromStreamLine removes the prefix from tool names in streaming events.

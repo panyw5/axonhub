@@ -123,6 +123,46 @@ type Tool struct {
 	UrlContext *UrlContext `json:"urlContext,omitempty"`
 }
 
+func (t *Tool) UnmarshalJSON(data []byte) error {
+	type toolAlias struct {
+		FunctionDeclarations      []*FunctionDeclaration `json:"functionDeclarations,omitempty"`
+		FunctionDeclarationsSnake []*FunctionDeclaration `json:"function_declarations,omitempty"`
+		CodeExecution             *CodeExecution         `json:"codeExecution,omitempty"`
+		CodeExecutionSnake        *CodeExecution         `json:"code_execution,omitempty"`
+		GoogleSearch              *GoogleSearch          `json:"googleSearch,omitempty"`
+		GoogleSearchSnake         *GoogleSearch          `json:"google_search,omitempty"`
+		UrlContext                *UrlContext            `json:"urlContext,omitempty"`
+		UrlContextSnake           *UrlContext            `json:"url_context,omitempty"`
+	}
+
+	var alias toolAlias
+	if err := json.Unmarshal(data, &alias); err != nil {
+		return err
+	}
+
+	t.FunctionDeclarations = alias.FunctionDeclarations
+	if len(t.FunctionDeclarations) == 0 {
+		t.FunctionDeclarations = alias.FunctionDeclarationsSnake
+	}
+
+	t.CodeExecution = alias.CodeExecution
+	if t.CodeExecution == nil {
+		t.CodeExecution = alias.CodeExecutionSnake
+	}
+
+	t.GoogleSearch = alias.GoogleSearch
+	if t.GoogleSearch == nil {
+		t.GoogleSearch = alias.GoogleSearchSnake
+	}
+
+	t.UrlContext = alias.UrlContext
+	if t.UrlContext == nil {
+		t.UrlContext = alias.UrlContextSnake
+	}
+
+	return nil
+}
+
 // FunctionDeclaration represents a function declaration.
 type FunctionDeclaration struct {
 	// Optional. Defines the function behavior.
@@ -179,7 +219,7 @@ type ToolConfig struct {
 
 // FunctionCallingConfig is the function calling config.
 type FunctionCallingConfig struct {
-	// Mode is the function calling mode. One of: AUTO, ANY, NONE.
+	// Mode is the function calling mode. One of: AUTO, ANY, NONE, VALIDATED.
 	Mode string `json:"mode,omitempty"`
 
 	// AllowedFunctionNames is the function names to call.
@@ -199,7 +239,12 @@ type GenerationConfig struct {
 	ResponseMIMEType string `json:"responseMimeType,omitempty"`
 
 	// ResponseSchema is the output schema of the generated candidate text.
+	// Uses the Gemini SDK's structured Schema type (OpenAPI 3.0 subset).
 	ResponseSchema json.RawMessage `json:"responseSchema,omitempty"`
+
+	// ResponseJsonSchema accepts a raw JSON Schema directly.
+	// When set, ResponseSchema must be omitted, but ResponseMIMEType is required.
+	ResponseJsonSchema json.RawMessage `json:"responseJsonSchema,omitempty"`
 
 	// CandidateCount is the number of generated responses to return.
 	CandidateCount int64 `json:"candidateCount,omitempty"`
@@ -420,6 +465,10 @@ type UsageMetadata struct {
 
 	// Output only. A detailed breakdown of the token count for each modality in the prompt.
 	PromptTokensDetails []*ModalityTokenCount `json:"promptTokensDetails,omitempty"`
+
+	// Cost is the request cost calculated by AxonHub from channel model prices.
+	// This is an AxonHub extension; official Gemini responses do not include it.
+	Cost *float64 `json:"cost,omitempty"`
 }
 
 type ModalityTokenCount struct {

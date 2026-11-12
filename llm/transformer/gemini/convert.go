@@ -5,8 +5,8 @@ import (
 
 	"github.com/samber/lo"
 
-	"github.com/looplj/axonhub/internal/pkg/xurl"
 	"github.com/looplj/axonhub/llm"
+	"github.com/looplj/axonhub/llm/internal/pkg/xurl"
 )
 
 func extractTextFromContent(content *Content) string {
@@ -136,8 +136,12 @@ func convertLLMFinishReasonToGemini(reason *string) string {
 	}
 }
 
-func convertImageURLToGeminiPart(url string) *Part {
-	if parsed := xurl.ParseDataURL(url); parsed != nil {
+func convertImageURLToGeminiPart(image *llm.ImageURL) *Part {
+	if image == nil || image.URL == "" {
+		return nil
+	}
+
+	if parsed := xurl.ParseDataURL(image.URL); parsed != nil {
 		return &Part{
 			InlineData: &Blob{
 				MIMEType: parsed.MediaType,
@@ -146,14 +150,65 @@ func convertImageURLToGeminiPart(url string) *Part {
 		}
 	}
 
-	// Regular URL - use FileData with MIME type detection
-	part := &Part{
+	return &Part{
 		FileData: &FileData{
-			FileURI: url,
+			FileURI:  image.URL,
+			MIMEType: imageMIMEType(image),
 		},
 	}
+}
 
-	return part
+func convertVideoURLToGeminiPart(video *llm.VideoURL) *Part {
+	if video == nil || video.URL == "" {
+		return nil
+	}
+
+	if parsed := xurl.ParseDataURL(video.URL); parsed != nil {
+		return &Part{
+			InlineData: &Blob{
+				MIMEType: parsed.MediaType,
+				Data:     parsed.Data,
+			},
+		}
+	}
+
+	return &Part{
+		FileData: &FileData{
+			FileURI:  video.URL,
+			MIMEType: mediaMIMEType(video.MIMEType, video.URL, isVideoMIMEType),
+		},
+	}
+}
+
+func convertAudioToGeminiPart(audio *llm.InputAudio) *Part {
+	if audio == nil {
+		return nil
+	}
+
+	if audio.Data != "" {
+		mimeType := audio.MIMEType
+		if mimeType == "" {
+			mimeType = audioFormatToMIMEType(audio.Format)
+		}
+
+		return &Part{
+			InlineData: &Blob{
+				MIMEType: mimeType,
+				Data:     audio.Data,
+			},
+		}
+	}
+
+	if audio.URL == "" {
+		return nil
+	}
+
+	return &Part{
+		FileData: &FileData{
+			FileURI:  audio.URL,
+			MIMEType: mediaMIMEType(audio.MIMEType, audio.URL, isAudioMIMEType),
+		},
+	}
 }
 
 // convertDocumentURLToGeminiPart converts a DocumentURL to a Gemini Part.
@@ -178,13 +233,10 @@ func convertDocumentURLToGeminiPart(doc *llm.DocumentURL) *Part {
 		}
 	}
 
-	// Regular URL - use FileData
-	mimeType := doc.MIMEType
-
 	return &Part{
 		FileData: &FileData{
 			FileURI:  doc.URL,
-			MIMEType: mimeType,
+			MIMEType: mediaMIMEType(doc.MIMEType, doc.URL, isDocumentMIMEType),
 		},
 	}
 }
@@ -203,6 +255,66 @@ func isDocumentMIMEType(mimeType string) bool {
 		strings.HasPrefix(mimeType, "application/vnd.openxmlformats-officedocument") ||
 		strings.HasPrefix(mimeType, "application/vnd.ms-") ||
 		strings.HasPrefix(mimeType, "text/")
+}
+
+func isVideoMIMEType(mimeType string) bool {
+	if mimeType == "" {
+		return false
+	}
+
+	return strings.HasPrefix(strings.ToLower(mimeType), "video/")
+}
+
+func isAudioMIMEType(mimeType string) bool {
+	if mimeType == "" {
+		return false
+	}
+
+	return strings.HasPrefix(strings.ToLower(mimeType), "audio/")
+}
+
+func audioFormatToMIMEType(format string) string {
+	switch strings.ToLower(format) {
+	case "wav", "wave", "x-wav":
+		return "audio/wav"
+	case "mpeg", "mpga":
+		return "audio/mpeg"
+	case "webm":
+		return "audio/webm"
+	case "ogg":
+		return "audio/ogg"
+	case "flac":
+		return "audio/flac"
+	case "aac":
+		return "audio/aac"
+	case "mp4", "m4a":
+		return "audio/mp4"
+	case "mp3":
+		fallthrough
+	default:
+		return "audio/mp3"
+	}
+}
+
+func audioMIMETypeToFormat(mimeType string) string {
+	switch strings.ToLower(mimeType) {
+	case "audio/wav", "audio/wave", "audio/x-wav":
+		return "wav"
+	case "audio/mpeg", "audio/mpga":
+		return "mp3"
+	case "audio/webm":
+		return "webm"
+	case "audio/ogg":
+		return "ogg"
+	case "audio/flac":
+		return "flac"
+	case "audio/aac":
+		return "aac"
+	case "audio/mp4", "audio/m4a":
+		return "mp4"
+	default:
+		return "mp3"
+	}
 }
 
 func convertGeminiFunctionCallingConfigToToolChoice(fcc *FunctionCallingConfig) *llm.ToolChoice {
@@ -225,6 +337,12 @@ func convertGeminiFunctionCallingConfigToToolChoice(fcc *FunctionCallingConfig) 
 			}
 		} else {
 			tc.ToolChoice = lo.ToPtr("required")
+			if len(fcc.AllowedFunctionNames) > 1 {
+				tc.NamedToolChoice = &llm.NamedToolChoice{Type: "allowed_tools"}
+				for _, name := range fcc.AllowedFunctionNames {
+					tc.Tools = append(tc.Tools, llm.ToolOption{Type: llm.ToolTypeFunction, Name: name})
+				}
+			}
 		}
 	case "NONE":
 		tc.ToolChoice = lo.ToPtr("none")
@@ -249,7 +367,7 @@ func convertLLMToolChoiceToGeminiToolConfig(tc *llm.ToolChoice) *ToolConfig {
 			fcc.Mode = "AUTO"
 		case "none":
 			fcc.Mode = "NONE"
-		case "required":
+		case "required", "any":
 			fcc.Mode = "ANY"
 		default:
 			fcc.Mode = "AUTO"
@@ -262,6 +380,14 @@ func convertLLMToolChoiceToGeminiToolConfig(tc *llm.ToolChoice) *ToolConfig {
 		}
 	} else {
 		fcc.Mode = "AUTO"
+	}
+
+	if fcc.Mode == "ANY" {
+		for _, tool := range tc.Tools {
+			if tool.Type == llm.ToolTypeFunction {
+				fcc.AllowedFunctionNames = append(fcc.AllowedFunctionNames, tool.Name)
+			}
+		}
 	}
 
 	return &ToolConfig{FunctionCallingConfig: fcc}
@@ -303,6 +429,7 @@ var defaultGeminiReasoningEffortMapping = map[string]int64{
 	"low":    1024,
 	"medium": 8192,
 	"high":   32768,
+	"xhigh":  32768,
 }
 
 func reasoningEffortToThinkingBudget(effort string) int64 {
@@ -403,6 +530,7 @@ func convertToGeminiUsage(chatUsage *llm.Usage) *UsageMetadata {
 		CachedContentTokenCount: 0,
 		ThoughtsTokenCount:      0,
 		CandidatesTokensDetails: nil,
+		Cost:                    chatUsage.Cost,
 	}
 
 	if chatUsage.PromptTokensDetails != nil {
@@ -433,4 +561,40 @@ func convertToGeminiUsage(chatUsage *llm.Usage) *UsageMetadata {
 	}
 
 	return usage
+}
+
+// TransformerMetadataKeySafetySettings is the key for storing SafetySettings in TransformerMetadata.
+const TransformerMetadataKeySafetySettings = "gemini_safety_settings"
+
+// extractSafetySettingsFromMetadata extracts SafetySettings from TransformerMetadata.
+func extractSafetySettingsFromMetadata(metadata map[string]any) []*SafetySetting {
+	if metadata == nil {
+		return nil
+	}
+
+	if rawSettings, ok := metadata[TransformerMetadataKeySafetySettings]; ok {
+		if settings, ok := rawSettings.([]*SafetySetting); ok && len(settings) > 0 {
+			return settings
+		}
+	}
+
+	return nil
+}
+
+// TransformerMetadataKeyImageConfig is the key for storing ImageConfig in TransformerMetadata.
+const TransformerMetadataKeyImageConfig = "gemini_image_config"
+
+// extractImageConfigFromMetadata extracts ImageConfig from TransformerMetadata.
+func extractImageConfigFromMetadata(metadata map[string]any) *ImageConfig {
+	if metadata == nil {
+		return nil
+	}
+
+	if rawConfig, ok := metadata[TransformerMetadataKeyImageConfig]; ok {
+		if config, ok := rawConfig.(*ImageConfig); ok {
+			return config
+		}
+	}
+
+	return nil
 }

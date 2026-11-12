@@ -9,6 +9,14 @@ export const ME_QUERY = `
       scopes
       preferLanguage
       avatar
+      hasPassword
+      oidcIdentities {
+        id
+        idpName
+        issuer
+        subject
+        email
+      }
       roles {
         name
       }
@@ -16,6 +24,7 @@ export const ME_QUERY = `
         projectID
         isOwner
         scopes
+        effectiveScopes
         roles {
           name
         }
@@ -23,6 +32,8 @@ export const ME_QUERY = `
     }
   }
 `;
+
+export const ME_QUERY_OPERATION_NAME = 'Me';
 
 export const USERS_QUERY = `
   query Users($first: Int, $after: Cursor, $orderBy: UserOrder, $where: UserWhereInput) {
@@ -159,6 +170,12 @@ export const UPDATE_USER_STATUS_MUTATION = `
   }
 `;
 
+export const DELETE_USER_MUTATION = `
+  mutation DeleteUser($id: ID!) {
+    deleteUser(id: $id)
+  }
+`;
+
 export const SIGN_IN_MUTATION = `
   mutation SignIn($input: SignInInput!) {
     signIn(input: $input) {
@@ -202,5 +219,17 @@ export const UPDATE_ME_MUTATION = `
       preferLanguage
       avatar
     }
+  }
+`;
+
+export const UPDATE_MY_PASSWORD_MUTATION = `
+  mutation UpdateMyPassword($input: UpdateMyPasswordInput!) {
+    updateMyPassword(input: $input)
+  }
+`;
+
+export const UNLINK_OIDC_IDENTITY_MUTATION = `
+  mutation UnlinkOIDCIdentity($id: ID!) {
+    unlinkOIDCIdentity(id: $id)
   }
 `;

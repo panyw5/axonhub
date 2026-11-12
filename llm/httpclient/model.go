@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strings"
 
 	"github.com/looplj/axonhub/llm/streams"
 )
@@ -33,6 +34,7 @@ type Request struct {
 	// Request tracking
 	RequestID string `json:"request_id"`
 	ClientIP  string `json:"client_ip"`
+	UserAgent string `json:"user_agent"`
 
 	// RequestType is the type of the request, ref to llm.RequestType.
 	// For example, "chat", "image", "embedding", etc.
@@ -55,6 +57,16 @@ type Request struct {
 	// SkipInboundQueryMerge when set to true, prevents query parameters from the original
 	// inbound request from being merged into this request during MergeInboundRequest.
 	SkipInboundQueryMerge bool `json:"-"`
+	// DisableCompression opts out of HTTP-level compression negotiation. Framed
+	// protocols may still independently compress individual response frames.
+	DisableCompression bool                               `json:"-"`
+	OnResponseHeaders  func(context.Context, http.Header) `json:"-"`
+}
+
+func (r *Request) ObserveResponseHeaders(ctx context.Context, headers http.Header) {
+	if r != nil && r.OnResponseHeaders != nil {
+		r.OnResponseHeaders(ctx, headers.Clone())
+	}
 }
 
 // AuthConfig represents authentication configuration.
@@ -73,6 +85,14 @@ type AuthConfig struct {
 const (
 	AuthTypeBearer = "bearer"
 	AuthTypeAPIKey = "api_key"
+
+	// MetadataStreamDecoderContentType overrides response Content-Type only for
+	// stream decoder selection. It is useful for providers that advertise SSE
+	// while sending newline-delimited JSON.
+	MetadataStreamDecoderContentType = "stream_decoder_content_type"
+
+	// BinaryStreamDoneEventType marks EOF for non-SSE streaming responses.
+	BinaryStreamDoneEventType = "binary.done"
 )
 
 // Response represents a generic HTTP response.
@@ -100,9 +120,46 @@ type Response struct {
 }
 
 type StreamEvent struct {
-	LastEventID string `json:"last_event_id,omitempty"`
-	Type        string `json:"type"`
-	Data        []byte `json:"data"`
+	LastEventID                string `json:"last_event_id,omitempty"`
+	Type                       string `json:"type"`
+	Data                       []byte `json:"data"`
+	CleanEOFCompletionEvidence bool   `json:"-"`
+	// Size optionally carries the byte size of a binary chunk that was elided
+	// from Data for persistence (e.g. raw TTS audio chunks). It lets stream
+	// aggregators report total bytes without retaining the audio payload.
+	Size int `json:"size,omitempty"`
+	// Headers is populated only on the first event by HTTP stream executors.
+	// It carries transport metadata such as Codex turn-state headers.
+	Headers http.Header `json:"-"`
+}
+
+// IsBinaryAudioChunk reports whether the event carries a raw binary audio payload
+// (e.g. TTS audio/* or application/octet-stream chunks) as opposed to an SSE event
+// or the binary.done sentinel.
+func (e *StreamEvent) IsBinaryAudioChunk() bool {
+	if e == nil || e.Type == "" || e.Type == BinaryStreamDoneEventType {
+		return false
+	}
+
+	t := strings.ToLower(strings.TrimSpace(e.Type))
+
+	return strings.HasPrefix(t, "audio/") || t == "application/octet-stream"
+}
+
+// SummarizeBinaryChunk returns a copy of the event suitable for persistence:
+// for raw binary audio chunks the audio bytes are dropped and only the byte
+// count is kept in Size, so persistence buffers never accumulate the full
+// audio payload. Non-binary events are returned as-is.
+func SummarizeBinaryChunk(event *StreamEvent) *StreamEvent {
+	if event == nil || !event.IsBinaryAudioChunk() {
+		return event
+	}
+
+	return &StreamEvent{
+		LastEventID: event.LastEventID,
+		Type:        event.Type,
+		Size:        len(event.Data),
+	}
 }
 
 // StreamDecoder defines the interface for decoding streaming responses.

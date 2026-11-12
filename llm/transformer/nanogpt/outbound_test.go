@@ -44,6 +44,7 @@ func TestNewOutboundTransformerWithConfig(t *testing.T) {
 				require.Error(t, err)
 				return
 			}
+
 			require.NoError(t, err)
 			require.NotNil(t, transformer)
 			assert.IsType(t, &OutboundTransformer{}, transformer)
@@ -144,6 +145,144 @@ func TestOutboundTransformer_TransformResponse(t *testing.T) {
 			},
 			expectedErr: true,
 		},
+		{
+			name: "embedding request routes to embedded OpenAI transformer",
+			httpResp: &httpclient.Response{
+				StatusCode: http.StatusOK,
+				Body: []byte(`{
+					"object": "list",
+					"data": [{
+						"object": "embedding",
+						"embedding": [0.1, 0.2, 0.3],
+						"index": 0
+					}],
+					"model": "text-embedding-3-small",
+					"usage": {
+						"prompt_tokens": 10,
+						"total_tokens": 10
+					}
+				}`),
+				Request: &httpclient.Request{
+					APIFormat: string(llm.APIFormatOpenAIEmbedding),
+				},
+			},
+			expectedErr: false,
+			validateResp: func(t *testing.T, resp *llm.Response) {
+				require.NotNil(t, resp)
+				require.NotNil(t, resp.Embedding)
+				require.Len(t, resp.Embedding.Data, 1)
+				require.NotNil(t, resp.Embedding.Data[0].Embedding)
+				assert.Len(t, resp.Embedding.Data[0].Embedding.Embedding, 3)
+			},
+		},
+		{
+			name: "image generation request routes to embedded OpenAI transformer",
+			httpResp: &httpclient.Response{
+				StatusCode: http.StatusOK,
+				Body: []byte(`{
+					"created": 1234567890,
+					"data": [{
+						"b64_json": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==",
+						"revised_prompt": "A sunset over mountains"
+					}]
+				}`),
+				Request: &httpclient.Request{
+					APIFormat: string(llm.APIFormatOpenAIImageGeneration),
+				},
+			},
+			expectedErr: false,
+
+			validateResp: func(t *testing.T, resp *llm.Response) {
+				require.NotNil(t, resp)
+				require.NotNil(t, resp.Image)
+				require.NotNil(t, resp.Image.Data)
+				require.Len(t, resp.Image.Data, 1)
+				assert.NotEmpty(t, resp.Image.Data[0].B64JSON)
+			},
+		},
+		{
+			name: "moderation request routes to embedded OpenAI transformer",
+			httpResp: &httpclient.Response{
+				StatusCode: http.StatusOK,
+				Body: []byte(`{
+					"id": "modr-1",
+					"model": "omni-moderation-latest",
+					"results": [{
+						"flagged": false,
+						"categories": {"violence": false},
+						"category_scores": {"violence": 0.01}
+					}]
+				}`),
+				Request: &httpclient.Request{
+					APIFormat: string(llm.APIFormatOpenAIModeration),
+				},
+			},
+			expectedErr: false,
+			validateResp: func(t *testing.T, resp *llm.Response) {
+				require.NotNil(t, resp)
+				require.NotNil(t, resp.Moderation)
+				require.Len(t, resp.Moderation.Results, 1)
+				require.False(t, resp.Moderation.Results[0].Flagged)
+			},
+		},
+		{
+			name: "chat request uses NanoGPT-specific parsing",
+			httpResp: &httpclient.Response{
+				StatusCode: http.StatusOK,
+				Body: []byte(`{
+					"id": "chat-123",
+					"object": "chat.completion",
+					"created": 1234567890,
+					"model": "zai-org/glm-4.7",
+					"choices": [{
+						"index": 0,
+						"message": {
+							"role": "assistant",
+							"content": "Hello from NanoGPT!"
+						},
+						"finish_reason": "stop"
+					}]
+				}`),
+				Request: &httpclient.Request{
+					APIFormat: string(llm.APIFormatOpenAIChatCompletion),
+				},
+			},
+			expectedErr: false,
+			validateResp: func(t *testing.T, resp *llm.Response) {
+				require.NotNil(t, resp)
+				require.Len(t, resp.Choices, 1)
+				require.NotNil(t, resp.Choices[0].Message.Content)
+				assert.Equal(t, "Hello from NanoGPT!", *resp.Choices[0].Message.Content.Content)
+			},
+		},
+		{
+			name: "nil request in httpResp uses NanoGPT parsing",
+			httpResp: &httpclient.Response{
+				StatusCode: http.StatusOK,
+				Body: []byte(`{
+					"id": "chat-456",
+					"object": "chat.completion",
+					"created": 1234567890,
+					"model": "zai-org/glm-4.7",
+					"choices": [{
+						"index": 0,
+						"message": {
+							"role": "assistant",
+							"content": "Response without request info"
+						},
+						"finish_reason": "stop"
+					}]
+				}`),
+				Request: nil,
+			},
+			expectedErr: false,
+			validateResp: func(t *testing.T, resp *llm.Response) {
+				require.NotNil(t, resp)
+				require.Len(t, resp.Choices, 1)
+				require.NotNil(t, resp.Choices[0].Message.Content)
+				assert.Equal(t, "Response without request info", *resp.Choices[0].Message.Content.Content)
+			},
+		},
 	}
 
 	for _, tt := range tests {
@@ -153,7 +292,9 @@ func TestOutboundTransformer_TransformResponse(t *testing.T) {
 				assert.Error(t, err)
 				return
 			}
+
 			assert.NoError(t, err)
+
 			if tt.validateResp != nil {
 				tt.validateResp(t, resp)
 			}
@@ -173,7 +314,7 @@ func TestOutboundTransformer_AggregateStreamChunks(t *testing.T) {
 		{Data: []byte(`{"id":"test","choices":[{"index":0,"delta":{"content":" World"}}]}`)},
 	}
 
-	data, meta, err := transformer.AggregateStreamChunks(context.Background(), chunks)
+	data, meta, err := transformer.AggregateStreamChunks(context.Background(), nil, chunks)
 	require.NoError(t, err)
 	assert.Contains(t, string(data), "Hello")
 	assert.Contains(t, string(data), "World")

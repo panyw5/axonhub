@@ -2,20 +2,26 @@ package gql
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 
 	"entgo.io/contrib/entgql"
+	"entgo.io/ent/privacy"
+	"github.com/99designs/gqlgen/graphql"
 	"github.com/99designs/gqlgen/graphql/handler"
 	"github.com/99designs/gqlgen/graphql/handler/extension"
 	"github.com/99designs/gqlgen/graphql/handler/lru"
 	"github.com/99designs/gqlgen/graphql/handler/transport"
 	"github.com/99designs/gqlgen/graphql/playground"
 	"github.com/vektah/gqlparser/v2/ast"
+	"github.com/vektah/gqlparser/v2/gqlerror"
 	"go.uber.org/fx"
 
+	"github.com/looplj/axonhub/internal/authz"
 	"github.com/looplj/axonhub/internal/ent"
 	"github.com/looplj/axonhub/internal/ent/apikey"
+	"github.com/looplj/axonhub/internal/ent/apikeyprofiletemplate"
 	"github.com/looplj/axonhub/internal/ent/channel"
 	"github.com/looplj/axonhub/internal/ent/channeloverridetemplate"
 	"github.com/looplj/axonhub/internal/ent/channelprobe"
@@ -33,8 +39,14 @@ import (
 	"github.com/looplj/axonhub/internal/ent/user"
 	"github.com/looplj/axonhub/internal/ent/userproject"
 	"github.com/looplj/axonhub/internal/ent/userrole"
+	"github.com/looplj/axonhub/internal/pkg/xerrors"
 	"github.com/looplj/axonhub/internal/server/backup"
 	"github.com/looplj/axonhub/internal/server/biz"
+	"github.com/looplj/axonhub/internal/server/gc"
+	"github.com/looplj/axonhub/internal/server/orchestrator"
+	"github.com/looplj/axonhub/internal/server/scheduler"
+	"github.com/looplj/axonhub/internal/server/video_storage"
+	"github.com/looplj/axonhub/llm/httpclient"
 )
 
 type Dependencies struct {
@@ -47,6 +59,7 @@ type Dependencies struct {
 	SystemService                  *biz.SystemService
 	ChannelService                 *biz.ChannelService
 	RequestService                 *biz.RequestService
+	QuotaService                   *biz.QuotaService
 	ProjectService                 *biz.ProjectService
 	DataStorageService             *biz.DataStorageService
 	RoleService                    *biz.RoleService
@@ -54,11 +67,21 @@ type Dependencies struct {
 	ThreadService                  *biz.ThreadService
 	UsageLogService                *biz.UsageLogService
 	ChannelOverrideTemplateService *biz.ChannelOverrideTemplateService
+	APIKeyProfileTemplateService   *biz.APIKeyProfileTemplateService
 	ModelService                   *biz.ModelService
 	BackupService                  *backup.BackupService
 	ChannelProbeService            *biz.ChannelProbeService
 	PromptService                  *biz.PromptService
+	PromptProtectionRuleService    *biz.PromptProtectionRuleService
 	ProviderQuotaService           *biz.ProviderQuotaService
+	Scheduler                      *scheduler.Scheduler
+	DefaultSelector                *orchestrator.DefaultSelector
+	CandidateSelectorDiagnostics   *orchestrator.CandidateSelectorDiagnostics
+	ChannelLimiterManager          *orchestrator.ChannelLimiterManager
+	HttpClient                     *httpclient.HttpClient
+	GCWorker                       *gc.Worker
+	VideoWorker                    *video_storage.Worker
+	CatalogService                 *biz.CatalogService
 }
 
 type GraphqlHandler struct {
@@ -76,6 +99,7 @@ func NewGraphqlHandlers(deps Dependencies) *GraphqlHandler {
 			deps.SystemService,
 			deps.ChannelService,
 			deps.RequestService,
+			deps.QuotaService,
 			deps.ProjectService,
 			deps.DataStorageService,
 			deps.RoleService,
@@ -83,11 +107,21 @@ func NewGraphqlHandlers(deps Dependencies) *GraphqlHandler {
 			deps.ThreadService,
 			deps.UsageLogService,
 			deps.ChannelOverrideTemplateService,
+			deps.APIKeyProfileTemplateService,
 			deps.ModelService,
 			deps.BackupService,
 			deps.ChannelProbeService,
 			deps.PromptService,
+			deps.PromptProtectionRuleService,
 			deps.ProviderQuotaService,
+			deps.Scheduler,
+			deps.DefaultSelector,
+			deps.CandidateSelectorDiagnostics,
+			deps.ChannelLimiterManager,
+			deps.HttpClient,
+			deps.GCWorker,
+			deps.VideoWorker,
+			deps.CatalogService,
 		),
 	)
 
@@ -103,13 +137,45 @@ func NewGraphqlHandlers(deps Dependencies) *GraphqlHandler {
 		Cache: lru.New[string](1024),
 	})
 	gqlSrv.Use(&loggingTracer{})
+	gqlSrv.AroundOperations(apiKeyReadOnly)
+	skipTestChannelTransaction := entgql.SkipOperations("TestChannel", "TestChannelAPIKeys")
+	skipBulkImportTransaction := entgql.SkipIfHasFields("bulkImportChannels")
 	gqlSrv.Use(entgql.Transactioner{
 		TxOpener: deps.Ent,
-		// Skip transaction for TestChannel mutation to avoid transaction conflicts
-		// when multiple test requests are sent in parallel from the frontend.
-		// TestChannel performs LLM API calls which can be long-running, and the
-		// database operations within don't require transactional consistency.
-		SkipTxFunc: entgql.SkipOperations("TestChannel"),
+		// TestChannel performs long-running parallel provider requests whose database
+		// operations do not require one transaction. BulkImportChannels manages one
+		// transaction per row to preserve its partial-success behavior.
+		SkipTxFunc: func(op *ast.OperationDefinition) bool {
+			return skipTestChannelTransaction(op) || skipBulkImportTransaction(op)
+		},
+	})
+
+	// Set error presenter to handle CodedError and add extensions.code
+	gqlSrv.SetErrorPresenter(func(ctx context.Context, err error) *gqlerror.Error {
+		// Check if it's a CodedError
+		var codedErr *xerrors.CodedError
+		if errors.As(err, &codedErr) {
+			return &gqlerror.Error{
+				Message: codedErr.Message,
+				Extensions: map[string]any{
+					"code":     codedErr.Code,
+					"resource": codedErr.Extensions["resource"],
+					"field":    codedErr.Extensions["field"],
+					"value":    codedErr.Extensions["value"],
+				},
+			}
+		}
+		// Convert ent privacy deny errors to FORBIDDEN
+		if errors.Is(err, privacy.Deny) {
+			return &gqlerror.Error{
+				Message: "permission denied",
+				Extensions: map[string]any{
+					"code": xerrors.ErrCodeForbidden,
+				},
+			}
+		}
+		// Return default error presentation
+		return graphql.DefaultErrorPresenter(ctx, err)
 	})
 
 	return &GraphqlHandler{
@@ -118,9 +184,29 @@ func NewGraphqlHandlers(deps Dependencies) *GraphqlHandler {
 	}
 }
 
+// apiKeyReadOnly keeps service-account API keys read-only on the admin GraphQL
+// surface. Admin mutations are normally gated by ent privacy and authz scopes,
+// but several custom mutations have side effects — outbound provider requests,
+// cache and storage maintenance — without an ent mutation for the privacy layer
+// to gate, so the whole mutation class is refused for API-key principals.
+func apiKeyReadOnly(ctx context.Context, next graphql.OperationHandler) graphql.ResponseHandler {
+	principal, ok := authz.GetPrincipal(ctx)
+	if !ok || principal.Type != authz.PrincipalTypeAPIKey {
+		return next(ctx)
+	}
+
+	opCtx := graphql.GetOperationContext(ctx)
+	if opCtx == nil || opCtx.Operation == nil || opCtx.Operation.Operation == ast.Query {
+		return next(ctx)
+	}
+
+	return graphql.OneShot(graphql.ErrorResponse(ctx, "service account API keys are read-only"))
+}
+
 var guidTypeToNodeType = map[string]string{
 	ent.TypeUser:                    user.Table,
 	ent.TypeAPIKey:                  apikey.Table,
+	ent.TypeAPIKeyProfileTemplate:   apikeyprofiletemplate.Table,
 	ent.TypeModel:                   model.Table,
 	ent.TypeChannel:                 channel.Table,
 	ent.TypeChannelProbe:            channelprobe.Table,
@@ -150,8 +236,33 @@ func getNilableChannel(ctx context.Context, client *ent.Client, channelID int) (
 			return nil, nil
 		}
 
+		if errors.Is(err, privacy.Deny) {
+			return nil, nil
+		}
+
 		return nil, fmt.Errorf("failed to load channel: %w", err)
 	}
 
 	return ch, nil
+}
+
+func getNilableUser(ctx context.Context, client *ent.Client, userID int) (*ent.User, error) {
+	if userID == 0 {
+		return nil, nil
+	}
+
+	u, err := client.User.Query().Where(user.ID(userID)).First(ctx)
+	if err != nil {
+		if ent.IsNotFound(err) {
+			return nil, nil
+		}
+
+		if errors.Is(err, privacy.Deny) {
+			return nil, nil
+		}
+
+		return nil, fmt.Errorf("failed to load user: %w", err)
+	}
+
+	return u, nil
 }

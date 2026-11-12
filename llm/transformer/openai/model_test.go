@@ -1,6 +1,7 @@
 package openai
 
 import (
+	"context"
 	"encoding/json"
 	"testing"
 
@@ -140,6 +141,45 @@ func TestStop_MarshalUnmarshalJSON(t *testing.T) {
 	}
 }
 
+func TestMessageContent_UnmarshalJSON_ClearsConflictingRepresentation(t *testing.T) {
+	content := MessageContent{
+		Content: lo.ToPtr("stale"),
+		MultipleContent: []MessageContentPart{
+			{Type: "text", Text: lo.ToPtr("old")},
+		},
+	}
+
+	err := json.Unmarshal([]byte(`"fresh"`), &content)
+	require.NoError(t, err)
+	require.NotNil(t, content.Content)
+	require.Equal(t, "fresh", *content.Content)
+	require.Nil(t, content.MultipleContent)
+
+	err = json.Unmarshal([]byte(`[{"type":"text","text":"part"}]`), &content)
+	require.NoError(t, err)
+	require.Nil(t, content.Content)
+	require.Len(t, content.MultipleContent, 1)
+	require.Equal(t, "part", *content.MultipleContent[0].Text)
+}
+
+func TestStop_UnmarshalJSON_ClearsConflictingRepresentation(t *testing.T) {
+	stop := Stop{
+		Stop:         lo.ToPtr("stale"),
+		MultipleStop: []string{"old"},
+	}
+
+	err := json.Unmarshal([]byte(`"fresh"`), &stop)
+	require.NoError(t, err)
+	require.NotNil(t, stop.Stop)
+	require.Equal(t, "fresh", *stop.Stop)
+	require.Nil(t, stop.MultipleStop)
+
+	err = json.Unmarshal([]byte(`["a","b"]`), &stop)
+	require.NoError(t, err)
+	require.Nil(t, stop.Stop)
+	require.Equal(t, []string{"a", "b"}, stop.MultipleStop)
+}
+
 func TestToolChoice_MarshalUnmarshalJSON(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -207,7 +247,7 @@ func TestRoundTrip_Request(t *testing.T) {
 
 	// Convert to llm.Request and back
 	llmReq := original.ToLLMRequest()
-	roundTripped := RequestFromLLM(llmReq)
+	roundTripped := RequestFromLLM(context.Background(), llmReq, ReasoningFieldNone)
 
 	require.Equal(t, original.Model, roundTripped.Model)
 	require.Len(t, roundTripped.Messages, len(original.Messages))
@@ -254,4 +294,56 @@ func TestRoundTrip_Response(t *testing.T) {
 	require.Equal(t, original.ServiceTier, roundTripped.ServiceTier)
 	require.NotNil(t, roundTripped.Usage)
 	require.Equal(t, original.Usage.PromptTokens, roundTripped.Usage.PromptTokens)
+}
+
+func TestToolChoice_AllowedToolsMarshalUnmarshalJSON(t *testing.T) {
+	// Chat Completions nests the mode and tool subset of an allowed_tools
+	// choice: {"type":"allowed_tools","allowed_tools":{"mode":"...","tools":[...]}}.
+	raw := `{"type":"allowed_tools","allowed_tools":{"mode":"required","tools":[{"type":"function","function":{"name":"tool_a"}}]}}`
+
+	var choice ToolChoice
+	require.NoError(t, json.Unmarshal([]byte(raw), &choice))
+	require.NotNil(t, choice.NamedToolChoice)
+	require.Equal(t, "allowed_tools", choice.NamedToolChoice.Type)
+	require.NotNil(t, choice.AllowedTools)
+	require.NotNil(t, choice.AllowedTools.Mode)
+	require.Equal(t, "required", *choice.AllowedTools.Mode)
+	require.Len(t, choice.AllowedTools.Tools, 1)
+	require.Equal(t, "function", choice.AllowedTools.Tools[0].Type)
+	require.Equal(t, "tool_a", choice.AllowedTools.Tools[0].Function.Name)
+
+	data, err := json.Marshal(choice)
+	require.NoError(t, err)
+	require.JSONEq(t, raw, string(data))
+}
+
+func TestRoundTrip_AllowedToolsToolChoice(t *testing.T) {
+	// The issue #2504 payload: the subset and mode must survive a
+	// Chat Completions inbound -> llm -> Chat Completions outbound round trip.
+	raw := `{
+		"model": "gpt-4o",
+		"messages": [{"role": "user", "content": "hi"}],
+		"tool_choice": {"type": "allowed_tools", "allowed_tools": {"mode": "required", "tools": [{"type": "function", "function": {"name": "tool_a"}}]}},
+		"tools": [
+			{"type": "function", "function": {"name": "tool_a", "parameters": {"type": "object", "properties": {}}}},
+			{"type": "function", "function": {"name": "tool_b", "parameters": {"type": "object", "properties": {}}}}
+		]
+	}`
+
+	var original Request
+	require.NoError(t, json.Unmarshal([]byte(raw), &original))
+
+	roundTripped := RequestFromLLM(context.Background(), original.ToLLMRequest(), ReasoningFieldNone)
+	require.NotNil(t, roundTripped)
+
+	data, err := json.Marshal(roundTripped)
+	require.NoError(t, err)
+
+	var encoded struct {
+		ToolChoice json.RawMessage `json:"tool_choice"`
+	}
+	require.NoError(t, json.Unmarshal(data, &encoded))
+	require.JSONEq(t,
+		`{"type":"allowed_tools","allowed_tools":{"mode":"required","tools":[{"type":"function","function":{"name":"tool_a"}}]}}`,
+		string(encoded.ToolChoice))
 }

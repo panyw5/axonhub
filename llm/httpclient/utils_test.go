@@ -1,314 +1,416 @@
 package httpclient
 
 import (
+	"bytes"
+	"compress/flate"
+	"compress/gzip"
+	"compress/zlib"
 	"net/http"
-	"net/url"
+	"net/http/httptest"
 	"testing"
 
+	"github.com/klauspost/compress/zstd"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
-func TestIsHTTPStatusCodeRetryable(t *testing.T) {
-	t.Run("429 is retryable", func(t *testing.T) {
-		require.True(t, IsHTTPStatusCodeRetryable(429))
-	})
+func TestReadHTTPRequest_NoContentEncoding(t *testing.T) {
+	body := []byte(`{"model":"gpt-4","messages":[{"role":"user","content":"hello"}]}`)
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
 
-	t.Run("4xx errors (except 429) are not retryable", func(t *testing.T) {
-		require.False(t, IsHTTPStatusCodeRetryable(400))
-		require.False(t, IsHTTPStatusCodeRetryable(401))
-		require.False(t, IsHTTPStatusCodeRetryable(403))
-		require.False(t, IsHTTPStatusCodeRetryable(404))
-		require.False(t, IsHTTPStatusCodeRetryable(422))
-	})
-
-	t.Run("5xx errors are retryable", func(t *testing.T) {
-		require.True(t, IsHTTPStatusCodeRetryable(500))
-		require.True(t, IsHTTPStatusCodeRetryable(502))
-		require.True(t, IsHTTPStatusCodeRetryable(503))
-		require.True(t, IsHTTPStatusCodeRetryable(504))
-	})
-
-	t.Run("non-error status codes are not retryable", func(t *testing.T) {
-		require.False(t, IsHTTPStatusCodeRetryable(200))
-		require.False(t, IsHTTPStatusCodeRetryable(201))
-		require.False(t, IsHTTPStatusCodeRetryable(301))
-		require.False(t, IsHTTPStatusCodeRetryable(302))
-	})
+	got, err := ReadHTTPRequest(req)
+	require.NoError(t, err)
+	assert.Equal(t, body, got.Body)
+	assert.Equal(t, "", got.Headers.Get("Content-Encoding"))
 }
 
-func TestMergeHTTPHeaders(t *testing.T) {
-	// Register headers for testing append behavior
-	RegisterMergeWithAppendHeaders("User-Agent", "Accept")
+func TestReadHTTPRequest_UserAgent(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(nil))
+	req.Header.Set("User-Agent", "axonhub-test/1.0")
 
+	got, err := ReadHTTPRequest(req)
+	require.NoError(t, err)
+	assert.Equal(t, "axonhub-test/1.0", got.UserAgent)
+}
+
+func TestReadHTTPRequest_IdentityEncoding(t *testing.T) {
+	body := []byte(`{"model":"gpt-4","messages":[{"role":"user","content":"hello"}]}`)
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Content-Encoding", "identity")
+
+	got, err := ReadHTTPRequest(req)
+	require.NoError(t, err)
+	assert.Equal(t, body, got.Body)
+	assert.Equal(t, "identity", got.Headers.Get("Content-Encoding"))
+}
+
+func TestReadHTTPRequest_GzipEncoding(t *testing.T) {
+	originalBody := []byte(`{"model":"gpt-4","messages":[{"role":"user","content":"hello"}]}`)
+
+	var buf bytes.Buffer
+	writer := gzip.NewWriter(&buf)
+	_, err := writer.Write(originalBody)
+	require.NoError(t, err)
+	writer.Close()
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(buf.Bytes()))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Content-Encoding", "gzip")
+
+	got, err := ReadHTTPRequest(req)
+	require.NoError(t, err)
+	assert.Equal(t, originalBody, got.Body)
+	assert.Equal(t, "", got.Headers.Get("Content-Encoding"))
+	assert.Equal(t, "", got.Headers.Get("Content-Length"))
+}
+
+func TestReadHTTPRequest_GzipEncodingXGzip(t *testing.T) {
+	originalBody := []byte(`{"model":"gpt-4"}`)
+
+	var buf bytes.Buffer
+	writer := gzip.NewWriter(&buf)
+	_, err := writer.Write(originalBody)
+	require.NoError(t, err)
+	writer.Close()
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(buf.Bytes()))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Content-Encoding", "x-gzip")
+
+	got, err := ReadHTTPRequest(req)
+	require.NoError(t, err)
+	assert.Equal(t, originalBody, got.Body)
+	assert.Equal(t, "", got.Headers.Get("Content-Encoding"))
+}
+
+func TestReadHTTPRequest_DeflateEncoding(t *testing.T) {
+	originalBody := []byte(`{"model":"gpt-4","messages":[{"role":"user","content":"hello"}]}`)
+
+	var buf bytes.Buffer
+	writer, err := flate.NewWriter(&buf, flate.DefaultCompression)
+	require.NoError(t, err)
+	_, err = writer.Write(originalBody)
+	require.NoError(t, err)
+	writer.Close()
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(buf.Bytes()))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Content-Encoding", "deflate")
+
+	got, err := ReadHTTPRequest(req)
+	require.NoError(t, err)
+	assert.Equal(t, originalBody, got.Body)
+	assert.Equal(t, "", got.Headers.Get("Content-Encoding"))
+	assert.Equal(t, "", got.Headers.Get("Content-Length"))
+}
+
+func TestReadHTTPRequest_DeflateZlibEncoding(t *testing.T) {
+	originalBody := []byte(`{"model":"gpt-4","messages":[{"role":"user","content":"hello"}]}`)
+
+	var buf bytes.Buffer
+	writer := zlib.NewWriter(&buf)
+	_, err := writer.Write(originalBody)
+	require.NoError(t, err)
+	writer.Close()
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(buf.Bytes()))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Content-Encoding", "deflate")
+
+	got, err := ReadHTTPRequest(req)
+	require.NoError(t, err)
+	assert.Equal(t, originalBody, got.Body)
+	assert.Equal(t, "", got.Headers.Get("Content-Encoding"))
+	assert.Equal(t, "", got.Headers.Get("Content-Length"))
+}
+
+func TestReadHTTPRequest_ZstdEncoding(t *testing.T) {
+	originalBody := []byte(`{"model":"gpt-4","messages":[{"role":"user","content":"hello"}]}`)
+
+	encoder, err := zstd.NewWriter(nil)
+	require.NoError(t, err)
+	compressedBody := encoder.EncodeAll(originalBody, nil)
+	encoder.Close()
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(compressedBody))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Content-Encoding", "zstd")
+
+	got, err := ReadHTTPRequest(req)
+	require.NoError(t, err)
+	assert.Equal(t, originalBody, got.Body)
+	assert.Equal(t, "", got.Headers.Get("Content-Encoding"))
+	assert.Equal(t, "", got.Headers.Get("Content-Length"))
+}
+
+func TestReadHTTPRequest_EncodingCaseInsensitive(t *testing.T) {
 	tests := []struct {
-		name string // description of this test case
-		// Named input parameters for target function.
-		dest http.Header
-		src  http.Header
-		want http.Header
+		name     string
+		encoding string
+		compress func(t *testing.T, body []byte) []byte
 	}{
 		{
-			name: "given src Authorization header, should skip sensitive header",
-			dest: http.Header{
-				"Content-Type": []string{"application/json"},
-			},
-			src: http.Header{
-				"Content-Type":  []string{"application/json"},
-				"Authorization": []string{"Bearer 123456"},
-			},
-			want: http.Header{
-				"Content-Type": []string{"application/json"},
-			},
-		},
-		{
-			name: "given src User-Agent header, should merge them",
-			dest: http.Header{
-				"Content-Type": []string{"application/json"},
-			},
-			src: http.Header{
-				"Content-Type": []string{"application/json"},
-				"User-Agent":   []string{"Mozilla/5.0"},
-			},
-			want: http.Header{
-				"Content-Type": []string{"application/json"},
-				"User-Agent":   []string{"Mozilla/5.0"},
+			name:     "gzip uppercase",
+			encoding: "GZIP",
+			compress: func(t *testing.T, body []byte) []byte {
+				var buf bytes.Buffer
+				writer := gzip.NewWriter(&buf)
+				_, err := writer.Write(body)
+				require.NoError(t, err)
+				writer.Close()
+				return buf.Bytes()
 			},
 		},
 		{
-			name: "should add non-duplicate values to existing headers",
-			dest: http.Header{
-				"Content-Type": []string{"application/json"},
-				"Accept":       []string{"application/json"},
-			},
-			src: http.Header{
-				"Accept":     []string{"text/plain", "application/json"},
-				"User-Agent": []string{"Mozilla/5.0"},
-			},
-			want: http.Header{
-				"Content-Type": []string{"application/json"},
-				"Accept":       []string{"application/json", "text/plain"},
-				"User-Agent":   []string{"Mozilla/5.0"},
+			name:     "deflate uppercase",
+			encoding: "DEFLATE",
+			compress: func(t *testing.T, body []byte) []byte {
+				var buf bytes.Buffer
+				writer, err := flate.NewWriter(&buf, flate.DefaultCompression)
+				require.NoError(t, err)
+				_, err = writer.Write(body)
+				require.NoError(t, err)
+				writer.Close()
+				return buf.Bytes()
 			},
 		},
 		{
-			name: "should add all non-duplicate values from multiple values",
-			dest: http.Header{
-				"Accept": []string{"application/json"},
+			name:     "zstd with spaces",
+			encoding: "  ZSTD  ",
+			compress: func(t *testing.T, body []byte) []byte {
+				encoder, err := zstd.NewWriter(nil)
+				require.NoError(t, err)
+				compressed := encoder.EncodeAll(body, nil)
+				encoder.Close()
+				return compressed
 			},
-			src: http.Header{
-				"Accept": []string{"text/plain", "application/xml", "text/html"},
-			},
-			want: http.Header{
-				"Accept": []string{"application/json", "text/plain", "application/xml", "text/html"},
-			},
-		},
-		{
-			name: "should skip all duplicate values",
-			dest: http.Header{
-				"Accept": []string{"application/json", "text/plain"},
-			},
-			src: http.Header{
-				"Accept": []string{"application/json", "text/plain"},
-			},
-			want: http.Header{
-				"Accept": []string{"application/json", "text/plain"},
-			},
-		},
-		{
-			name: "should skip only duplicate values and add new ones",
-			dest: http.Header{
-				"Accept": []string{"application/json", "text/plain"},
-			},
-			src: http.Header{
-				"Accept": []string{"text/plain", "application/xml", "application/json"},
-			},
-			want: http.Header{
-				"Accept": []string{"application/json", "text/plain", "application/xml"},
-			},
-		},
-		{
-			name: "should block transport-managed headers and skip sensitive ones",
-			dest: http.Header{
-				"Content-Type": []string{"application/json"},
-			},
-			src: http.Header{
-				"Authorization":     []string{"Bearer token"},
-				"Api-Key":           []string{"key123"},
-				"X-Api-Key":         []string{"xkey456"},
-				"X-Api-Secret":      []string{"secret789"},
-				"X-Api-Token":       []string{"token000"},
-				"Content-Type":      []string{"text/plain"},
-				"Content-Length":    []string{"100"},
-				"Transfer-Encoding": []string{"chunked"},
-				"User-Agent":        []string{"Test/1.0"},
-			},
-			want: http.Header{
-				"Content-Type": []string{"application/json"},
-				"User-Agent":   []string{"Test/1.0"},
-			},
-		},
-		{
-			name: "empty src headers should not change dest",
-			dest: http.Header{
-				"Content-Type": []string{"application/json"},
-			},
-			src: http.Header{},
-			want: http.Header{
-				"Content-Type": []string{"application/json"},
-			},
-		},
-		{
-			name: "empty dest headers should merge non-blocked src headers",
-			dest: http.Header{},
-			src: http.Header{
-				"User-Agent":    []string{"Test/1.0"},
-				"Accept":        []string{"*/*"},
-				"Authorization": []string{"Bearer token"},
-			},
-			want: http.Header{
-				"User-Agent": []string{"Test/1.0"},
-				"Accept":     []string{"*/*"},
-			},
-		},
-		{
-			name: "should merge multiple custom headers",
-			dest: http.Header{
-				"Content-Type": []string{"application/json"},
-			},
-			src: http.Header{
-				"X-Request-ID":    []string{"req-123"},
-				"X-Trace-ID":      []string{"trace-456"},
-				"User-Agent":      []string{"Custom/1.0"},
-				"Accept-Encoding": []string{"gzip, deflate"},
-			},
-			want: http.Header{
-				"Content-Type": []string{"application/json"},
-				"X-Request-ID": []string{"req-123"},
-				"X-Trace-ID":   []string{"trace-456"},
-				"User-Agent":   []string{"Custom/1.0"},
-			},
-		},
-		{
-			name: "should handle headers with multiple values",
-			dest: http.Header{
-				"Content-Type": []string{"application/json"},
-			},
-			src: http.Header{
-				"Accept": []string{"application/json", "text/plain"},
-			},
-			want: http.Header{
-				"Content-Type": []string{"application/json"},
-				"Accept":       []string{"application/json", "text/plain"},
-			},
-		},
-		{
-			name: "should add non-duplicate values when header exists",
-			dest: http.Header{
-				"User-Agent": []string{"AxonHub/1.0"},
-			},
-			src: http.Header{
-				"Content-Type": []string{"application/json"},
-				"User-Agent":   []string{"Mozilla/5.0"},
-				"Accept":       []string{"*/*"},
-			},
-			want: http.Header{
-				"User-Agent": []string{"AxonHub/1.0", "Mozilla/5.0"},
-				"Accept":     []string{"*/*"},
-			},
-		},
-		{
-			name: "should overwrite non-appendable headers",
-			dest: http.Header{
-				"X-Custom-Header": []string{"old-value"},
-			},
-			src: http.Header{
-				"X-Custom-Header": []string{"new-value"},
-			},
-			want: http.Header{
-				"X-Custom-Header": []string{"new-value"},
-			},
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := MergeHTTPHeaders(tt.dest, tt.src)
-			require.Equal(t, tt.want, got)
-		})
-	}
-}
-
-func TestRegisterAppendHeaders(t *testing.T) {
-	RegisterMergeWithAppendHeaders("X-New-Append")
-
-	dest := http.Header{"X-New-Append": []string{"old"}}
-	src := http.Header{"X-New-Append": []string{"new"}}
-
-	got := MergeHTTPHeaders(dest, src)
-	require.Equal(t, []string{"old", "new"}, got["X-New-Append"])
-}
-
-func TestMergeHTTPQuery(t *testing.T) {
-	tests := []struct {
-		name string
-		dest url.Values
-		src  url.Values
-		want url.Values
-	}{
-		{
-			name: "should merge new query parameters",
-			dest: url.Values{"q": []string{"golang"}},
-			src:  url.Values{"page": []string{"1"}},
-			want: url.Values{"q": []string{"golang"}, "page": []string{"1"}},
-		},
-		{
-			name: "should not overwrite existing query parameters",
-			dest: url.Values{"q": []string{"golang"}},
-			src:  url.Values{"q": []string{"java"}},
-			want: url.Values{"q": []string{"golang"}},
-		},
-		{
-			name: "should handle empty src",
-			dest: url.Values{"q": []string{"golang"}},
-			src:  nil,
-			want: url.Values{"q": []string{"golang"}},
-		},
-		{
-			name: "should handle empty dest",
-			dest: nil,
-			src:  url.Values{"page": []string{"1"}},
-			want: url.Values{"page": []string{"1"}},
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := MergeHTTPQuery(tt.dest, tt.src)
-			require.Equal(t, tt.want, got)
+			originalBody := []byte(`{"model":"gpt-4"}`)
+			compressedBody := tt.compress(t, originalBody)
+
+			req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(compressedBody))
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("Content-Encoding", tt.encoding)
+
+			got, err := ReadHTTPRequest(req)
+			require.NoError(t, err)
+			assert.Equal(t, originalBody, got.Body)
 		})
 	}
 }
 
-func TestMergeInboundRequest(t *testing.T) {
-	t.Run("should merge both headers and query", func(t *testing.T) {
-		dest := &Request{
-			Headers: http.Header{"Content-Type": []string{"application/json"}},
-			Query:   url.Values{"q": []string{"old"}},
-		}
-		src := &Request{
-			Headers: http.Header{"User-Agent": []string{"Test"}},
-			Query:   url.Values{"page": []string{"1"}},
-		}
+func TestReadHTTPRequest_UnsupportedContentEncoding(t *testing.T) {
+	body := []byte(`{"model":"gpt-4"}`)
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Content-Encoding", "br")
 
-		got := MergeInboundRequest(dest, src)
-		require.Equal(t, "application/json", got.Headers.Get("Content-Type"))
-		require.Equal(t, "Test", got.Headers.Get("User-Agent"))
-		require.Equal(t, "old", got.Query.Get("q"))
-		require.Equal(t, "1", got.Query.Get("page"))
-	})
+	_, err := ReadHTTPRequest(req)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "unsupported content encoding")
+}
 
-	t.Run("should return dest if src is nil", func(t *testing.T) {
-		dest := &Request{Headers: http.Header{"X-Test": []string{"val"}}}
-		got := MergeInboundRequest(dest, nil)
-		require.Equal(t, dest, got)
-	})
+func TestReadHTTPRequest_InvalidGzipData(t *testing.T) {
+	invalidData := []byte("this is not valid gzip compressed data")
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(invalidData))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Content-Encoding", "gzip")
+
+	_, err := ReadHTTPRequest(req)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "failed to create gzip reader")
+}
+
+func TestReadHTTPRequest_InvalidDeflateData(t *testing.T) {
+	invalidData := []byte("this is not valid deflate compressed data")
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(invalidData))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Content-Encoding", "deflate")
+
+	_, err := ReadHTTPRequest(req)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "failed to decompress deflate body")
+}
+
+func TestReadHTTPRequest_InvalidZstdData(t *testing.T) {
+	invalidData := []byte("this is not valid zstd compressed data")
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(invalidData))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Content-Encoding", "zstd")
+
+	_, err := ReadHTTPRequest(req)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "failed to decode zstd compressed body")
+}
+
+func TestReadHTTPRequest_EmptyBody(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	req.Header.Set("Content-Type", "application/json")
+
+	got, err := ReadHTTPRequest(req)
+	require.NoError(t, err)
+	assert.Empty(t, got.Body)
+}
+
+func TestReadHTTPRequest_EmptyBodyWithContentEncoding(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Content-Encoding", "zstd")
+
+	got, err := ReadHTTPRequest(req)
+	require.NoError(t, err)
+	assert.Empty(t, got.Body)
+}
+
+func TestReadHTTPRequest_RejectsOversizedRawBody(t *testing.T) {
+	originalLimit := maxRequestBodySize
+	maxRequestBodySize = 32
+	t.Cleanup(func() { maxRequestBodySize = originalLimit })
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(bytes.Repeat([]byte("a"), maxRequestBodySize+1)))
+
+	_, err := ReadHTTPRequest(req)
+
+	require.ErrorIs(t, err, ErrRequestBodyTooLarge)
+}
+
+func TestReadHTTPRequest_RejectsOversizedDecodedBody(t *testing.T) {
+	originalLimit := maxRequestBodySize
+	maxRequestBodySize = 32
+	t.Cleanup(func() { maxRequestBodySize = originalLimit })
+
+	originalBody := bytes.Repeat([]byte("a"), maxRequestBodySize+1)
+	var compressed bytes.Buffer
+	writer := gzip.NewWriter(&compressed)
+	_, err := writer.Write(originalBody)
+	require.NoError(t, err)
+	require.NoError(t, writer.Close())
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(compressed.Bytes()))
+	req.Header.Set("Content-Encoding", "gzip")
+
+	_, err = ReadHTTPRequest(req)
+
+	require.ErrorIs(t, err, ErrRequestBodyTooLarge)
+}
+
+func TestDecodeRequestBody_NoEncoding(t *testing.T) {
+	body := []byte(`{"test":"data"}`)
+	headers := http.Header{}
+
+	got, err := decodeRequestBody(body, headers)
+	require.NoError(t, err)
+	assert.Equal(t, body, got)
+}
+
+func TestDecodeRequestBody_IdentityEncoding(t *testing.T) {
+	body := []byte(`{"test":"data"}`)
+	headers := http.Header{}
+	headers.Set("Content-Encoding", "identity")
+
+	got, err := decodeRequestBody(body, headers)
+	require.NoError(t, err)
+	assert.Equal(t, body, got)
+}
+
+func TestDecodeRequestBody_GzipEncoding(t *testing.T) {
+	originalBody := []byte(`{"test":"data"}`)
+
+	var buf bytes.Buffer
+	writer := gzip.NewWriter(&buf)
+	_, err := writer.Write(originalBody)
+	require.NoError(t, err)
+	writer.Close()
+
+	headers := http.Header{}
+	headers.Set("Content-Encoding", "gzip")
+	headers.Set("Content-Length", "100")
+
+	got, err := decodeRequestBody(buf.Bytes(), headers)
+	require.NoError(t, err)
+	assert.Equal(t, originalBody, got)
+	assert.Equal(t, "", headers.Get("Content-Encoding"))
+	assert.Equal(t, "", headers.Get("Content-Length"))
+}
+
+func TestDecodeRequestBody_DeflateEncoding(t *testing.T) {
+	originalBody := []byte(`{"test":"data"}`)
+
+	var buf bytes.Buffer
+	writer, err := flate.NewWriter(&buf, flate.DefaultCompression)
+	require.NoError(t, err)
+	_, err = writer.Write(originalBody)
+	require.NoError(t, err)
+	writer.Close()
+
+	headers := http.Header{}
+	headers.Set("Content-Encoding", "deflate")
+
+	got, err := decodeRequestBody(buf.Bytes(), headers)
+	require.NoError(t, err)
+	assert.Equal(t, originalBody, got)
+	assert.Equal(t, "", headers.Get("Content-Encoding"))
+}
+
+func TestDecodeRequestBody_ZstdEncoding(t *testing.T) {
+	originalBody := []byte(`{"test":"data"}`)
+
+	encoder, err := zstd.NewWriter(nil)
+	require.NoError(t, err)
+	compressedBody := encoder.EncodeAll(originalBody, nil)
+	encoder.Close()
+
+	headers := http.Header{}
+	headers.Set("Content-Encoding", "zstd")
+
+	got, err := decodeRequestBody(compressedBody, headers)
+	require.NoError(t, err)
+	assert.Equal(t, originalBody, got)
+	assert.Equal(t, "", headers.Get("Content-Encoding"))
+}
+
+func TestMergeHTTPHeaders_AcceptNotOverridden(t *testing.T) {
+	// The transformer-owned Accept (e.g. */* for TTS binary audio) must not be
+	// overridden by the inbound client's Accept.
+	dest := http.Header{}
+	dest.Set("Accept", "*/*")
+	dest.Set("Content-Type", "application/json")
+
+	src := http.Header{}
+	src.Set("Accept", "text/event-stream")
+	src.Set("X-Custom", "client-value")
+
+	merged := MergeHTTPHeaders(dest, src)
+	assert.Equal(t, "*/*", merged.Get("Accept"))
+	assert.Equal(t, "client-value", merged.Get("X-Custom"))
+}
+
+func TestMergeHTTPHeaders_UserAgentNotMerged(t *testing.T) {
+	// The User-Agent identifies the client (e.g. codex_cli_rs/...); merging it
+	// into the outbound request would clobber a provider-required UA set by the
+	// outbound transformer (e.g. GitHubCopilotChat for Copilot channels) before
+	// the pass-through middleware can apply the configured policy.
+	dest := http.Header{}
+	dest.Set("User-Agent", "GitHubCopilotChat/0.26.7")
+
+	src := http.Header{}
+	src.Set("User-Agent", "codex_cli_rs/1.2.3")
+	src.Set("X-Custom", "client-value")
+
+	merged := MergeHTTPHeaders(dest, src)
+	assert.Equal(t, "GitHubCopilotChat/0.26.7", merged.Get("User-Agent"))
+	assert.Equal(t, "client-value", merged.Get("X-Custom"))
+
+	// A transformer that set no UA must not receive the client UA either; the
+	// pass-through middleware owns client-UA forwarding.
+	emptyDest := http.Header{}
+
+	merged = MergeHTTPHeaders(emptyDest, src)
+	assert.Empty(t, merged.Get("User-Agent"))
 }

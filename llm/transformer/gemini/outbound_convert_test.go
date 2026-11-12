@@ -1,6 +1,7 @@
 package gemini
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -9,8 +10,8 @@ import (
 	"github.com/samber/lo"
 	"github.com/stretchr/testify/require"
 
-	"github.com/looplj/axonhub/internal/pkg/xmap"
 	"github.com/looplj/axonhub/llm"
+	"github.com/looplj/axonhub/llm/internal/pkg/xmap"
 	"github.com/looplj/axonhub/llm/transformer/shared"
 )
 
@@ -212,6 +213,35 @@ func TestConvertLLMToGeminiRequest_Basic(t *testing.T) {
 			},
 		},
 		{
+			name: "request with audio input",
+			input: &llm.Request{
+				Messages: []llm.Message{
+					{
+						Role: "user",
+						Content: llm.MessageContent{
+							MultipleContent: []llm.MessageContentPart{
+								{
+									Type: "input_audio",
+									InputAudio: &llm.InputAudio{
+										Format: "wav",
+										Data:   "UklGRiQAAABXQVZF",
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			validate: func(t *testing.T, result *GenerateContentRequest) {
+				t.Helper()
+				require.Len(t, result.Contents, 1)
+				require.Len(t, result.Contents[0].Parts, 1)
+				require.NotNil(t, result.Contents[0].Parts[0].InlineData)
+				require.Equal(t, "audio/wav", result.Contents[0].Parts[0].InlineData.MIMEType)
+				require.Equal(t, "UklGRiQAAABXQVZF", result.Contents[0].Parts[0].InlineData.Data)
+			},
+		},
+		{
 			name: "request with reasoning effort low",
 			input: &llm.Request{
 				ReasoningEffort: "low",
@@ -273,6 +303,29 @@ func TestConvertLLMToGeminiRequest_Basic(t *testing.T) {
 				require.NotNil(t, result.GenerationConfig)
 				require.NotNil(t, result.GenerationConfig.ThinkingConfig)
 				require.True(t, result.GenerationConfig.ThinkingConfig.IncludeThoughts)
+				require.Equal(t, "high", result.GenerationConfig.ThinkingConfig.ThinkingLevel)
+				require.Nil(t, result.GenerationConfig.ThinkingConfig.ThinkingBudget)
+			},
+		},
+		{
+			name: "request with reasoning effort xhigh maps to high ThinkingLevel",
+			input: &llm.Request{
+				ReasoningEffort: "xhigh",
+				Messages: []llm.Message{
+					{
+						Role: "user",
+						Content: llm.MessageContent{
+							Content: lo.ToPtr("Very complex problem"),
+						},
+					},
+				},
+			},
+			validate: func(t *testing.T, result *GenerateContentRequest) {
+				t.Helper()
+				require.NotNil(t, result.GenerationConfig)
+				require.NotNil(t, result.GenerationConfig.ThinkingConfig)
+				require.True(t, result.GenerationConfig.ThinkingConfig.IncludeThoughts)
+				// "xhigh" (from Anthropic "max") should map to Gemini "high"
 				require.Equal(t, "high", result.GenerationConfig.ThinkingConfig.ThinkingLevel)
 				require.Nil(t, result.GenerationConfig.ThinkingConfig.ThinkingBudget)
 			},
@@ -483,6 +536,74 @@ func TestConvertLLMToGeminiRequest_Basic(t *testing.T) {
 	}
 }
 
+func TestConvertLLMToGeminiRequest_VideoURL(t *testing.T) {
+	req := &llm.Request{
+		Messages: []llm.Message{
+			{
+				Role: "user",
+				Content: llm.MessageContent{
+					MultipleContent: []llm.MessageContentPart{
+						{
+							Type: "video_url",
+							VideoURL: &llm.VideoURL{
+								URL:      "https://example.com/example.mp4",
+								MIMEType: "video/quicktime",
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	result := convertLLMToGeminiRequest(req)
+	require.Len(t, result.Contents, 1)
+	require.Len(t, result.Contents[0].Parts, 1)
+	require.NotNil(t, result.Contents[0].Parts[0].FileData)
+	require.Equal(t, "https://example.com/example.mp4", result.Contents[0].Parts[0].FileData.FileURI)
+	require.Equal(t, "video/quicktime", result.Contents[0].Parts[0].FileData.MIMEType)
+}
+
+func TestConvertLLMToGeminiRequest_VideoURLWithoutKnownMIME(t *testing.T) {
+	req := &llm.Request{
+		Messages: []llm.Message{{
+			Role: "user",
+			Content: llm.MessageContent{MultipleContent: []llm.MessageContentPart{{
+				Type:     "video_url",
+				VideoURL: &llm.VideoURL{URL: "https://assets.example.com/video/input"},
+			}}},
+		}},
+	}
+
+	result := convertLLMToGeminiRequest(req)
+	require.Len(t, result.Contents, 1)
+	require.Len(t, result.Contents[0].Parts, 1)
+	require.NotNil(t, result.Contents[0].Parts[0].FileData)
+	require.Empty(t, result.Contents[0].Parts[0].FileData.MIMEType)
+}
+
+func TestConvertLLMToGeminiRequest_RemoteAudio(t *testing.T) {
+	req := &llm.Request{
+		Messages: []llm.Message{{
+			Role: "user",
+			Content: llm.MessageContent{MultipleContent: []llm.MessageContentPart{{
+				Type: "input_audio",
+				InputAudio: &llm.InputAudio{
+					URL:      "https://assets.example.com/audio/input.mp3",
+					MIMEType: "audio/mpeg",
+				},
+			}}},
+		}},
+	}
+
+	result := convertLLMToGeminiRequest(req)
+	require.Len(t, result.Contents, 1)
+	require.Len(t, result.Contents[0].Parts, 1)
+	require.NotNil(t, result.Contents[0].Parts[0].FileData)
+	require.Equal(t, "https://assets.example.com/audio/input.mp3", result.Contents[0].Parts[0].FileData.FileURI)
+	require.Equal(t, "audio/mpeg", result.Contents[0].Parts[0].FileData.MIMEType)
+}
+
 func TestConvertLLMToGeminiRequest_ResponseFormat(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -490,7 +611,7 @@ func TestConvertLLMToGeminiRequest_ResponseFormat(t *testing.T) {
 		validate func(t *testing.T, result *GenerateContentRequest)
 	}{
 		{
-			name: "json_schema converts to ResponseSchema and ResponseMIMEType",
+			name: "json_schema converts to ResponseJsonSchema and ResponseMIMEType",
 			input: &llm.Request{
 				Messages: []llm.Message{
 					{
@@ -508,10 +629,39 @@ func TestConvertLLMToGeminiRequest_ResponseFormat(t *testing.T) {
 			validate: func(t *testing.T, result *GenerateContentRequest) {
 				t.Helper()
 				require.NotNil(t, result.GenerationConfig)
-				require.NotNil(t, result.GenerationConfig.ResponseSchema)
+				require.NotNil(t, result.GenerationConfig.ResponseJsonSchema)
+				require.Nil(t, result.GenerationConfig.ResponseSchema)
 				require.Equal(t, "application/json", result.GenerationConfig.ResponseMIMEType)
-				require.Contains(t, string(result.GenerationConfig.ResponseSchema), "name")
-				require.Contains(t, string(result.GenerationConfig.ResponseSchema), "age")
+				require.Contains(t, string(result.GenerationConfig.ResponseJsonSchema), "name")
+				require.Contains(t, string(result.GenerationConfig.ResponseJsonSchema), "age")
+			},
+		},
+		{
+			name: "json_schema with OpenAI wrapper extracts inner schema for Gemini",
+			input: &llm.Request{
+				Messages: []llm.Message{
+					{
+						Role: "user",
+						Content: llm.MessageContent{
+							Content: lo.ToPtr("Generate JSON"),
+						},
+					},
+				},
+				ResponseFormat: &llm.ResponseFormat{
+					Type:       "json_schema",
+					JSONSchema: json.RawMessage(`{"name":"ping_response","schema":{"additionalProperties":false,"properties":{"pong":{"type":"boolean"}},"required":["pong"],"type":"object"}}`),
+				},
+			},
+			validate: func(t *testing.T, result *GenerateContentRequest) {
+				t.Helper()
+				require.NotNil(t, result.GenerationConfig)
+				require.NotNil(t, result.GenerationConfig.ResponseJsonSchema)
+				require.Nil(t, result.GenerationConfig.ResponseSchema)
+				require.Equal(t, "application/json", result.GenerationConfig.ResponseMIMEType)
+				// Should contain the inner schema fields, not the wrapper "name"/"schema" keys
+				require.Contains(t, string(result.GenerationConfig.ResponseJsonSchema), `"pong"`)
+				require.Contains(t, string(result.GenerationConfig.ResponseJsonSchema), `"boolean"`)
+				require.NotContains(t, string(result.GenerationConfig.ResponseJsonSchema), `"ping_response"`)
 			},
 		},
 		{
@@ -716,6 +866,32 @@ func TestConvertLLMToGeminiRequest_Tools(t *testing.T) {
 			},
 		},
 		{
+			name: "request with generic web search tool maps to google search",
+			input: &llm.Request{
+				Messages: []llm.Message{
+					{
+						Role: "user",
+						Content: llm.MessageContent{
+							Content: lo.ToPtr("Search the web"),
+						},
+					},
+				},
+				Tools: []llm.Tool{
+					{
+						Type:      llm.ToolTypeWebSearch,
+						WebSearch: &llm.WebSearch{},
+					},
+				},
+			},
+			validate: func(t *testing.T, result *GenerateContentRequest) {
+				t.Helper()
+				require.Len(t, result.Tools, 1)
+				require.NotNil(t, result.Tools[0].GoogleSearch)
+				require.Nil(t, result.Tools[0].FunctionDeclarations)
+				require.Nil(t, result.Tools[0].CodeExecution)
+			},
+		},
+		{
 			name: "request with code execution tool",
 			input: &llm.Request{
 				Messages: []llm.Message{
@@ -839,6 +1015,35 @@ func TestConvertLLMToGeminiRequest_Tools(t *testing.T) {
 				require.NotNil(t, result.ToolConfig)
 				require.NotNil(t, result.ToolConfig.FunctionCallingConfig)
 				require.Equal(t, "AUTO", result.ToolConfig.FunctionCallingConfig.Mode)
+			},
+		},
+		{
+			name: "request with strict function tool",
+			input: &llm.Request{
+				Messages: []llm.Message{
+					{
+						Role: "user",
+						Content: llm.MessageContent{
+							Content: lo.ToPtr("Test"),
+						},
+					},
+				},
+				Tools: []llm.Tool{
+					{
+						Type: llm.ToolTypeFunction,
+						Function: llm.Function{
+							Name:       "get_weather",
+							Parameters: json.RawMessage(`{"type":"object","properties":{}}`),
+							Strict:     lo.ToPtr(true),
+						},
+					},
+				},
+			},
+			validate: func(t *testing.T, result *GenerateContentRequest) {
+				t.Helper()
+				require.NotNil(t, result.ToolConfig)
+				require.NotNil(t, result.ToolConfig.FunctionCallingConfig)
+				require.Equal(t, "VALIDATED", result.ToolConfig.FunctionCallingConfig.Mode)
 			},
 		},
 		{
@@ -1250,6 +1455,114 @@ func TestConvertLLMToolMessageToGeminiContent(t *testing.T) {
 	}
 }
 
+func TestConvertLLMToolResultToGeminiContent_VertexAI(t *testing.T) {
+	// Test that Vertex AI doesn't include ID field in function response
+	req := &GenerateContentRequest{
+		Contents: []*Content{
+			{
+				Role: "model",
+				Parts: []*Part{
+					{
+						FunctionCall: &FunctionCall{
+							ID:   "call_123",
+							Name: "get_weather",
+							Args: map[string]any{"city": "Paris"},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	toolID := "call_123"
+	msg := &llm.Message{
+		Role: "tool",
+		Content: llm.MessageContent{
+			Content: lo.ToPtr(`{"temperature": 22}`),
+		},
+		ToolCallID:   &toolID,
+		ToolCallName: lo.ToPtr("get_weather"),
+	}
+
+	// Test conversion - ID should always be set for lookup purposes
+	result := convertLLMToolResultToGeminiContent(msg, req.Contents)
+	require.NotNil(t, result)
+	require.Len(t, result.Parts, 1)
+	require.NotNil(t, result.Parts[0].FunctionResponse)
+	require.Equal(t, "call_123", result.Parts[0].FunctionResponse.ID, "ID should be set for lookup")
+	require.Equal(t, "get_weather", result.Parts[0].FunctionResponse.Name)
+
+	// Verify JSON serialization - ID should be present when not empty
+	jsonBytes, err := json.Marshal(result.Parts[0].FunctionResponse)
+	require.NoError(t, err)
+	require.Contains(t, string(jsonBytes), "\"id\":", "JSON should contain ID field")
+	require.Contains(t, string(jsonBytes), "get_weather", "JSON should contain name")
+}
+
+func TestConvertLLMToGeminiRequest_MultipleToolMessages(t *testing.T) {
+	// Test that multiple tool messages are grouped into a single Content entry
+	llmReq := &llm.Request{
+		Model: "gemini-2.5-flash",
+		Messages: []llm.Message{
+			{
+				Role:    "user",
+				Content: llm.MessageContent{Content: lo.ToPtr("What's the weather and news?")},
+			},
+			{
+				Role: "assistant",
+				ToolCalls: []llm.ToolCall{
+					{
+						ID:   "call_weather",
+						Type: "function",
+						Function: llm.FunctionCall{
+							Name:      "get_weather",
+							Arguments: `{"city": "Paris"}`,
+						},
+					},
+					{
+						ID:   "call_news",
+						Type: "function",
+						Function: llm.FunctionCall{
+							Name:      "get_news",
+							Arguments: `{"category": "tech"}`,
+						},
+					},
+				},
+			},
+			{
+				Role: "tool",
+				Content: llm.MessageContent{
+					Content: lo.ToPtr(`{"temperature": 22}`),
+				},
+				ToolCallID:   lo.ToPtr("call_weather"),
+				ToolCallName: lo.ToPtr("get_weather"),
+			},
+			{
+				Role: "tool",
+				Content: llm.MessageContent{
+					Content: lo.ToPtr(`{"headlines": ["AI breakthrough"]}`),
+				},
+				ToolCallID:   lo.ToPtr("call_news"),
+				ToolCallName: lo.ToPtr("get_news"),
+			},
+		},
+	}
+
+	result := convertLLMToGeminiRequest(llmReq)
+
+	// Should have: user message, assistant with function calls, user with grouped function responses
+	require.Len(t, result.Contents, 3)
+
+	// Last content should be user role with 2 function response parts
+	lastContent := result.Contents[len(result.Contents)-1]
+	require.Equal(t, "user", lastContent.Role)
+	require.Len(t, lastContent.Parts, 2)
+	require.NotNil(t, lastContent.Parts[0].FunctionResponse)
+	require.NotNil(t, lastContent.Parts[1].FunctionResponse)
+	require.Equal(t, "get_weather", lastContent.Parts[0].FunctionResponse.Name)
+	require.Equal(t, "get_news", lastContent.Parts[1].FunctionResponse.Name)
+}
+
 // =============================================================================
 // Basic Tests for convertGeminiToLLMResponse
 // =============================================================================
@@ -1476,15 +1789,17 @@ func TestConvertGeminiToLLMResponse_ThoughtSignature(t *testing.T) {
 				require.Len(t, result.Choices, 1)
 				require.NotNil(t, result.Choices[0].Message)
 				require.NotNil(t, result.Choices[0].Message.ReasoningSignature)
-				require.True(t, shared.IsGeminiThoughtSignature(result.Choices[0].Message.ReasoningSignature))
-				decoded := shared.DecodeGeminiThoughtSignature(result.Choices[0].Message.ReasoningSignature)
-				require.NotNil(t, decoded)
-				require.Equal(t, "signature_A", *decoded)
+				require.Equal(t, "signature_A", *result.Choices[0].Message.ReasoningSignature)
 				require.Len(t, result.Choices[0].Message.ToolCalls, 1)
 				tc := result.Choices[0].Message.ToolCalls[0]
 				require.Equal(t, "call_001", tc.ID)
 				require.Equal(t, "check_flight", tc.Function.Name)
-				require.Nil(t, tc.TransformerMetadata)
+				require.NotNil(t, tc.TransformerMetadata)
+				require.Equal(
+					t,
+					"signature_A",
+					tc.TransformerMetadata[transformerMetadataKeyGoogleThoughtSignature],
+				)
 			},
 		},
 		{
@@ -1523,21 +1838,68 @@ func TestConvertGeminiToLLMResponse_ThoughtSignature(t *testing.T) {
 				t.Helper()
 				require.NotNil(t, result.Choices[0].Message)
 				require.NotNil(t, result.Choices[0].Message.ReasoningSignature)
-				require.True(t, shared.IsGeminiThoughtSignature(result.Choices[0].Message.ReasoningSignature))
-				decoded := shared.DecodeGeminiThoughtSignature(result.Choices[0].Message.ReasoningSignature)
-				require.NotNil(t, decoded)
-				require.Equal(t, "signature_parallel", *decoded)
+				require.Equal(t, "signature_parallel", *result.Choices[0].Message.ReasoningSignature)
 				require.Len(t, result.Choices[0].Message.ToolCalls, 2)
 
 				// First call should have signature
 				tc1 := result.Choices[0].Message.ToolCalls[0]
 				require.Equal(t, "call_paris", tc1.ID)
-				require.Nil(t, tc1.TransformerMetadata)
+				require.NotNil(t, tc1.TransformerMetadata)
+				require.Equal(
+					t,
+					"signature_parallel",
+					tc1.TransformerMetadata[transformerMetadataKeyGoogleThoughtSignature],
+				)
 
 				// Second call should not have signature
 				tc2 := result.Choices[0].Message.ToolCalls[1]
 				require.Equal(t, "call_london", tc2.ID)
 				require.Nil(t, tc2.TransformerMetadata)
+			},
+		},
+		{
+			name: "function call with already prefixed thought signature",
+			input: &GenerateContentResponse{
+				ResponseID:   "resp_prefixed_sig",
+				ModelVersion: "gemini-3-pro",
+				Candidates: []*Candidate{
+					{
+						Index: 0,
+						Content: &Content{
+							Role: "model",
+							Parts: []*Part{
+								{
+									FunctionCall: &FunctionCall{
+										ID:   "call_prefixed",
+										Name: "check_weather",
+										Args: map[string]any{"city": "Tokyo"},
+									},
+									ThoughtSignature: "signature_prefixed",
+								},
+							},
+						},
+						FinishReason: "STOP",
+					},
+				},
+			},
+			validate: func(t *testing.T, result *llm.Response) {
+				t.Helper()
+				require.NotNil(t, result.Choices[0].Message)
+				require.NotNil(t, result.Choices[0].Message.ReasoningSignature)
+				require.Equal(
+					t,
+					"signature_prefixed",
+					*result.Choices[0].Message.ReasoningSignature,
+				)
+				decoded := shared.DecodeGeminiThoughtSignature(result.Choices[0].Message.ReasoningSignature)
+				require.Nil(t, decoded)
+				require.Len(t, result.Choices[0].Message.ToolCalls, 1)
+				require.NotNil(t, result.Choices[0].Message.ToolCalls[0].TransformerMetadata)
+				require.Equal(
+					t,
+					"signature_prefixed",
+					result.Choices[0].Message.ToolCalls[0].TransformerMetadata[transformerMetadataKeyGoogleThoughtSignature],
+				)
 			},
 		},
 		{
@@ -1593,7 +1955,7 @@ func TestConvertLLMMessageToGeminiContent_ThoughtSignature(t *testing.T) {
 			name: "tool call with thought signature",
 			input: &llm.Message{
 				Role:               "assistant",
-				ReasoningSignature: shared.EncodeGeminiThoughtSignature(lo.ToPtr("signature_A")),
+				ReasoningSignature: shared.EncodeGeminiThoughtSignature(lo.ToPtr(base64.StdEncoding.EncodeToString([]byte{0x0a, 0x02, 0x08, 0x01}))),
 				ToolCalls: []llm.ToolCall{
 					{
 						ID:   "call_001",
@@ -1612,14 +1974,14 @@ func TestConvertLLMMessageToGeminiContent_ThoughtSignature(t *testing.T) {
 				require.Len(t, result.Parts, 1)
 				require.NotNil(t, result.Parts[0].FunctionCall)
 				require.Equal(t, "check_flight", result.Parts[0].FunctionCall.Name)
-				require.Equal(t, "signature_A", result.Parts[0].ThoughtSignature)
+				require.Equal(t, base64.StdEncoding.EncodeToString([]byte{0x0a, 0x02, 0x08, 0x01}), result.Parts[0].ThoughtSignature)
 			},
 		},
 		{
 			name: "multiple tool calls - only first has signature",
 			input: &llm.Message{
 				Role:               "assistant",
-				ReasoningSignature: shared.EncodeGeminiThoughtSignature(lo.ToPtr("signature_A")),
+				ReasoningSignature: shared.EncodeGeminiThoughtSignature(lo.ToPtr(base64.StdEncoding.EncodeToString([]byte{0x0a, 0x02, 0x08, 0x01}))),
 				ToolCalls: []llm.ToolCall{
 					{
 						ID:   "call_001",
@@ -1645,16 +2007,51 @@ func TestConvertLLMMessageToGeminiContent_ThoughtSignature(t *testing.T) {
 				require.Len(t, result.Parts, 2)
 
 				require.Equal(t, "check_flight", result.Parts[0].FunctionCall.Name)
-				require.Equal(t, "signature_A", result.Parts[0].ThoughtSignature)
+				require.Equal(t, base64.StdEncoding.EncodeToString([]byte{0x0a, 0x02, 0x08, 0x01}), result.Parts[0].ThoughtSignature)
 
 				require.Equal(t, "book_taxi", result.Parts[1].FunctionCall.Name)
 				require.Empty(t, result.Parts[1].ThoughtSignature)
 			},
 		},
 		{
-			name: "tool call without signature",
+			name: "multiple tool calls with per-tool thought signature metadata",
 			input: &llm.Message{
 				Role: "assistant",
+				ToolCalls: []llm.ToolCall{
+					{
+						ID:   "call_001",
+						Type: "function",
+						Function: llm.FunctionCall{
+							Name:      "check_flight",
+							Arguments: `{"flight":"AA100"}`,
+						},
+					},
+					{
+						ID:   "call_002",
+						Type: "function",
+						Function: llm.FunctionCall{
+							Name:      "book_taxi",
+							Arguments: `{"time":"10 AM"}`,
+						},
+						TransformerMetadata: map[string]any{
+							transformerMetadataKeyGoogleThoughtSignature: base64.StdEncoding.EncodeToString([]byte{0x0a, 0x02, 0x41, 0x42}),
+						},
+					},
+				},
+			},
+			validate: func(t *testing.T, result *Content) {
+				t.Helper()
+				require.NotNil(t, result)
+				require.Len(t, result.Parts, 2)
+				require.Empty(t, result.Parts[0].ThoughtSignature)
+				require.Equal(t, base64.StdEncoding.EncodeToString([]byte{0x0a, 0x02, 0x41, 0x42}), result.Parts[1].ThoughtSignature)
+			},
+		},
+		{
+			name: "tool call with unrecognized signature uses default",
+			input: &llm.Message{
+				Role:               "assistant",
+				ReasoningSignature: lo.ToPtr("encrypted_data"),
 				ToolCalls: []llm.ToolCall{
 					{
 						ID:   "call_001",
@@ -1671,7 +2068,7 @@ func TestConvertLLMMessageToGeminiContent_ThoughtSignature(t *testing.T) {
 				require.NotNil(t, result)
 				require.Len(t, result.Parts, 1)
 				require.NotNil(t, result.Parts[0].FunctionCall)
-				require.Equal(t, "context_engineering_is_the_way_to_go", result.Parts[0].ThoughtSignature)
+				require.Equal(t, ContextEngineeringThoughtSignature, result.Parts[0].ThoughtSignature)
 			},
 		},
 		{
@@ -1701,7 +2098,7 @@ func TestConvertLLMMessageToGeminiContent_ThoughtSignature(t *testing.T) {
 				t.Helper()
 				require.NotNil(t, result)
 				require.Len(t, result.Parts, 2)
-				require.Equal(t, "context_engineering_is_the_way_to_go", result.Parts[0].ThoughtSignature)
+				require.Equal(t, ContextEngineeringThoughtSignature, result.Parts[0].ThoughtSignature)
 				require.Empty(t, result.Parts[1].ThoughtSignature)
 			},
 		},
@@ -2315,7 +2712,7 @@ func TestConvertImageURLToGeminiPart(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := convertImageURLToGeminiPart(tt.url)
+			result := convertImageURLToGeminiPart(&llm.ImageURL{URL: tt.url})
 			tt.validate(t, result)
 		})
 	}
@@ -2500,6 +2897,66 @@ func TestConvertLLMRoleToGeminiRole(t *testing.T) {
 			require.Equal(t, tt.expected, result)
 		})
 	}
+}
+
+func TestConvertGeminiToLLMResponse_CitationMetadata(t *testing.T) {
+	resp := convertGeminiToLLMResponse(&GenerateContentResponse{
+		ResponseID:   "resp_citation_meta",
+		ModelVersion: "gemini-2.5-flash",
+		Candidates: []*Candidate{{
+			Index:   0,
+			Content: &Content{Role: "model", Parts: []*Part{{Text: "Grounded answer"}}},
+			CitationMetadata: &CitationMetadata{Citations: []*Citation{{
+				StartIndex: 0,
+				EndIndex:   8,
+				URI:        "https://example.com/citation",
+				Title:      "Citation Source",
+			}}},
+			FinishReason: "STOP",
+		}},
+	}, false)
+
+	require.Len(t, resp.Choices, 1)
+	require.NotNil(t, resp.Choices[0].Message)
+	require.Len(t, resp.Choices[0].Message.Annotations, 1)
+	require.Equal(t, "url_citation", resp.Choices[0].Message.Annotations[0].Type)
+	require.NotNil(t, resp.Choices[0].Message.Annotations[0].URLCitation)
+	require.Equal(t, "https://example.com/citation", resp.Choices[0].Message.Annotations[0].URLCitation.URL)
+	require.Equal(t, "Citation Source", resp.Choices[0].Message.Annotations[0].URLCitation.Title)
+	require.Equal(t, int64(0), lo.FromPtr(resp.Choices[0].Message.Annotations[0].StartIndex))
+	require.Equal(t, int64(8), lo.FromPtr(resp.Choices[0].Message.Annotations[0].EndIndex))
+}
+
+func TestConvertGeminiToLLMResponse_GroundingMetadataDerivesAnnotations(t *testing.T) {
+	resp := convertGeminiToLLMResponse(&GenerateContentResponse{
+		ResponseID:   "resp_grounding_annotations",
+		ModelVersion: "gemini-2.5-flash",
+		Candidates: []*Candidate{{
+			Index:   0,
+			Content: &Content{Role: "model", Parts: []*Part{{Text: "Grounded answer"}}},
+			GroundingMetadata: &GroundingMetadata{
+				GroundingChunks: []*GroundingChunk{{
+					Web: &GroundingChunkWeb{URI: "https://example.com/chunk", Title: "Chunk Source"},
+				}},
+				GroundingSupports: []*GroundingSupport{{
+					Segment:               &Segment{StartIndex: 0, EndIndex: 8},
+					GroundingChunkIndices: []int32{0},
+				}},
+			},
+			FinishReason: "STOP",
+		}},
+	}, false)
+
+	require.Len(t, resp.Choices, 1)
+	require.NotNil(t, resp.Choices[0].Message)
+	require.Len(t, resp.Choices[0].Message.Annotations, 1)
+	require.Equal(t, "url_citation", resp.Choices[0].Message.Annotations[0].Type)
+	require.NotNil(t, resp.Choices[0].Message.Annotations[0].URLCitation)
+	require.Equal(t, "https://example.com/chunk", resp.Choices[0].Message.Annotations[0].URLCitation.URL)
+	require.Equal(t, "Chunk Source", resp.Choices[0].Message.Annotations[0].URLCitation.Title)
+	require.Equal(t, int64(0), lo.FromPtr(resp.Choices[0].Message.Annotations[0].StartIndex))
+	require.Equal(t, int64(8), lo.FromPtr(resp.Choices[0].Message.Annotations[0].EndIndex))
+	require.NotNil(t, resp.Choices[0].TransformerMetadata)
 }
 
 func TestConvertGeminiToLLMResponse_GroundingMetadata(t *testing.T) {
@@ -2804,6 +3261,406 @@ func TestConvertGeminiToLLMResponse_GroundingMetadata(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			result := convertGeminiToLLMResponse(tt.input, tt.isStream)
+			tt.validate(t, result)
+		})
+	}
+}
+
+func TestConvertGeminiToLLMResponse_ToolCallThoughtSignature(t *testing.T) {
+	protoBytes := []byte{0x0a, 0x05, 0x73, 0x69, 0x67, 0x5f, 0x41}
+	protoB64 := base64.StdEncoding.EncodeToString(protoBytes)
+
+	input := &GenerateContentResponse{
+		ResponseID:   "resp_fp_sig",
+		ModelVersion: "gemini-3-pro",
+		Candidates: []*Candidate{
+			{
+				Index: 0,
+				Content: &Content{
+					Role: "model",
+					Parts: []*Part{
+						{
+							FunctionCall: &FunctionCall{
+								ID:   "call_001",
+								Name: "check_flight",
+								Args: map[string]any{"flight": "AA100"},
+							},
+							ThoughtSignature: protoB64,
+						},
+					},
+				},
+				FinishReason: "STOP",
+			},
+		},
+	}
+
+	result := convertGeminiToLLMResponse(input, false)
+	require.Len(t, result.Choices, 1)
+	require.NotNil(t, result.Choices[0].Message)
+	require.Len(t, result.Choices[0].Message.ToolCalls, 1)
+	require.NotNil(t, result.Choices[0].Message.ToolCalls[0].TransformerMetadata)
+	raw, ok := result.Choices[0].Message.ToolCalls[0].TransformerMetadata[transformerMetadataKeyGoogleThoughtSignature].(string)
+	require.True(t, ok)
+
+	decoded := shared.DecodeGeminiThoughtSignature(&raw)
+	require.NotNil(t, decoded)
+	require.Equal(t, protoB64, *decoded)
+}
+
+// =============================================================================
+// SafetySettings Tests
+// =============================================================================
+
+func TestConvertLLMToGeminiRequest_SafetySettings(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    *llm.Request
+		validate func(t *testing.T, result *GenerateContentRequest)
+	}{
+		{
+			name: "request with safety settings",
+			input: &llm.Request{
+				Model: "gemini-2.5-flash",
+				Messages: []llm.Message{
+					{
+						Role: "user",
+						Content: llm.MessageContent{
+							Content: lo.ToPtr("Hello, Gemini!"),
+						},
+					},
+				},
+				TransformerMetadata: map[string]any{
+					TransformerMetadataKeySafetySettings: []*SafetySetting{
+						{
+							Category:  "HARM_CATEGORY_HARASSMENT",
+							Threshold: "BLOCK_LOW_AND_ABOVE",
+						},
+						{
+							Category:  "HARM_CATEGORY_HATE_SPEECH",
+							Threshold: "BLOCK_MEDIUM_AND_ABOVE",
+						},
+					},
+				},
+			},
+			validate: func(t *testing.T, result *GenerateContentRequest) {
+				t.Helper()
+				require.NotNil(t, result.SafetySettings)
+				require.Len(t, result.SafetySettings, 2)
+				require.Equal(t, "HARM_CATEGORY_HARASSMENT", result.SafetySettings[0].Category)
+				require.Equal(t, "BLOCK_LOW_AND_ABOVE", result.SafetySettings[0].Threshold)
+				require.Equal(t, "HARM_CATEGORY_HATE_SPEECH", result.SafetySettings[1].Category)
+				require.Equal(t, "BLOCK_MEDIUM_AND_ABOVE", result.SafetySettings[1].Threshold)
+			},
+		},
+		{
+			name: "request without safety settings",
+			input: &llm.Request{
+				Model: "gemini-2.5-flash",
+				Messages: []llm.Message{
+					{
+						Role: "user",
+						Content: llm.MessageContent{
+							Content: lo.ToPtr("Hello, Gemini!"),
+						},
+					},
+				},
+			},
+			validate: func(t *testing.T, result *GenerateContentRequest) {
+				t.Helper()
+				require.Nil(t, result.SafetySettings)
+			},
+		},
+		{
+			name: "request with empty safety settings",
+			input: &llm.Request{
+				Model: "gemini-2.5-flash",
+				Messages: []llm.Message{
+					{
+						Role: "user",
+						Content: llm.MessageContent{
+							Content: lo.ToPtr("Hello, Gemini!"),
+						},
+					},
+				},
+				TransformerMetadata: map[string]any{
+					TransformerMetadataKeySafetySettings: []*SafetySetting{},
+				},
+			},
+			validate: func(t *testing.T, result *GenerateContentRequest) {
+				t.Helper()
+				require.Nil(t, result.SafetySettings)
+			},
+		},
+		{
+			name: "request with all safety categories",
+			input: &llm.Request{
+				Model: "gemini-2.5-flash",
+				Messages: []llm.Message{
+					{
+						Role: "user",
+						Content: llm.MessageContent{
+							Content: lo.ToPtr("Hello, Gemini!"),
+						},
+					},
+				},
+				TransformerMetadata: map[string]any{
+					TransformerMetadataKeySafetySettings: []*SafetySetting{
+						{
+							Category:  "HARM_CATEGORY_HARASSMENT",
+							Threshold: "BLOCK_NONE",
+						},
+						{
+							Category:  "HARM_CATEGORY_HATE_SPEECH",
+							Threshold: "BLOCK_LOW_AND_ABOVE",
+						},
+						{
+							Category:  "HARM_CATEGORY_SEXUALLY_EXPLICIT",
+							Threshold: "BLOCK_MEDIUM_AND_ABOVE",
+						},
+						{
+							Category:  "HARM_CATEGORY_DANGEROUS_CONTENT",
+							Threshold: "BLOCK_HIGH_AND_ABOVE",
+						},
+					},
+				},
+			},
+			validate: func(t *testing.T, result *GenerateContentRequest) {
+				t.Helper()
+				require.NotNil(t, result.SafetySettings)
+				require.Len(t, result.SafetySettings, 4)
+				require.Equal(t, "HARM_CATEGORY_HARASSMENT", result.SafetySettings[0].Category)
+				require.Equal(t, "BLOCK_NONE", result.SafetySettings[0].Threshold)
+				require.Equal(t, "HARM_CATEGORY_HATE_SPEECH", result.SafetySettings[1].Category)
+				require.Equal(t, "BLOCK_LOW_AND_ABOVE", result.SafetySettings[1].Threshold)
+				require.Equal(t, "HARM_CATEGORY_SEXUALLY_EXPLICIT", result.SafetySettings[2].Category)
+				require.Equal(t, "BLOCK_MEDIUM_AND_ABOVE", result.SafetySettings[2].Threshold)
+				require.Equal(t, "HARM_CATEGORY_DANGEROUS_CONTENT", result.SafetySettings[3].Category)
+				require.Equal(t, "BLOCK_HIGH_AND_ABOVE", result.SafetySettings[3].Threshold)
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := convertLLMToGeminiRequest(tt.input)
+			tt.validate(t, result)
+		})
+	}
+}
+
+func TestExtractSafetySettingsFromMetadata(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    map[string]any
+		validate func(t *testing.T, result []*SafetySetting)
+	}{
+		{
+			name: "extract multiple safety settings",
+			input: map[string]any{
+				TransformerMetadataKeySafetySettings: []*SafetySetting{
+					{
+						Category:  "HARM_CATEGORY_HARASSMENT",
+						Threshold: "BLOCK_LOW_AND_ABOVE",
+					},
+					{
+						Category:  "HARM_CATEGORY_HATE_SPEECH",
+						Threshold: "BLOCK_MEDIUM_AND_ABOVE",
+					},
+				},
+			},
+			validate: func(t *testing.T, result []*SafetySetting) {
+				t.Helper()
+				require.NotNil(t, result)
+				require.Len(t, result, 2)
+				require.Equal(t, "HARM_CATEGORY_HARASSMENT", result[0].Category)
+				require.Equal(t, "BLOCK_LOW_AND_ABOVE", result[0].Threshold)
+				require.Equal(t, "HARM_CATEGORY_HATE_SPEECH", result[1].Category)
+				require.Equal(t, "BLOCK_MEDIUM_AND_ABOVE", result[1].Threshold)
+			},
+		},
+		{
+			name:  "extract nil safety settings",
+			input: nil,
+			validate: func(t *testing.T, result []*SafetySetting) {
+				t.Helper()
+				require.Nil(t, result)
+			},
+		},
+		{
+			name: "extract empty safety settings",
+			input: map[string]any{
+				TransformerMetadataKeySafetySettings: []*SafetySetting{},
+			},
+			validate: func(t *testing.T, result []*SafetySetting) {
+				t.Helper()
+				require.Nil(t, result)
+			},
+		},
+		{
+			name: "extract single safety setting",
+			input: map[string]any{
+				TransformerMetadataKeySafetySettings: []*SafetySetting{
+					{
+						Category:  "HARM_CATEGORY_DANGEROUS_CONTENT",
+						Threshold: "BLOCK_NONE",
+					},
+				},
+			},
+			validate: func(t *testing.T, result []*SafetySetting) {
+				t.Helper()
+				require.NotNil(t, result)
+				require.Len(t, result, 1)
+				require.Equal(t, "HARM_CATEGORY_DANGEROUS_CONTENT", result[0].Category)
+				require.Equal(t, "BLOCK_NONE", result[0].Threshold)
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := extractSafetySettingsFromMetadata(tt.input)
+			tt.validate(t, result)
+		})
+	}
+}
+
+// =============================================================================
+// ImageConfig Tests
+// =============================================================================
+
+func TestConvertLLMToGeminiRequest_ImageConfig(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    *llm.Request
+		validate func(t *testing.T, result *GenerateContentRequest)
+	}{
+		{
+			name: "request with image config",
+			input: &llm.Request{
+				Model: "gemini-2.5-flash",
+				Messages: []llm.Message{
+					{
+						Role: "user",
+						Content: llm.MessageContent{
+							Content: lo.ToPtr("Generate an image"),
+						},
+					},
+				},
+				TransformerMetadata: map[string]any{
+					TransformerMetadataKeyImageConfig: &ImageConfig{
+						AspectRatio: "16:9",
+						ImageSize:   "2K",
+					},
+				},
+			},
+			validate: func(t *testing.T, result *GenerateContentRequest) {
+				t.Helper()
+				require.NotNil(t, result.GenerationConfig)
+				require.NotNil(t, result.GenerationConfig.ImageConfig)
+				require.Equal(t, "16:9", result.GenerationConfig.ImageConfig.AspectRatio)
+				require.Equal(t, "2K", result.GenerationConfig.ImageConfig.ImageSize)
+			},
+		},
+		{
+			name: "request without image config",
+			input: &llm.Request{
+				Model: "gemini-2.5-flash",
+				Messages: []llm.Message{
+					{
+						Role: "user",
+						Content: llm.MessageContent{
+							Content: lo.ToPtr("Hello, Gemini!"),
+						},
+					},
+				},
+			},
+			validate: func(t *testing.T, result *GenerateContentRequest) {
+				t.Helper()
+				require.Nil(t, result.GenerationConfig)
+			},
+		},
+		{
+			name: "request with nil image config",
+			input: &llm.Request{
+				Model: "gemini-2.5-flash",
+				Messages: []llm.Message{
+					{
+						Role: "user",
+						Content: llm.MessageContent{
+							Content: lo.ToPtr("Hello, Gemini!"),
+						},
+					},
+				},
+				TransformerMetadata: map[string]any{
+					TransformerMetadataKeyImageConfig: nil,
+				},
+			},
+			validate: func(t *testing.T, result *GenerateContentRequest) {
+				t.Helper()
+				require.Nil(t, result.GenerationConfig)
+			},
+		},
+		{
+			name: "request with only aspect ratio",
+			input: &llm.Request{
+				Model: "gemini-2.5-flash",
+				Messages: []llm.Message{
+					{
+						Role: "user",
+						Content: llm.MessageContent{
+							Content: lo.ToPtr("Generate an image"),
+						},
+					},
+				},
+				TransformerMetadata: map[string]any{
+					TransformerMetadataKeyImageConfig: &ImageConfig{
+						AspectRatio: "1:1",
+					},
+				},
+			},
+			validate: func(t *testing.T, result *GenerateContentRequest) {
+				t.Helper()
+				require.NotNil(t, result.GenerationConfig)
+				require.NotNil(t, result.GenerationConfig.ImageConfig)
+				require.Equal(t, "1:1", result.GenerationConfig.ImageConfig.AspectRatio)
+				require.Empty(t, result.GenerationConfig.ImageConfig.ImageSize)
+			},
+		},
+		{
+			name: "request with image config and other generation config",
+			input: &llm.Request{
+				Model: "gemini-2.5-flash",
+				Messages: []llm.Message{
+					{
+						Role: "user",
+						Content: llm.MessageContent{
+							Content: lo.ToPtr("Generate an image"),
+						},
+					},
+				},
+				Temperature: lo.ToPtr(0.7),
+				TransformerMetadata: map[string]any{
+					TransformerMetadataKeyImageConfig: &ImageConfig{
+						AspectRatio: "9:16",
+						ImageSize:   "4K",
+					},
+				},
+			},
+			validate: func(t *testing.T, result *GenerateContentRequest) {
+				t.Helper()
+				require.NotNil(t, result.GenerationConfig)
+				require.NotNil(t, result.GenerationConfig.ImageConfig)
+				require.Equal(t, "9:16", result.GenerationConfig.ImageConfig.AspectRatio)
+				require.Equal(t, "4K", result.GenerationConfig.ImageConfig.ImageSize)
+				require.NotNil(t, result.GenerationConfig.Temperature)
+				require.Equal(t, 0.7, *result.GenerationConfig.Temperature)
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := convertLLMToGeminiRequestWithConfig(tt.input, nil)
 			tt.validate(t, result)
 		})
 	}

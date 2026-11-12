@@ -34,12 +34,17 @@ type PlaygroundHandlersParams struct {
 
 	ChannelService  *biz.ChannelService
 	ModelService    *biz.ModelService
+	DefaultSelector *orchestrator.DefaultSelector
 	RequestService  *biz.RequestService
 	SystemService   *biz.SystemService
 	UsageLogService *biz.UsageLogService
 	PromptService   *biz.PromptService
+	PromptProtectionRuleService *biz.PromptProtectionRuleService
 	QuotaService    *biz.QuotaService
 	HttpClient      *httpclient.HttpClient
+	LiveStreamRegistry *biz.LiveStreamRegistry
+	ChannelLimiterManager       *orchestrator.ChannelLimiterManager
+	ProviderQuotaStatusProvider orchestrator.ProviderQuotaStatusProvider
 }
 
 type PlaygroundHandlers struct {
@@ -52,7 +57,7 @@ func NewPlaygroundHandlers(params PlaygroundHandlersParams) *PlaygroundHandlers 
 		ChannelService: params.ChannelService,
 		ChatCompletionOrchestrator: orchestrator.NewChatCompletionOrchestrator(
 			params.ChannelService,
-			params.ModelService,
+			params.DefaultSelector,
 			params.RequestService,
 			params.HttpClient,
 			aisdk.NewDataStreamTransformer(),
@@ -60,6 +65,10 @@ func NewPlaygroundHandlers(params PlaygroundHandlersParams) *PlaygroundHandlers 
 			params.UsageLogService,
 			params.PromptService,
 			params.QuotaService,
+			params.PromptProtectionRuleService,
+			params.LiveStreamRegistry,
+			params.ChannelLimiterManager,
+			params.ProviderQuotaStatusProvider,
 		),
 	}
 }
@@ -110,6 +119,20 @@ func tryExtractUpstreamErrorMessage(body []byte) string {
 
 // HandleError handles raw errors and returns a PlaygroundResponseError.
 func (handlers *PlaygroundHandlers) HandleError(rawErr error) *PlaygroundResponseError {
+	var quotaErr *orchestrator.QuotaExhaustedError
+	if errors.As(rawErr, &quotaErr) {
+		return &PlaygroundResponseError{
+			Status: http.StatusServiceUnavailable,
+			Error: struct {
+				Code    int    `json:"code,omitempty"`
+				Message string `json:"message"`
+			}{
+				Code:    http.StatusServiceUnavailable,
+				Message: quotaErr.Error(),
+			},
+		}
+	}
+
 	if httpErr, ok := xerrors.As[*httpclient.Error](rawErr); ok {
 		// Prefer upstream error message when available
 		msg := tryExtractUpstreamErrorMessage(httpErr.Body)

@@ -38,6 +38,7 @@ func (ChannelOverrideTemplate) Indexes() []ent.Index {
 func (ChannelOverrideTemplate) Fields() []ent.Field {
 	return []ent.Field{
 		field.Int("user_id").
+			Optional().
 			Immutable().
 			Comment("Owner of this template").
 			Annotations(
@@ -50,7 +51,7 @@ func (ChannelOverrideTemplate) Fields() []ent.Field {
 			Optional().
 			Comment("Template description"),
 		field.String("override_parameters").
-			Default("{}").
+			DefaultFunc(func() string { return "{}" }).
 			Deprecated("Use body_override_operations instead").
 			Annotations(
 				entgql.Skip(entgql.SkipMutationCreateInput, entgql.SkipMutationUpdateInput),
@@ -89,10 +90,10 @@ func (ChannelOverrideTemplate) Edges() []ent.Edge {
 			Ref("channel_override_templates").
 			Field("user_id").
 			Unique().
-			Required().
 			Immutable().
 			Annotations(
 				entgql.Skip(entgql.SkipMutationCreateInput, entgql.SkipMutationUpdateInput),
+				entgql.Directives(forceResolver()),
 			),
 	}
 }

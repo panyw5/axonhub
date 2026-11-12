@@ -47,15 +47,21 @@ Thread (complete user conversation session)
 ### Configuration
 ```yaml
 # config.yml
-trace:
-  thread_header: "AH-Thread-Id"
-  trace_header: "AH-Trace-Id"
-  extra_trace_headers:
-    - "Sentry-Trace"
+server:
+  trace:
+    thread_header: "AH-Thread-Id"
+    trace_header: "AH-Trace-Id"
+    extra_trace_headers:
+      - "Sentry-Trace"
+    response_trace_headers:
+      - "AH-Trace-Id"
+      - "X-Oneapi-Request-Id"
 ```
 
 - Set `extra_trace_headers` to reuse existing instrumentation headers.
-- Leave headers empty to fall back to the defaults shown above.
+- `response_trace_headers` writes the final resolved trace ID before the response starts; an empty list disables it. It is independent from inbound extraction and can include multiple gateway-compatible headers.
+- Browser clients must also include these names in `server.cors.exposed_headers` to read them.
+- Leave `thread_header` or `trace_header` empty to use the default header names above.
 
 ### Using Tracing with OpenAI-Compatible Clients
 ```bash
@@ -176,7 +182,57 @@ func sendTracedMessage(ctx context.Context, apiKey string) (*anthropic.Message, 
   </tr>
 </table>
 
+### Best Practices
+
+#### Trace Design Recommendations
+
+**Keep Reasonable Number of Requests per Trace**
+
+While AxonHub theoretically supports unlimited requests per trace, we recommend the following limits in production:
+
+- **Recommended range**: 10-50 requests per trace
+- **Acceptable range**: Up to 100 requests
+- **Avoid**: More than 1000 requests in a single trace
+
+**Reasons**:
+- **Memory consumption**: Each request body typically ranges from 1-5MB, so 100 requests could consume ~500MB memory
+- **Performance impact**: Too many requests slow down trace page loading, affecting user experience
+- **Readability**: Traces with hundreds of requests are difficult to navigate and debug
+
+**Optimization Tips**:
+1. **Split workflows**: Break down complex agent workflows into multiple traces, each representing a logical unit
+2. **Use Thread linkage**: Associate multiple traces via Thread ID to maintain conversation continuity
+3. **Limit agent iterations**: Set reasonable maximum iteration counts in agent loops to avoid infinite cycles
+4. **Implement cleanup**: Set data retention policies to periodically clean up old trace data
+
+**Example Scenarios**:
+
+✅ **Good Practice**:
+```
+Thread (User Session)
+  ├── Trace 1: Problem Analysis (5 requests)
+  ├── Trace 2: Solution Design (10 requests)
+  ├── Trace 3: Code Generation (20 requests)
+  └── Trace 4: Result Validation (8 requests)
+```
+
+❌ **Avoid**:
+```
+Thread (User Session)
+  └── Trace: Complete Workflow (500+ requests)
+```
+
+#### Request Body Size Control
+
+- For requests with large context, consider using Prompt Caching (e.g., Anthropic's caching feature)
+- Avoid storing unnecessary large files in Request Bodies (e.g., complete log files)
+- For large media files like images and videos, use URL references instead of base64 encoding
+
 ### Troubleshooting
 - **No trace recorded** – Ensure the request is authenticated and the project ID is resolved (API Key must belong to a project).
 - **Missing thread linkage** – Provide `AH-Thread-Id` or create threads via the API before sending requests.
 - **Unexpected trace IDs** – Check for upstream reverse proxies overriding headers.
+
+### Related Documentation
+- [Request Processing Guide](../getting-started/request-processing.md)
+- [Load Balancing Guide](load-balance.md)

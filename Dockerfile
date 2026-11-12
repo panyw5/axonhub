@@ -1,7 +1,7 @@
-FROM --platform=$BUILDPLATFORM node:20-alpine AS frontend-builder
+FROM --platform=$BUILDPLATFORM node:22-alpine AS frontend-builder
 
 WORKDIR /build
-RUN corepack enable && corepack prepare pnpm@latest --activate
+RUN corepack enable && corepack prepare pnpm@10 --activate
 COPY frontend/package.json frontend/pnpm-lock.yaml ./
 RUN --mount=type=cache,target=/root/.local/share/pnpm/store \
     pnpm install --frozen-lockfile
@@ -21,6 +21,7 @@ WORKDIR /build
 RUN apk add --no-cache git ca-certificates tzdata
 
 COPY go.mod go.sum ./
+COPY llm/go.mod llm/go.sum llm/
 RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
     GOTOOLCHAIN=auto go mod download
@@ -38,14 +39,22 @@ RUN --mount=type=cache,target=/go/pkg/mod \
     -tags=nomsgpack \
     -ldflags "-s -w -X 'github.com/looplj/axonhub/internal/build.Version=$(cat internal/build/VERSION 2>/dev/null || echo dev)' -X 'github.com/looplj/axonhub/internal/build.BuildTime=$(date -u +%Y-%m-%dT%H:%M:%SZ)'" \
     -o axonhub \
-    ./cmd/axonhub
+    ./cmd/axonhub && \
+    ./scripts/verify-go-sse-dependency-test.sh && \
+    ./scripts/verify-go-sse-dependency.sh ./axonhub
 
 FROM alpine
 
 RUN apk add --no-cache ca-certificates tzdata
+RUN addgroup -S -g 65532 axonhub \
+    && adduser -S -D -H -u 65532 -G axonhub axonhub
 
 WORKDIR /app
-COPY --from=backend-builder /build/axonhub /app/axonhub
+COPY --from=backend-builder --chown=axonhub:axonhub /build/axonhub /app/axonhub
+
+# Keep root as the image default for backward compatibility with SQLite data
+# directories created by older images. Deployments that have prepared writable
+# volumes can still opt in to the unprivileged 65532:65532 user.
 
 EXPOSE 8090
 ENTRYPOINT ["/app/axonhub"]

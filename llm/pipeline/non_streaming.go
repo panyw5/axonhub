@@ -2,10 +2,11 @@ package pipeline
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"log/slog"
+	"net/http"
 
-	"github.com/looplj/axonhub/internal/log"
-	"github.com/looplj/axonhub/internal/pkg/xerrors"
 	"github.com/looplj/axonhub/llm/httpclient"
 )
 
@@ -21,42 +22,146 @@ func (p *pipeline) notStream(
 		// Apply error response middlewares
 		p.applyRawErrorResponseMiddlewares(ctx, err)
 
-		if httpErr, ok := xerrors.As[*httpclient.Error](err); ok {
-			return nil, p.Outbound.TransformError(ctx, httpErr)
+		if httpErr, ok := errors.AsType[*httpclient.Error](err); ok {
+			return nil, WrapUpstreamError(p.Outbound.TransformError(ctx, httpErr))
 		}
 
-		return nil, fmt.Errorf("failed to do request: %w", err)
+		return nil, WrapUpstreamError(fmt.Errorf("failed to do request: %w", err))
 	}
 
 	// Apply raw response middlewares
 	httpResp, err = p.applyRawResponseMiddlewares(ctx, httpResp)
 	if err != nil {
+		p.applyRawErrorResponseMiddlewares(ctx, err)
+
 		return nil, fmt.Errorf("failed to apply raw response middlewares: %w", err)
 	}
+	responseHeaders := httpclient.MergeForwardResponseHeaders(nil, httpResp.Headers)
 
 	llmResp, err := p.Outbound.TransformResponse(ctx, httpResp)
 	if err != nil {
-		return nil, fmt.Errorf("failed to transform response: %w", err)
+		p.applyRawErrorResponseMiddlewares(ctx, err)
+
+		return nil, WrapUpstreamError(fmt.Errorf("failed to transform response: %w", err))
 	}
 
 	// Apply LLM response middlewares
 	llmResp, err = p.applyLlmResponseMiddlewares(ctx, llmResp)
 	if err != nil {
+		p.applyRawErrorResponseMiddlewares(ctx, err)
+
 		return nil, fmt.Errorf("failed to apply llm response middlewares: %w", err)
 	}
 
-	log.Debug(ctx, "LLM response", log.Any("response", llmResp))
+	if p.emptyResponseDetection && !hasResponseContent(llmResp) {
+		p.applyRawErrorResponseMiddlewares(ctx, ErrEmptyResponse)
 
+		return nil, ErrEmptyResponse
+	}
+
+	slog.DebugContext(ctx, "LLM response", slog.Any("response", llmResp))
+
+	llmResp = withTransformerMetadata(request.TransformerMetadata, llmResp)
 	finalResp, err := p.Inbound.TransformResponse(ctx, llmResp)
 	if err != nil {
+		p.applyRawErrorResponseMiddlewares(ctx, err)
+
 		return nil, fmt.Errorf("failed to transform final response: %w", err)
 	}
+	preserveCodexTurnStateHeader(finalResp, httpResp)
 
 	// Apply inbound raw response middlewares after final response transformation
 	finalResp, err = p.applyInboundRawResponseMiddlewares(ctx, finalResp)
 	if err != nil {
+		p.applyRawErrorResponseMiddlewares(ctx, err)
+
 		return nil, fmt.Errorf("failed to apply inbound raw response middlewares: %w", err)
 	}
+	finalResp.Headers = httpclient.MergeForwardResponseHeaders(finalResp.Headers, responseHeaders)
 
 	return finalResp, nil
+}
+
+func (p *pipeline) autoAggregateStream(
+	ctx context.Context,
+	executor Executor,
+	request *httpclient.Request,
+) (*httpclient.Response, error) {
+	inboundStream, err := p.stream(ctx, executor, request, 0)
+	if err != nil {
+		return nil, err
+	}
+	defer inboundStream.Close()
+	upstreamHeaders := httpclient.GetResponseHeaders(inboundStream)
+
+	chunks := make([]*httpclient.StreamEvent, 0, 8)
+	for inboundStream.Next() {
+		event := inboundStream.Current()
+		if event != nil {
+			chunks = append(chunks, event)
+		}
+	}
+
+	if err := inboundStream.Err(); err != nil {
+		p.applyRawErrorResponseMiddlewares(ctx, err)
+		return nil, err
+	}
+
+	if len(chunks) == 0 {
+		p.applyRawErrorResponseMiddlewares(ctx, ErrEmptyStreamChunks)
+		return nil, ErrEmptyStreamChunks
+	}
+
+	body, _, err := p.Inbound.AggregateStreamChunks(ctx, chunks)
+	if err != nil {
+		p.applyRawErrorResponseMiddlewares(ctx, err)
+		return nil, err
+	}
+
+	if len(body) == 0 {
+		p.applyRawErrorResponseMiddlewares(ctx, ErrEmptyAggregatedBody)
+		return nil, ErrEmptyAggregatedBody
+	}
+
+	responseHeaders := http.Header{
+		"Content-Type":  []string{"application/json"},
+		"Cache-Control": []string{"no-cache"},
+	}
+	responseHeaders = httpclient.MergeForwardResponseHeaders(responseHeaders, upstreamHeaders)
+	for _, chunk := range chunks {
+		if chunk == nil {
+			continue
+		}
+		if value := chunk.Headers.Get("X-Codex-Turn-State"); value != "" {
+			responseHeaders.Set("X-Codex-Turn-State", value)
+			break
+		}
+	}
+
+	resp := &httpclient.Response{
+		StatusCode: http.StatusOK,
+		Headers:    responseHeaders,
+		Body:       body,
+	}
+
+	resp, err = p.applyInboundRawResponseMiddlewares(ctx, resp)
+	if err != nil {
+		p.applyRawErrorResponseMiddlewares(ctx, err)
+		return nil, fmt.Errorf("failed to apply inbound raw response middlewares: %w", err)
+	}
+	resp.Headers = httpclient.MergeForwardResponseHeaders(resp.Headers, responseHeaders)
+
+	return resp, nil
+}
+
+func preserveCodexTurnStateHeader(dst, src *httpclient.Response) {
+	if dst == nil || src == nil {
+		return
+	}
+	if value := src.Headers.Get("X-Codex-Turn-State"); value != "" {
+		if dst.Headers == nil {
+			dst.Headers = make(http.Header)
+		}
+		dst.Headers.Set("X-Codex-Turn-State", value)
+	}
 }

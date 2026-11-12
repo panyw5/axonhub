@@ -12,7 +12,7 @@ import { Prompt } from '../data/schema';
 import { DataTableRowActions } from './data-table-row-actions';
 import { PromptsStatusDialog } from './prompts-status-dialog';
 
-function StatusSwitchCell({ row }: { row: Row<Prompt> }) {
+function StatusSwitchCell({ row, canWrite }: { row: Row<Prompt>; canWrite: boolean }) {
   const prompt = row.original;
   const [dialogOpen, setDialogOpen] = useState(false);
 
@@ -21,6 +21,10 @@ function StatusSwitchCell({ row }: { row: Row<Prompt> }) {
   const handleSwitchClick = useCallback(() => {
     setDialogOpen(true);
   }, []);
+
+  if (!canWrite) {
+    return <Badge variant='outline'>{prompt.status}</Badge>;
+  }
 
   return (
     <>
@@ -72,6 +76,18 @@ export const createColumns = (t: ReturnType<typeof useTranslation>['t'], canWrit
         className: 'md:table-cell min-w-48',
       },
       enableHiding: false,
+      enableSorting: true,
+    },
+    {
+      accessorKey: 'order',
+      header: ({ column }) => <DataTableColumnHeader column={column} title={t('prompts.columns.order')} />,
+      cell: ({ row }) => {
+        const order = row.getValue('order') as number;
+        return <div className='text-center text-sm'>{order}</div>;
+      },
+      meta: {
+        className: 'w-[80px] min-w-[80px]',
+      },
       enableSorting: true,
     },
     {
@@ -129,7 +145,7 @@ export const createColumns = (t: ReturnType<typeof useTranslation>['t'], canWrit
     {
       accessorKey: 'status',
       header: ({ column }) => <DataTableColumnHeader column={column} title={t('common.columns.status')} />,
-      cell: StatusSwitchCell,
+      cell: ({ row }) => <StatusSwitchCell row={row} canWrite={canWrite} />,
       enableSorting: false,
       enableHiding: false,
     },
@@ -156,15 +172,15 @@ export const createColumns = (t: ReturnType<typeof useTranslation>['t'], canWrit
       enableSorting: true,
       enableHiding: false,
     },
-    {
-      id: 'actions',
-      header: t('common.columns.actions'),
-      cell: DataTableRowActions,
-      meta: {
-        className: 'w-[56px] min-w-[56px] pr-3 pl-0',
-      },
-      enableSorting: false,
-      enableHiding: false,
-    },
+    ...(canWrite
+      ? [{
+          id: 'actions',
+          header: t('common.columns.actions'),
+          cell: DataTableRowActions,
+          meta: { className: 'w-[56px] min-w-[56px] pr-3 pl-0' },
+          enableSorting: false,
+          enableHiding: false,
+        }]
+      : []),
   ];
 };

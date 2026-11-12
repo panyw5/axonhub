@@ -123,6 +123,20 @@ func (_c *ProviderQuotaStatusCreate) SetNextCheckAt(v time.Time) *ProviderQuotaS
 	return _c
 }
 
+// SetAccountKey sets the "account_key" field.
+func (_c *ProviderQuotaStatusCreate) SetAccountKey(v string) *ProviderQuotaStatusCreate {
+	_c.mutation.SetAccountKey(v)
+	return _c
+}
+
+// SetNillableAccountKey sets the "account_key" field if the given value is not nil.
+func (_c *ProviderQuotaStatusCreate) SetNillableAccountKey(v *string) *ProviderQuotaStatusCreate {
+	if v != nil {
+		_c.SetAccountKey(*v)
+	}
+	return _c
+}
+
 // SetChannel sets the "channel" edge to the Channel entity.
 func (_c *ProviderQuotaStatusCreate) SetChannel(v *Channel) *ProviderQuotaStatusCreate {
 	return _c.SetChannelID(v.ID)
@@ -187,17 +201,15 @@ func (_c *ProviderQuotaStatusCreate) defaults() error {
 		v := providerquotastatus.DefaultReady
 		_c.mutation.SetReady(v)
 	}
+	if _, ok := _c.mutation.AccountKey(); !ok {
+		v := providerquotastatus.DefaultAccountKey
+		_c.mutation.SetAccountKey(v)
+	}
 	return nil
 }
 
 // check runs all checks and user-defined validators on the builder.
 func (_c *ProviderQuotaStatusCreate) check() error {
-	if _, ok := _c.mutation.CreatedAt(); !ok {
-		return &ValidationError{Name: "created_at", err: errors.New(`ent: missing required field "ProviderQuotaStatus.created_at"`)}
-	}
-	if _, ok := _c.mutation.UpdatedAt(); !ok {
-		return &ValidationError{Name: "updated_at", err: errors.New(`ent: missing required field "ProviderQuotaStatus.updated_at"`)}
-	}
 	if _, ok := _c.mutation.DeletedAt(); !ok {
 		return &ValidationError{Name: "deleted_at", err: errors.New(`ent: missing required field "ProviderQuotaStatus.deleted_at"`)}
 	}
@@ -294,6 +306,10 @@ func (_c *ProviderQuotaStatusCreate) createSpec() (*ProviderQuotaStatus, *sqlgra
 	if value, ok := _c.mutation.NextCheckAt(); ok {
 		_spec.SetField(providerquotastatus.FieldNextCheckAt, field.TypeTime, value)
 		_node.NextCheckAt = value
+	}
+	if value, ok := _c.mutation.AccountKey(); ok {
+		_spec.SetField(providerquotastatus.FieldAccountKey, field.TypeString, value)
+		_node.AccountKey = value
 	}
 	if nodes := _c.mutation.ChannelIDs(); len(nodes) > 0 {
 		edge := &sqlgraph.EdgeSpec{
@@ -394,6 +410,18 @@ func (u *ProviderQuotaStatusUpsert) AddDeletedAt(v int) *ProviderQuotaStatusUpse
 	return u
 }
 
+// SetProviderType sets the "provider_type" field.
+func (u *ProviderQuotaStatusUpsert) SetProviderType(v providerquotastatus.ProviderType) *ProviderQuotaStatusUpsert {
+	u.Set(providerquotastatus.FieldProviderType, v)
+	return u
+}
+
+// UpdateProviderType sets the "provider_type" field to the value that was provided on create.
+func (u *ProviderQuotaStatusUpsert) UpdateProviderType() *ProviderQuotaStatusUpsert {
+	u.SetExcluded(providerquotastatus.FieldProviderType)
+	return u
+}
+
 // SetStatus sets the "status" field.
 func (u *ProviderQuotaStatusUpsert) SetStatus(v providerquotastatus.Status) *ProviderQuotaStatusUpsert {
 	u.Set(providerquotastatus.FieldStatus, v)
@@ -460,6 +488,24 @@ func (u *ProviderQuotaStatusUpsert) UpdateNextCheckAt() *ProviderQuotaStatusUpse
 	return u
 }
 
+// SetAccountKey sets the "account_key" field.
+func (u *ProviderQuotaStatusUpsert) SetAccountKey(v string) *ProviderQuotaStatusUpsert {
+	u.Set(providerquotastatus.FieldAccountKey, v)
+	return u
+}
+
+// UpdateAccountKey sets the "account_key" field to the value that was provided on create.
+func (u *ProviderQuotaStatusUpsert) UpdateAccountKey() *ProviderQuotaStatusUpsert {
+	u.SetExcluded(providerquotastatus.FieldAccountKey)
+	return u
+}
+
+// ClearAccountKey clears the value of the "account_key" field.
+func (u *ProviderQuotaStatusUpsert) ClearAccountKey() *ProviderQuotaStatusUpsert {
+	u.SetNull(providerquotastatus.FieldAccountKey)
+	return u
+}
+
 // UpdateNewValues updates the mutable fields using the new values that were set on create.
 // Using this option is equivalent to using:
 //
@@ -476,9 +522,6 @@ func (u *ProviderQuotaStatusUpsertOne) UpdateNewValues() *ProviderQuotaStatusUps
 		}
 		if _, exists := u.create.mutation.ChannelID(); exists {
 			s.SetIgnore(providerquotastatus.FieldChannelID)
-		}
-		if _, exists := u.create.mutation.ProviderType(); exists {
-			s.SetIgnore(providerquotastatus.FieldProviderType)
 		}
 	}))
 	return u
@@ -543,6 +586,20 @@ func (u *ProviderQuotaStatusUpsertOne) AddDeletedAt(v int) *ProviderQuotaStatusU
 func (u *ProviderQuotaStatusUpsertOne) UpdateDeletedAt() *ProviderQuotaStatusUpsertOne {
 	return u.Update(func(s *ProviderQuotaStatusUpsert) {
 		s.UpdateDeletedAt()
+	})
+}
+
+// SetProviderType sets the "provider_type" field.
+func (u *ProviderQuotaStatusUpsertOne) SetProviderType(v providerquotastatus.ProviderType) *ProviderQuotaStatusUpsertOne {
+	return u.Update(func(s *ProviderQuotaStatusUpsert) {
+		s.SetProviderType(v)
+	})
+}
+
+// UpdateProviderType sets the "provider_type" field to the value that was provided on create.
+func (u *ProviderQuotaStatusUpsertOne) UpdateProviderType() *ProviderQuotaStatusUpsertOne {
+	return u.Update(func(s *ProviderQuotaStatusUpsert) {
+		s.UpdateProviderType()
 	})
 }
 
@@ -620,6 +677,27 @@ func (u *ProviderQuotaStatusUpsertOne) SetNextCheckAt(v time.Time) *ProviderQuot
 func (u *ProviderQuotaStatusUpsertOne) UpdateNextCheckAt() *ProviderQuotaStatusUpsertOne {
 	return u.Update(func(s *ProviderQuotaStatusUpsert) {
 		s.UpdateNextCheckAt()
+	})
+}
+
+// SetAccountKey sets the "account_key" field.
+func (u *ProviderQuotaStatusUpsertOne) SetAccountKey(v string) *ProviderQuotaStatusUpsertOne {
+	return u.Update(func(s *ProviderQuotaStatusUpsert) {
+		s.SetAccountKey(v)
+	})
+}
+
+// UpdateAccountKey sets the "account_key" field to the value that was provided on create.
+func (u *ProviderQuotaStatusUpsertOne) UpdateAccountKey() *ProviderQuotaStatusUpsertOne {
+	return u.Update(func(s *ProviderQuotaStatusUpsert) {
+		s.UpdateAccountKey()
+	})
+}
+
+// ClearAccountKey clears the value of the "account_key" field.
+func (u *ProviderQuotaStatusUpsertOne) ClearAccountKey() *ProviderQuotaStatusUpsertOne {
+	return u.Update(func(s *ProviderQuotaStatusUpsert) {
+		s.ClearAccountKey()
 	})
 }
 
@@ -805,9 +883,6 @@ func (u *ProviderQuotaStatusUpsertBulk) UpdateNewValues() *ProviderQuotaStatusUp
 			if _, exists := b.mutation.ChannelID(); exists {
 				s.SetIgnore(providerquotastatus.FieldChannelID)
 			}
-			if _, exists := b.mutation.ProviderType(); exists {
-				s.SetIgnore(providerquotastatus.FieldProviderType)
-			}
 		}
 	}))
 	return u
@@ -872,6 +947,20 @@ func (u *ProviderQuotaStatusUpsertBulk) AddDeletedAt(v int) *ProviderQuotaStatus
 func (u *ProviderQuotaStatusUpsertBulk) UpdateDeletedAt() *ProviderQuotaStatusUpsertBulk {
 	return u.Update(func(s *ProviderQuotaStatusUpsert) {
 		s.UpdateDeletedAt()
+	})
+}
+
+// SetProviderType sets the "provider_type" field.
+func (u *ProviderQuotaStatusUpsertBulk) SetProviderType(v providerquotastatus.ProviderType) *ProviderQuotaStatusUpsertBulk {
+	return u.Update(func(s *ProviderQuotaStatusUpsert) {
+		s.SetProviderType(v)
+	})
+}
+
+// UpdateProviderType sets the "provider_type" field to the value that was provided on create.
+func (u *ProviderQuotaStatusUpsertBulk) UpdateProviderType() *ProviderQuotaStatusUpsertBulk {
+	return u.Update(func(s *ProviderQuotaStatusUpsert) {
+		s.UpdateProviderType()
 	})
 }
 
@@ -949,6 +1038,27 @@ func (u *ProviderQuotaStatusUpsertBulk) SetNextCheckAt(v time.Time) *ProviderQuo
 func (u *ProviderQuotaStatusUpsertBulk) UpdateNextCheckAt() *ProviderQuotaStatusUpsertBulk {
 	return u.Update(func(s *ProviderQuotaStatusUpsert) {
 		s.UpdateNextCheckAt()
+	})
+}
+
+// SetAccountKey sets the "account_key" field.
+func (u *ProviderQuotaStatusUpsertBulk) SetAccountKey(v string) *ProviderQuotaStatusUpsertBulk {
+	return u.Update(func(s *ProviderQuotaStatusUpsert) {
+		s.SetAccountKey(v)
+	})
+}
+
+// UpdateAccountKey sets the "account_key" field to the value that was provided on create.
+func (u *ProviderQuotaStatusUpsertBulk) UpdateAccountKey() *ProviderQuotaStatusUpsertBulk {
+	return u.Update(func(s *ProviderQuotaStatusUpsert) {
+		s.UpdateAccountKey()
+	})
+}
+
+// ClearAccountKey clears the value of the "account_key" field.
+func (u *ProviderQuotaStatusUpsertBulk) ClearAccountKey() *ProviderQuotaStatusUpsertBulk {
+	return u.Update(func(s *ProviderQuotaStatusUpsert) {
+		s.ClearAccountKey()
 	})
 }
 

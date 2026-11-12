@@ -72,6 +72,14 @@ func (_c *ChannelOverrideTemplateCreate) SetUserID(v int) *ChannelOverrideTempla
 	return _c
 }
 
+// SetNillableUserID sets the "user_id" field if the given value is not nil.
+func (_c *ChannelOverrideTemplateCreate) SetNillableUserID(v *int) *ChannelOverrideTemplateCreate {
+	if v != nil {
+		_c.SetUserID(*v)
+	}
+	return _c
+}
+
 // SetName sets the "name" field.
 func (_c *ChannelOverrideTemplateCreate) SetName(v string) *ChannelOverrideTemplateCreate {
 	_c.mutation.SetName(v)
@@ -185,7 +193,10 @@ func (_c *ChannelOverrideTemplateCreate) defaults() error {
 		_c.mutation.SetDeletedAt(v)
 	}
 	if _, ok := _c.mutation.OverrideParameters(); !ok {
-		v := channeloverridetemplate.DefaultOverrideParameters
+		if channeloverridetemplate.DefaultOverrideParameters == nil {
+			return fmt.Errorf("ent: uninitialized channeloverridetemplate.DefaultOverrideParameters (forgotten import ent/runtime?)")
+		}
+		v := channeloverridetemplate.DefaultOverrideParameters()
 		_c.mutation.SetOverrideParameters(v)
 	}
 	if _, ok := _c.mutation.OverrideHeaders(); !ok {
@@ -205,17 +216,8 @@ func (_c *ChannelOverrideTemplateCreate) defaults() error {
 
 // check runs all checks and user-defined validators on the builder.
 func (_c *ChannelOverrideTemplateCreate) check() error {
-	if _, ok := _c.mutation.CreatedAt(); !ok {
-		return &ValidationError{Name: "created_at", err: errors.New(`ent: missing required field "ChannelOverrideTemplate.created_at"`)}
-	}
-	if _, ok := _c.mutation.UpdatedAt(); !ok {
-		return &ValidationError{Name: "updated_at", err: errors.New(`ent: missing required field "ChannelOverrideTemplate.updated_at"`)}
-	}
 	if _, ok := _c.mutation.DeletedAt(); !ok {
 		return &ValidationError{Name: "deleted_at", err: errors.New(`ent: missing required field "ChannelOverrideTemplate.deleted_at"`)}
-	}
-	if _, ok := _c.mutation.UserID(); !ok {
-		return &ValidationError{Name: "user_id", err: errors.New(`ent: missing required field "ChannelOverrideTemplate.user_id"`)}
 	}
 	if _, ok := _c.mutation.Name(); !ok {
 		return &ValidationError{Name: "name", err: errors.New(`ent: missing required field "ChannelOverrideTemplate.name"`)}
@@ -230,9 +232,6 @@ func (_c *ChannelOverrideTemplateCreate) check() error {
 	}
 	if _, ok := _c.mutation.OverrideHeaders(); !ok {
 		return &ValidationError{Name: "override_headers", err: errors.New(`ent: missing required field "ChannelOverrideTemplate.override_headers"`)}
-	}
-	if len(_c.mutation.UserIDs()) == 0 {
-		return &ValidationError{Name: "user", err: errors.New(`ent: missing required edge "ChannelOverrideTemplate.user"`)}
 	}
 	return nil
 }

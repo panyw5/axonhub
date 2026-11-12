@@ -19,10 +19,6 @@ func NewEmbeddingInboundTransformer() *EmbeddingInboundTransformer {
 	return &EmbeddingInboundTransformer{}
 }
 
-func (t *EmbeddingInboundTransformer) APIFormat() llm.APIFormat {
-	return llm.APIFormatJinaEmbedding
-}
-
 func (t *EmbeddingInboundTransformer) TransformRequest(
 	ctx context.Context,
 	httpReq *httpclient.Request,
@@ -147,10 +143,11 @@ func (t *EmbeddingInboundTransformer) TransformResponse(
 			}
 		}
 
-		if llmResp.Embedding.Usage != nil {
+		if llmResp.Usage != nil {
 			embResp.Usage = EmbeddingUsage{
-				PromptTokens: llmResp.Embedding.Usage.PromptTokens,
-				TotalTokens:  llmResp.Embedding.Usage.TotalTokens,
+				PromptTokens: llmResp.Usage.PromptTokens,
+				TotalTokens:  llmResp.Usage.TotalTokens,
+				Cost:         llmResp.Usage.Cost,
 			}
 		}
 

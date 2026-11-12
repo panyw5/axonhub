@@ -10,10 +10,10 @@ import (
 	"github.com/samber/lo"
 	"github.com/stretchr/testify/require"
 
-	"github.com/looplj/axonhub/internal/pkg/xtest"
 	"github.com/looplj/axonhub/llm"
 	"github.com/looplj/axonhub/llm/auth"
 	"github.com/looplj/axonhub/llm/httpclient"
+	"github.com/looplj/axonhub/llm/internal/pkg/xtest"
 	"github.com/looplj/axonhub/llm/transformer/shared"
 )
 
@@ -67,6 +67,20 @@ func TestNewOutboundTransformer(t *testing.T) {
 	}
 }
 
+func TestOutboundTransformer_TransformResponse_CanceledFinishReason(t *testing.T) {
+	transformer, err := NewOutboundTransformer("https://api.openai.com", "test-api-key")
+	require.NoError(t, err)
+
+	result, err := transformer.TransformResponse(context.Background(), &httpclient.Response{
+		StatusCode: http.StatusOK,
+		Body:       []byte(`{"id":"resp_canceled","object":"response","created_at":1700000000,"status":"canceled","model":"gpt-5","output":[]}`),
+	})
+	require.NoError(t, err)
+	require.Len(t, result.Choices, 1)
+	require.NotNil(t, result.Choices[0].FinishReason)
+	require.Equal(t, "cancelled", *result.Choices[0].FinishReason)
+}
+
 func TestOutboundTransformer_buildFullRequestURL(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -97,6 +111,12 @@ func TestOutboundTransformer_buildFullRequestURL(t *testing.T) {
 			baseURL:  "https://api.openai.com/custom#",
 			rawURL:   true,
 			expected: "https://api.openai.com/custom/responses",
+		},
+		{
+			name:     "websocket codex base with # suffix",
+			baseURL:  "wss://chatgpt.com/backend-api/codex#",
+			rawURL:   true,
+			expected: "wss://chatgpt.com/backend-api/codex/responses",
 		},
 		{
 			name:     "raw url with explicit config",
@@ -135,6 +155,361 @@ func TestOutboundTransformer_buildFullRequestURL(t *testing.T) {
 func TestOutboundTransformer_APIFormat(t *testing.T) {
 	transformer, _ := NewOutboundTransformer("https://api.openai.com", "test-api-key")
 	require.Equal(t, llm.APIFormatOpenAIResponse, transformer.APIFormat())
+}
+
+func TestOutboundTransformer_TransformRequest_AccountIdentity(t *testing.T) {
+	transformer, err := NewOutboundTransformerWithConfig(&Config{
+		BaseURL:        "https://api.openai.com",
+		APIKeyProvider: auth.NewStaticKeyProvider("test-api-key"),
+	})
+	require.NoError(t, err)
+
+	req := &llm.Request{
+		Model: "gpt-4o",
+		Messages: []llm.Message{
+			{Role: "user", Content: llm.MessageContent{Content: lo.ToPtr("hi")}},
+		},
+	}
+
+	hreq, err := transformer.TransformRequest(context.Background(), req)
+	require.NoError(t, err)
+	require.Nil(t, hreq.Metadata)
+}
+
+func TestOutboundTransformer_TransformRequest_OmitsMetadataWhenEmpty(t *testing.T) {
+	transformer, err := NewOutboundTransformerWithConfig(&Config{
+		BaseURL:        "https://api.openai.com",
+		APIKeyProvider: auth.NewStaticKeyProvider(""),
+	})
+	require.NoError(t, err)
+
+	req := &llm.Request{
+		Model: "gpt-4o",
+		Messages: []llm.Message{
+			{Role: "user", Content: llm.MessageContent{Content: lo.ToPtr("hi")}},
+		},
+	}
+
+	hreq, err := transformer.TransformRequest(context.Background(), req)
+	require.NoError(t, err)
+	require.Nil(t, hreq.Metadata)
+}
+
+func TestOutboundTransformer_TransformRequest_PreservesClientMetadata(t *testing.T) {
+	inboundRequest := &httpclient.Request{
+		Headers: http.Header{"Content-Type": []string{"application/json"}},
+		Body: []byte(`{
+			"model":"gpt-5",
+			"input":"hello",
+			"stream":true,
+			"client_metadata":{"x-codex-turn-state":"ts-1","custom":"kept"}
+		}`),
+	}
+
+	llmRequest, err := NewInboundTransformer().TransformRequest(t.Context(), inboundRequest)
+	require.NoError(t, err)
+	llmRequest.RawRequest = inboundRequest
+
+	outbound, err := NewOutboundTransformer("https://api.openai.com", "test-api-key")
+	require.NoError(t, err)
+	outboundRequest, err := outbound.TransformRequest(t.Context(), llmRequest)
+	require.NoError(t, err)
+
+	var body map[string]any
+	require.NoError(t, json.Unmarshal(outboundRequest.Body, &body))
+	metadata, ok := body["client_metadata"].(map[string]any)
+	require.True(t, ok)
+	require.Equal(t, "ts-1", metadata["x-codex-turn-state"])
+	require.Equal(t, "kept", metadata["custom"])
+}
+
+func TestOutboundTransformer_TransformRequest_WebSearchRequiredToolChoice(t *testing.T) {
+	transformer, err := NewOutboundTransformer("https://api.openai.com", "test-api-key")
+	require.NoError(t, err)
+
+	req := &llm.Request{
+		Model: "gpt-4o-search-preview",
+		Messages: []llm.Message{{
+			Role: "user",
+			Content: llm.MessageContent{
+				Content: lo.ToPtr("latest ai news"),
+			},
+		}},
+		Tools: []llm.Tool{{
+			Type: llm.ToolTypeWebSearch,
+		}},
+		ToolChoice: &llm.ToolChoice{
+			ToolChoice: lo.ToPtr("required"),
+		},
+	}
+
+	hreq, err := transformer.TransformRequest(context.Background(), req)
+	require.NoError(t, err)
+
+	var payload map[string]any
+	err = json.Unmarshal(hreq.Body, &payload)
+	require.NoError(t, err)
+	require.Equal(t, "required", payload["tool_choice"])
+}
+
+func TestOutboundTransformer_TransformRequest_ImageGenerationToolChoice(t *testing.T) {
+	transformer, err := NewOutboundTransformer("https://api.openai.com", "test-api-key")
+	require.NoError(t, err)
+
+	req := &llm.Request{
+		Model:     "gpt-5.5",
+		APIFormat: llm.APIFormatOpenAIResponse,
+		Messages: []llm.Message{{
+			Role: "user",
+			Content: llm.MessageContent{
+				Content: lo.ToPtr("Generate an image."),
+			},
+		}},
+		Tools: []llm.Tool{{
+			Type: llm.ToolTypeImageGeneration,
+			ImageGeneration: &llm.ImageGeneration{
+				Model: "gpt-image-2",
+			},
+		}},
+		ToolChoice: &llm.ToolChoice{
+			NamedToolChoice: &llm.NamedToolChoice{Type: llm.ToolTypeImageGeneration},
+		},
+	}
+
+	hreq, err := transformer.TransformRequest(context.Background(), req)
+	require.NoError(t, err)
+
+	var payload map[string]any
+	err = json.Unmarshal(hreq.Body, &payload)
+	require.NoError(t, err)
+	require.Equal(t, "image_generation", payload["tool_choice"].(map[string]any)["type"])
+	require.NotContains(t, payload["tool_choice"].(map[string]any), "name")
+	require.Equal(t, "image_generation", payload["tools"].([]any)[0].(map[string]any)["type"])
+	require.Equal(t, "gpt-image-2", payload["tools"].([]any)[0].(map[string]any)["model"])
+}
+
+func TestOutboundTransformer_TransformRequest_ReplaysProviderRawToolsAndToolChoice(t *testing.T) {
+	inbound := NewInboundTransformer()
+	inboundReq := &httpclient.Request{
+		Body: []byte(`{
+			"model": "gpt-4o",
+			"input": "Search and run shell.",
+			"tools": [
+				{
+					"type": "tool_search",
+					"name": "search_docs",
+					"namespace": "docs"
+				},
+				{
+					"type": "function",
+					"name": "get_weather",
+					"parameters": {"type": "object", "properties": {}}
+				}
+			],
+			"tool_choice": {
+				"type": "tool_search",
+				"tools": [
+					{"type": "tool_search", "name": "search_docs"}
+				]
+			}
+		}`),
+	}
+
+	llmReq, err := inbound.TransformRequest(context.Background(), inboundReq)
+	require.NoError(t, err)
+	llmReq.Model = "mapped-model"
+
+	outbound, err := NewOutboundTransformer("https://api.openai.com", "test-api-key")
+	require.NoError(t, err)
+
+	httpReq, err := outbound.TransformRequest(context.Background(), llmReq)
+	require.NoError(t, err)
+
+	var payload map[string]any
+	err = json.Unmarshal(httpReq.Body, &payload)
+	require.NoError(t, err)
+	require.Equal(t, "mapped-model", payload["model"])
+
+	tools, ok := payload["tools"].([]any)
+	require.True(t, ok)
+	require.Len(t, tools, 2)
+	rawTool, ok := tools[0].(map[string]any)
+	require.True(t, ok)
+	require.Equal(t, "tool_search", rawTool["type"])
+	require.Equal(t, "docs", rawTool["namespace"])
+
+	toolChoice, ok := payload["tool_choice"].(map[string]any)
+	require.True(t, ok)
+	require.Equal(t, "tool_search", toolChoice["type"])
+	require.Len(t, toolChoice["tools"], 1)
+}
+
+func TestOutboundTransformer_TransformRequest_ReplaysNamespaceTool(t *testing.T) {
+	inbound := NewInboundTransformer()
+	inboundReq := &httpclient.Request{
+		Body: []byte(`{
+			"model": "gpt-4o",
+			"input": "List the projects.",
+			"tools": [
+				{
+					"type": "namespace",
+					"name": "mcp__codebase_memory_mcp",
+					"tools": [
+						{"type": "function", "name": "list_projects", "parameters": {"type": "object"}},
+						{"type": "function", "name": "get_project", "parameters": {"type": "object"}}
+					]
+				},
+				{"type": "function", "name": "get_weather", "parameters": {"type": "object"}}
+			]
+		}`),
+	}
+
+	llmReq, err := inbound.TransformRequest(context.Background(), inboundReq)
+	require.NoError(t, err)
+	require.Len(t, llmReq.Tools, 3)
+
+	outbound, err := NewOutboundTransformer("https://api.openai.com", "test-api-key")
+	require.NoError(t, err)
+
+	httpReq, err := outbound.TransformRequest(context.Background(), llmReq)
+	require.NoError(t, err)
+
+	var payload map[string]any
+	err = json.Unmarshal(httpReq.Body, &payload)
+	require.NoError(t, err)
+
+	tools, ok := payload["tools"].([]any)
+	require.True(t, ok)
+	require.Len(t, tools, 2)
+	namespaceTool, ok := tools[0].(map[string]any)
+	require.True(t, ok)
+	require.Equal(t, "namespace", namespaceTool["type"])
+	require.Equal(t, "mcp__codebase_memory_mcp", namespaceTool["name"])
+	require.Len(t, namespaceTool["tools"], 2)
+
+	functionTool, ok := tools[1].(map[string]any)
+	require.True(t, ok)
+	require.Equal(t, "get_weather", functionTool["name"])
+}
+
+func TestOutboundTransformer_TransformRequest_ReplaysProviderRawInputItems(t *testing.T) {
+	inbound := NewInboundTransformer()
+	inboundReq := &httpclient.Request{
+		Body: []byte(`{
+			"model": "gpt-4o",
+			"input": [
+				{
+					"type": "tool_search_call",
+					"call_id": "call_search",
+					"status": "completed",
+					"arguments": {"query":"image generation","limit":10}
+				},
+				{
+					"type": "message",
+					"role": "user",
+					"content": [{"type":"input_text","text":"hello"}]
+				}
+			]
+		}`),
+	}
+
+	llmReq, err := inbound.TransformRequest(context.Background(), inboundReq)
+	require.NoError(t, err)
+
+	outbound, err := NewOutboundTransformer("https://api.openai.com", "test-api-key")
+	require.NoError(t, err)
+
+	httpReq, err := outbound.TransformRequest(context.Background(), llmReq)
+	require.NoError(t, err)
+
+	var payload map[string]any
+	err = json.Unmarshal(httpReq.Body, &payload)
+	require.NoError(t, err)
+
+	input, ok := payload["input"].([]any)
+	require.True(t, ok)
+	require.Len(t, input, 2)
+
+	rawItem, ok := input[0].(map[string]any)
+	require.True(t, ok)
+	require.Equal(t, "tool_search_call", rawItem["type"])
+	arguments, ok := rawItem["arguments"].(map[string]any)
+	require.True(t, ok)
+	require.Equal(t, "image generation", arguments["query"])
+	require.Equal(t, float64(10), arguments["limit"])
+
+	message, ok := input[1].(map[string]any)
+	require.True(t, ok)
+	require.Equal(t, "message", message["type"])
+}
+
+func TestOutboundTransformer_TransformRequest_DoesNotReplayRawToolWhenToolsChanged(t *testing.T) {
+	inbound := NewInboundTransformer()
+	inboundReq := &httpclient.Request{
+		Body: []byte(`{
+			"model": "gpt-4o",
+			"input": "Search and run shell.",
+			"tools": [
+				{"type": "tool_search", "name": "search_docs", "namespace": "docs"},
+				{"type": "function", "name": "get_weather", "parameters": {"type": "object", "properties": {}}}
+			]
+		}`),
+	}
+
+	llmReq, err := inbound.TransformRequest(context.Background(), inboundReq)
+	require.NoError(t, err)
+	llmReq.Tools = []llm.Tool{{
+		Type: "function",
+		Function: llm.Function{
+			Name:       "different_tool",
+			Parameters: json.RawMessage(`{"type":"object","properties":{}}`),
+		},
+	}}
+
+	outbound, err := NewOutboundTransformer("https://api.openai.com", "test-api-key")
+	require.NoError(t, err)
+
+	httpReq, err := outbound.TransformRequest(context.Background(), llmReq)
+	require.NoError(t, err)
+
+	var payload map[string]any
+	err = json.Unmarshal(httpReq.Body, &payload)
+	require.NoError(t, err)
+
+	tools, ok := payload["tools"].([]any)
+	require.True(t, ok)
+	require.Len(t, tools, 1)
+	tool, ok := tools[0].(map[string]any)
+	require.True(t, ok)
+	require.Equal(t, "function", tool["type"])
+	require.Equal(t, "different_tool", tool["name"])
+}
+
+func TestProviderExtensions_NotSerializedWithLLMRequest(t *testing.T) {
+	req := &llm.Request{
+		Model: "gpt-4o",
+		Messages: []llm.Message{{
+			Role:    "user",
+			Content: llm.MessageContent{Content: lo.ToPtr("hi")},
+		}},
+		ProviderExtensions: &llm.ProviderExtensions{
+			OpenAIResponses: &llm.OpenAIResponsesProviderExtensions{
+				Request: &llm.OpenAIResponsesRequestExtensions{
+					RawTools: []llm.OpenAIResponsesRawFragment{{
+						Type: "tool_search",
+						Raw:  json.RawMessage(`{"secret":"raw prompt"}`),
+					}},
+					RawToolChoice: json.RawMessage(`{"secret":"raw choice"}`),
+				},
+			},
+		},
+	}
+
+	data, err := json.Marshal(req)
+	require.NoError(t, err)
+	require.NotContains(t, string(data), "raw prompt")
+	require.NotContains(t, string(data), "raw choice")
+	require.NotContains(t, string(data), "provider_extensions")
 }
 
 func TestOutboundTransformer_TransformRequest(t *testing.T) {
@@ -275,6 +650,86 @@ func TestOutboundTransformer_TransformRequest(t *testing.T) {
 			},
 		},
 		{
+			name: "request with web search tool",
+			chatReq: &llm.Request{
+				Model: "gpt-4o-search-preview",
+				Messages: []llm.Message{
+					{
+						Role: "user",
+						Content: llm.MessageContent{
+							Content: lo.ToPtr("latest ai news"),
+						},
+					},
+				},
+				Tools: []llm.Tool{
+					{
+						Type: llm.ToolTypeWebSearch,
+						WebSearch: &llm.WebSearch{
+							AllowedDomains: []string{"openai.com"},
+							UserLocation: llm.WebSearchToolUserLocation{
+								Type:    "approximate",
+								Country: "US",
+							},
+						},
+					},
+				},
+			},
+			expectError: false,
+			validate: func(t *testing.T, result *httpclient.Request, chatReq *llm.Request) {
+				var req Request
+
+				err := json.Unmarshal(result.Body, &req)
+				require.NoError(t, err)
+				require.Equal(t, []Tool{
+					{
+						Type: "web_search",
+						Filters: &WebSearchFilters{
+							AllowedDomains: []string{"openai.com"},
+						},
+						UserLocation: &WebSearchUserLocation{
+							Type:    "approximate",
+							Country: "US",
+						},
+					},
+				}, req.Tools)
+			},
+		},
+		{
+			name: "request with google search tool maps to web_search",
+			chatReq: &llm.Request{
+				Model: "gpt-5.4",
+				Messages: []llm.Message{
+					{
+						Role: "user",
+						Content: llm.MessageContent{
+							Content: lo.ToPtr("Search the web for the latest AI announcement."),
+						},
+					},
+				},
+				Tools: []llm.Tool{{
+					Type: llm.ToolTypeGoogleSearch,
+					Google: &llm.GoogleTools{
+						Search: &llm.GoogleSearch{},
+					},
+				}},
+			},
+			expectError: false,
+			validate: func(t *testing.T, result *httpclient.Request, chatReq *llm.Request) {
+				var raw map[string]any
+
+				err := json.Unmarshal(result.Body, &raw)
+				require.NoError(t, err)
+
+				tools, ok := raw["tools"].([]any)
+				require.True(t, ok)
+				require.Len(t, tools, 1)
+
+				tool, ok := tools[0].(map[string]any)
+				require.True(t, ok)
+				require.Equal(t, llm.ToolTypeWebSearch, tool["type"])
+			},
+		},
+		{
 			name: "request with unsupported tool type is skipped",
 			chatReq: &llm.Request{
 				Model: "gpt-4o",
@@ -335,6 +790,40 @@ func TestOutboundTransformer_TransformRequest(t *testing.T) {
 				require.Equal(t, "function", req.Tools[0].Type)
 				require.Equal(t, "get_weather", req.Tools[0].Name)
 				require.Equal(t, "Get weather information", req.Tools[0].Description)
+			},
+		},
+		{
+			name: "request with zero-arg function tool normalizes empty object schema",
+			chatReq: &llm.Request{
+				Model: "gpt-4o",
+				Messages: []llm.Message{
+					{
+						Role: "user",
+						Content: llm.MessageContent{
+							Content: lo.ToPtr("Run the tool"),
+						},
+					},
+				},
+				Tools: []llm.Tool{
+					{
+						Type: "function",
+						Function: llm.Function{
+							Name:        "ping",
+							Description: "Ping tool",
+							Parameters:  []byte(`{"type":"object"}`),
+						},
+					},
+				},
+			},
+			expectError: false,
+			validate: func(t *testing.T, result *httpclient.Request, chatReq *llm.Request) {
+				var req Request
+
+				err := json.Unmarshal(result.Body, &req)
+				require.NoError(t, err)
+				require.Len(t, req.Tools, 1)
+				require.Equal(t, "object", req.Tools[0].Parameters["type"])
+				require.Equal(t, map[string]any{}, req.Tools[0].Parameters["properties"])
 			},
 		},
 		{
@@ -416,7 +905,7 @@ func TestOutboundTransformer_TransformRequest(t *testing.T) {
 			},
 		},
 		{
-			name: "request with tool choice",
+			name: "request with tool choice auto",
 			chatReq: &llm.Request{
 				Model: "gpt-4o",
 				Messages: []llm.Message{
@@ -602,6 +1091,30 @@ func TestOutboundTransformer_TransformRequest(t *testing.T) {
 				require.Equal(t, []string{"file_search_call.results", "reasoning.encrypted_content"}, req.Include)
 			},
 		},
+		{
+			name: "request with previous_response_id",
+			chatReq: &llm.Request{
+				Model:              "gpt-5.4",
+				PreviousResponseID: lo.ToPtr("resp_prev_123"),
+				Messages: []llm.Message{
+					{
+						Role: "user",
+						Content: llm.MessageContent{
+							Content: lo.ToPtr("Continue"),
+						},
+					},
+				},
+			},
+			expectError: false,
+			validate: func(t *testing.T, result *httpclient.Request, chatReq *llm.Request) {
+				var req Request
+
+				err := json.Unmarshal(result.Body, &req)
+				require.NoError(t, err)
+				require.NotNil(t, req.PreviousResponseID)
+				require.Equal(t, "resp_prev_123", *req.PreviousResponseID)
+			},
+		},
 	}
 
 	for _, tt := range tests {
@@ -621,6 +1134,115 @@ func TestOutboundTransformer_TransformRequest(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestOutboundTransformer_TransformRequest_UsesSharedSessionIDAsPromptCacheKeyFallback(t *testing.T) {
+	transformer, err := NewOutboundTransformer("https://api.openai.com", "test-api-key")
+	require.NoError(t, err)
+
+	ctx := shared.WithSessionID(context.Background(), "shared-session-123")
+
+	req := &llm.Request{
+		Model: "gpt-5.4",
+		Messages: []llm.Message{
+			{
+				Role: "user",
+				Content: llm.MessageContent{
+					Content: lo.ToPtr("Hello"),
+				},
+			},
+		},
+	}
+
+	httpReq, err := transformer.TransformRequest(ctx, req)
+	require.NoError(t, err)
+
+	var payload Request
+
+	err = json.Unmarshal(httpReq.Body, &payload)
+	require.NoError(t, err)
+	require.NotNil(t, payload.PromptCacheKey)
+	require.Equal(t, "shared-session-123-"+conversationAnchor(req.Messages), *payload.PromptCacheKey)
+}
+
+func TestOutboundTransformer_TransformRequest_PromptCacheKeyScopedPerConversation(t *testing.T) {
+	transformer, err := NewOutboundTransformer("https://api.openai.com", "test-api-key")
+	require.NoError(t, err)
+
+	ctx := shared.WithSessionID(context.Background(), "shared-session-123")
+
+	newReq := func(firstUser string, extraTurns ...llm.Message) *llm.Request {
+		messages := []llm.Message{
+			{Role: "system", Content: llm.MessageContent{Content: lo.ToPtr("You are an agent.")}},
+			{Role: "user", Content: llm.MessageContent{Content: lo.ToPtr(firstUser)}},
+		}
+		messages = append(messages, extraTurns...)
+
+		return &llm.Request{Model: "gpt-5.4", Messages: messages}
+	}
+
+	cacheKey := func(req *llm.Request) string {
+		httpReq, err := transformer.TransformRequest(ctx, req)
+		require.NoError(t, err)
+
+		var payload Request
+
+		require.NoError(t, json.Unmarshal(httpReq.Body, &payload))
+		require.NotNil(t, payload.PromptCacheKey)
+
+		return *payload.PromptCacheKey
+	}
+
+	// Later turns of the same conversation keep the same cache key.
+	turn1 := cacheKey(newReq("task A"))
+	turn2 := cacheKey(newReq("task A",
+		llm.Message{Role: "assistant", Content: llm.MessageContent{Content: lo.ToPtr("working")}},
+		llm.Message{Role: "user", Content: llm.MessageContent{Content: lo.ToPtr("continue")}},
+	))
+	require.Equal(t, turn1, turn2)
+
+	// Sibling conversations in the same session get distinct cache keys.
+	require.NotEqual(t, turn1, cacheKey(newReq("task B")))
+
+	// Client-provided keys are preserved untouched.
+	explicit := newReq("task A")
+	explicit.PromptCacheKey = lo.ToPtr("client-key")
+	require.Equal(t, "client-key", cacheKey(explicit))
+
+	// A large shared instruction prefix must not starve the first user
+	// message out of the fingerprint: sibling conversations still get
+	// distinct keys.
+	largeSystem := strings.Repeat("shared instructions. ", 2048)
+	largeReq := func(firstUser string) *llm.Request {
+		return &llm.Request{
+			Model: "gpt-5.4",
+			Messages: []llm.Message{
+				{Role: "system", Content: llm.MessageContent{Content: lo.ToPtr(largeSystem)}},
+				{Role: "user", Content: llm.MessageContent{Content: lo.ToPtr(firstUser)}},
+			},
+		}
+	}
+	require.NotEqual(t, cacheKey(largeReq("task A")), cacheKey(largeReq("task B")))
+
+	// Non-text content contributes to the fingerprint: first user messages
+	// that differ only by an image part get distinct keys.
+	imageReq := func(imageURL string) *llm.Request {
+		return &llm.Request{
+			Model: "gpt-5.4",
+			Messages: []llm.Message{
+				{Role: "user", Content: llm.MessageContent{
+					MultipleContent: []llm.MessageContentPart{
+						{Type: "text", Text: lo.ToPtr("describe this image")},
+						{Type: "image_url", ImageURL: &llm.ImageURL{URL: imageURL}},
+					},
+				}},
+			},
+		}
+	}
+	require.NotEqual(t,
+		cacheKey(imageReq("https://example.com/a.png")),
+		cacheKey(imageReq("https://example.com/b.png")),
+	)
 }
 
 func TestOutboundTransformer_TransformResponse(t *testing.T) {
@@ -764,7 +1386,40 @@ func TestOutboundTransformer_TransformResponse(t *testing.T) {
 				require.Len(t, result.Choices, 1)
 				require.NotNil(t, result.Choices[0].Message)
 				require.NotNil(t, result.Choices[0].Message.ReasoningSignature)
-				require.Equal(t, shared.OpenAIEncryptedContentPrefix+"encrypted_data_here", *result.Choices[0].Message.ReasoningSignature)
+				require.Equal(t, "encrypted_data_here", *result.Choices[0].Message.ReasoningSignature)
+			},
+		},
+		{
+			name: "response with previous_response_id",
+			httpResp: &httpclient.Response{
+				StatusCode: http.StatusOK,
+				Body: []byte(`{
+					"id": "resp_456",
+					"object": "response",
+					"created_at": 1759161016,
+					"status": "completed",
+					"model": "gpt-5.4",
+					"previous_response_id": "resp_prev_123",
+					"output": [
+						{
+							"id": "msg_456",
+							"type": "message",
+							"status": "completed",
+							"content": [
+								{
+									"type": "output_text",
+									"text": "Continued response"
+								}
+							],
+							"role": "assistant"
+						}
+					]
+				}`),
+			},
+			expectError: false,
+			validate: func(t *testing.T, result *llm.Response) {
+				require.NotNil(t, result.PreviousResponseID)
+				require.Equal(t, "resp_prev_123", *result.PreviousResponseID)
 			},
 		},
 	}
@@ -786,6 +1441,57 @@ func TestOutboundTransformer_TransformResponse(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestOutboundTransformer_TransformImageEditResponse(t *testing.T) {
+	transformer, err := NewOutboundTransformer("https://api.openai.com", "test-api-key")
+	require.NoError(t, err)
+
+	httpReq, err := transformer.TransformRequest(t.Context(), &llm.Request{
+		Model:       "gpt-image-1",
+		RequestType: llm.RequestTypeImage,
+		APIFormat:   llm.APIFormatOpenAIImageEdit,
+		Image: &llm.ImageRequest{
+			Prompt:       "edit this image",
+			Images:       [][]byte{[]byte("source-image")},
+			OutputFormat: "webp",
+			Quality:      "high",
+			Size:         "1024x1024",
+		},
+	})
+	require.NoError(t, err)
+	require.Equal(t, llm.RequestTypeImage.String(), httpReq.RequestType)
+	require.Equal(t, llm.APIFormatOpenAIResponse.String(), httpReq.APIFormat)
+
+	result, err := transformer.TransformResponse(t.Context(), &httpclient.Response{
+		StatusCode: http.StatusOK,
+		Request:    httpReq,
+		Body: []byte(`{
+			"id": "resp_image_123",
+			"object": "response",
+			"created_at": 1759161016,
+			"status": "completed",
+			"model": "gpt-image-1",
+			"output": [
+				{
+					"id": "img_123",
+					"type": "image_generation_call",
+					"status": "completed",
+					"result": "data:image/webp;base64,aW1hZ2UtZGF0YQ=="
+				}
+			]
+		}`),
+	})
+	require.NoError(t, err)
+	require.Equal(t, "image.generation", result.Object)
+	require.Equal(t, llm.RequestTypeImage, result.RequestType)
+	require.Equal(t, "gpt-image-1", result.Model)
+	require.NotNil(t, result.Image)
+	require.Equal(t, "webp", result.Image.OutputFormat)
+	require.Equal(t, "high", result.Image.Quality)
+	require.Equal(t, "1024x1024", result.Image.Size)
+	require.Len(t, result.Image.Data, 1)
+	require.Equal(t, "aW1hZ2UtZGF0YQ==", result.Image.Data[0].B64JSON)
 }
 
 func TestOutboundTransformer_TransformRequest_WithTestData(t *testing.T) {

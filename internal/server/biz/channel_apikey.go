@@ -3,27 +3,37 @@ package biz
 import (
 	"context"
 	"fmt"
-	"hash/fnv"
-	"math/rand/v2"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/samber/lo"
 
-	lru "github.com/hashicorp/golang-lru/v2"
-
-	"github.com/looplj/axonhub/internal/contexts"
+	"github.com/looplj/axonhub/internal/authz"
+	"github.com/looplj/axonhub/internal/ent"
 	"github.com/looplj/axonhub/internal/ent/channel"
-	"github.com/looplj/axonhub/internal/ent/privacy"
 	"github.com/looplj/axonhub/internal/log"
 	"github.com/looplj/axonhub/internal/objects"
+	"github.com/looplj/axonhub/internal/pkg/xcontext"
 )
 
+const allKeysDisabledErrorPrefix = "All API keys disabled"
+
 // DisableAPIKey 禁用指定 key；若所有 key 都不可用则禁用 channel.
-func (svc *ChannelService) DisableAPIKey(ctx context.Context, channelID int, key string, errorCode int, reason string) error {
+func (svc *ChannelService) DisableAPIKey(
+	ctx context.Context,
+	channelID int,
+	key string,
+	errorCode int,
+	reason string,
+	expiresAt ...*time.Time,
+) error {
 	if key == "" {
 		return fmt.Errorf("api key cannot be empty")
 	}
+
+	svc.apiKeyOpsLock.Lock()
+	defer svc.apiKeyOpsLock.Unlock()
 
 	// 读取 channel
 	ch, err := svc.entFromContext(ctx).Channel.Get(ctx, channelID)
@@ -31,8 +41,9 @@ func (svc *ChannelService) DisableAPIKey(ctx context.Context, channelID int, key
 		return fmt.Errorf("failed to get channel: %w", err)
 	}
 
-	// 检查 key 是否在 credentials 中
-	allKeys := ch.Credentials.GetAllAPIKeys()
+	// 检查 key 是否在 credentials 中。OAuth 渠道用固定的 OAuthCredentialRef 作为
+	// 唯一凭证标识，所以这里按凭证引用而非明文 key 匹配。
+	allKeys := ch.Credentials.GetAllCredentialRefs()
 
 	found := slices.Contains(allKeys, key)
 	if !found {
@@ -40,7 +51,11 @@ func (svc *ChannelService) DisableAPIKey(ctx context.Context, channelID int, key
 		return nil
 	}
 
-	disabled := lo.ContainsBy(ch.DisabledAPIKeys, func(dk objects.DisabledAPIKey) bool {
+	activeDisabledKeys := lo.Filter(ch.DisabledAPIKeys, func(dk objects.DisabledAPIKey, _ int) bool {
+		return !dk.IsExpired()
+	})
+
+	disabled := lo.ContainsBy(activeDisabledKeys, func(dk objects.DisabledAPIKey) bool {
 		return dk.Key == key
 	})
 
@@ -56,20 +71,32 @@ func (svc *ChannelService) DisableAPIKey(ctx context.Context, channelID int, key
 		ErrorCode:  errorCode,
 		Reason:     reason,
 	}
+	if len(expiresAt) > 0 {
+		disabledKey.ExpiresAt = expiresAt[0]
+	}
 
-	newDisabledKeys := append(ch.DisabledAPIKeys, disabledKey)
+	newDisabledKeys := append(activeDisabledKeys, disabledKey)
 
-	// 计算 enabled keys
-	enabledKeys := ch.Credentials.GetEnabledAPIKeys(newDisabledKeys)
+	// 计算 enabled 凭证
+	enabledKeys := ch.Credentials.GetEnabledCredentialRefs(newDisabledKeys)
 
 	// 更新 channel
 	update := svc.entFromContext(ctx).Channel.UpdateOneID(channelID).
 		SetDisabledAPIKeys(newDisabledKeys)
 
 	// 如果没有可用 key 了，禁用整个 channel
-	if len(enabledKeys) == 0 {
+	channelDisabled := len(enabledKeys) == 0
+	var (
+		autoDisabledAt     time.Time
+		autoDisabledReason string
+	)
+	if channelDisabled {
+		autoDisabledAt = time.Now()
+		autoDisabledReason = fmt.Sprintf("%s (last error: %d)", allKeysDisabledErrorPrefix, errorCode)
 		update.SetStatus(channel.StatusDisabled)
-		update.SetErrorMessage(fmt.Sprintf("All API keys disabled (last error: %d)", errorCode))
+		update.SetErrorMessage(autoDisabledReason)
+		update.SetAutoDisabledAt(autoDisabledAt)
+		update.ClearAutoDisableExpiresAt()
 		log.Warn(ctx, "Channel disabled because all API keys are disabled",
 			log.Int("channel_id", channelID),
 			log.String("channel_name", ch.Name),
@@ -85,7 +112,32 @@ func (svc *ChannelService) DisableAPIKey(ctx context.Context, channelID int, key
 		log.Int("error_code", errorCode),
 	)
 
-	// Reload channels to reflect the change in load balancer
+	if channelDisabled {
+		svc.asyncNotifyChannelAutoDisabled(ctx, ChannelAutoDisabledEvent{
+			ChannelID:       ch.ID,
+			ChannelName:     ch.Name,
+			ChannelProvider: ch.Type.String(),
+			ChannelBaseURL:  ch.BaseURL,
+			ChannelStatus:   channel.StatusDisabled.String(),
+			StatusCode:      errorCode,
+			Reason:          autoDisabledReason,
+			OccurredAt:      autoDisabledAt,
+		})
+
+		// Synchronously reload the local cache to immediately stop selecting this channel.
+		// This matches the behavior of markChannelUnavailable.
+		reloadCtx, cancel := xcontext.DetachWithTimeout(ctx, 10*time.Second)
+		defer cancel()
+
+		if err := svc.enabledChannelsCache.Load(reloadCtx, true); err != nil {
+			log.Warn(ctx, "Failed to synchronously reload channels after API key exhaustion",
+				log.Int("channel_id", channelID),
+				log.Cause(err),
+			)
+		}
+	}
+
+	// Also notify other instances via the watcher for cross-instance cache invalidation.
 	svc.asyncReloadChannels()
 
 	return nil
@@ -93,6 +145,9 @@ func (svc *ChannelService) DisableAPIKey(ctx context.Context, channelID int, key
 
 // EnableAPIKey 重新启用指定 key（从 disabled_api_keys 中移除）.
 func (svc *ChannelService) EnableAPIKey(ctx context.Context, channelID int, key string) error {
+	svc.apiKeyOpsLock.Lock()
+	defer svc.apiKeyOpsLock.Unlock()
+
 	// 读取 channel
 	ch, err := svc.entFromContext(ctx).Channel.Get(ctx, channelID)
 	if err != nil {
@@ -125,6 +180,7 @@ func (svc *ChannelService) EnableAPIKey(ctx context.Context, channelID int, key 
 	// 更新 channel
 	update := svc.entFromContext(ctx).Channel.UpdateOneID(channelID).
 		SetDisabledAPIKeys(newDisabledKeys)
+	update = applyRecoveredChannelStatus(ctx, update, ch, ch.Credentials, newDisabledKeys)
 
 	if _, err := update.Save(ctx); err != nil {
 		return fmt.Errorf("failed to enable api key: %w", err)
@@ -137,6 +193,9 @@ func (svc *ChannelService) EnableAPIKey(ctx context.Context, channelID int, key 
 
 // EnableAllAPIKeys 清空 disabled_api_keys.
 func (svc *ChannelService) EnableAllAPIKeys(ctx context.Context, channelID int) error {
+	svc.apiKeyOpsLock.Lock()
+	defer svc.apiKeyOpsLock.Unlock()
+
 	// 读取 channel
 	ch, err := svc.entFromContext(ctx).Channel.Get(ctx, channelID)
 	if err != nil {
@@ -151,6 +210,7 @@ func (svc *ChannelService) EnableAllAPIKeys(ctx context.Context, channelID int) 
 	// 更新 channel，清空 disabled_api_keys
 	update := svc.entFromContext(ctx).Channel.UpdateOneID(channelID).
 		SetDisabledAPIKeys([]objects.DisabledAPIKey{})
+	update = applyRecoveredChannelStatus(ctx, update, ch, ch.Credentials, nil)
 
 	if _, err := update.Save(ctx); err != nil {
 		return fmt.Errorf("failed to enable all api keys: %w", err)
@@ -170,6 +230,9 @@ func (svc *ChannelService) EnableSelectedAPIKeys(ctx context.Context, channelID 
 	if len(keys) == 0 {
 		return nil
 	}
+
+	svc.apiKeyOpsLock.Lock()
+	defer svc.apiKeyOpsLock.Unlock()
 
 	ch, err := svc.entFromContext(ctx).Channel.Get(ctx, channelID)
 	if err != nil {
@@ -198,6 +261,7 @@ func (svc *ChannelService) EnableSelectedAPIKeys(ctx context.Context, channelID 
 
 	update := svc.entFromContext(ctx).Channel.UpdateOneID(channelID).
 		SetDisabledAPIKeys(newDisabledKeys)
+	update = applyRecoveredChannelStatus(ctx, update, ch, ch.Credentials, newDisabledKeys)
 
 	if _, err := update.Save(ctx); err != nil {
 		return fmt.Errorf("failed to enable selected api keys: %w", err)
@@ -225,6 +289,9 @@ func (svc *ChannelService) DeleteDisabledAPIKeys(ctx context.Context, channelID 
 	if len(keys) == 0 {
 		return &DeleteDisabledAPIKeysResult{Success: true}, nil
 	}
+
+	svc.apiKeyOpsLock.Lock()
+	defer svc.apiKeyOpsLock.Unlock()
 
 	ch, err := svc.entFromContext(ctx).Channel.Get(ctx, channelID)
 	if err != nil {
@@ -280,6 +347,7 @@ func (svc *ChannelService) DeleteDisabledAPIKeys(ctx context.Context, channelID 
 	update := svc.entFromContext(ctx).Channel.UpdateOneID(channelID).
 		SetDisabledAPIKeys(newDisabledKeys).
 		SetCredentials(newCredentials)
+	update = applyRecoveredChannelStatus(ctx, update, ch, newCredentials, newDisabledKeys)
 
 	if _, err := update.Save(ctx); err != nil {
 		return nil, fmt.Errorf("failed to delete disabled api keys: %w", err)
@@ -289,8 +357,6 @@ func (svc *ChannelService) DeleteDisabledAPIKeys(ctx context.Context, channelID 
 		log.Int("channel_id", channelID),
 		log.Int("count", len(keys)),
 	)
-
-	svc.asyncReloadChannels()
 
 	// Check if we had to preserve a key
 	result := &DeleteDisabledAPIKeysResult{Success: true}
@@ -303,133 +369,148 @@ func (svc *ChannelService) DeleteDisabledAPIKeys(ctx context.Context, channelID 
 	return result, nil
 }
 
-// GetDisabledAPIKeys 获取禁用的 API keys（用于 UI 展示）.
-func (svc *ChannelService) GetDisabledAPIKeys(ctx context.Context, channelID int) ([]objects.DisabledAPIKey, error) {
-	ctx = privacy.DecisionContext(ctx, privacy.Allow)
-
-	ch, err := svc.entFromContext(ctx).Channel.Get(ctx, channelID)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get channel: %w", err)
+func applyRecoveredChannelStatus(
+	ctx context.Context,
+	update *ent.ChannelUpdateOne,
+	ch *ent.Channel,
+	credentials objects.ChannelCredentials,
+	disabledKeys []objects.DisabledAPIKey,
+) *ent.ChannelUpdateOne {
+	if ch.Status != channel.StatusDisabled || ch.ErrorMessage == nil ||
+		!strings.HasPrefix(*ch.ErrorMessage, allKeysDisabledErrorPrefix) ||
+		len(credentials.GetEnabledCredentialRefs(disabledKeys)) == 0 {
+		return update
 	}
 
-	return ch.DisabledAPIKeys, nil
+	log.Info(ctx, "Re-enabled channel after API key availability recovered",
+		log.Int("channel_id", ch.ID),
+		log.String("channel_name", ch.Name),
+	)
+
+	return update.SetStatus(channel.StatusEnabled).ClearErrorMessage().ClearAutoDisabledAt().ClearAutoDisableExpiresAt()
 }
 
-// IsAPIKeyDisabled 检查指定 key 是否被禁用.
-func (svc *ChannelService) IsAPIKeyDisabled(ctx context.Context, channelID int, key string) (bool, error) {
-	if key == "" {
-		return false, nil
-	}
+// cleanupExpiredDisabledAPIKeys prunes elapsed temporary disables and restores
+// channels that were disabled only because all of their keys were unavailable.
+func (svc *ChannelService) cleanupExpiredDisabledAPIKeys(ctx context.Context) {
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	ctx = authz.WithSystemBypass(ctx, "channel-cleanup-expired-disabled-api-keys")
 
-	ctx = privacy.DecisionContext(ctx, privacy.Allow)
-
-	ch, err := svc.entFromContext(ctx).Channel.Get(ctx, channelID)
+	channelIDs, err := svc.entFromContext(ctx).Channel.Query().
+		Where(channel.StatusIn(channel.StatusEnabled, channel.StatusDisabled)).
+		IDs(ctx)
 	if err != nil {
-		return false, fmt.Errorf("failed to get channel: %w", err)
+		log.Error(ctx, "Failed to query channels for expired API key cleanup", log.Cause(err))
+		return
 	}
 
-	disabled := lo.ContainsBy(ch.DisabledAPIKeys, func(dk objects.DisabledAPIKey) bool {
-		return dk.Key == key
+	needsReload := false
+	for _, channelID := range channelIDs {
+		cleaned, removed, err := svc.cleanupChannelExpiredDisabledAPIKeys(ctx, channelID)
+		if err != nil {
+			log.Error(ctx, "Failed to cleanup expired disabled API keys",
+				log.Int("channel_id", channelID),
+				log.Cause(err),
+			)
+			continue
+		}
+		if !cleaned {
+			continue
+		}
+
+		log.Info(ctx, "Cleaned up expired disabled API keys",
+			log.Int("channel_id", channelID),
+			log.Int("removed", removed),
+		)
+		needsReload = true
+	}
+
+	if svc.cleanupExpiredAutoDisabledChannels(ctx) {
+		needsReload = true
+	}
+
+	if needsReload {
+		svc.asyncReloadChannels()
+	}
+}
+
+func (svc *ChannelService) cleanupExpiredAutoDisabledChannels(ctx context.Context) bool {
+	now := time.Now()
+	channelIDs, err := svc.entFromContext(ctx).Channel.Query().
+		Where(
+			channel.StatusEQ(channel.StatusDisabled),
+			channel.AutoDisabledAtNotNil(),
+			channel.AutoDisableExpiresAtNotNil(),
+			channel.AutoDisableExpiresAtLTE(now),
+		).
+		IDs(ctx)
+	if err != nil {
+		log.Error(ctx, "Failed to query expired auto-disabled channels", log.Cause(err))
+		return false
+	}
+	if len(channelIDs) == 0 {
+		return false
+	}
+
+	recovered := false
+	for _, channelID := range channelIDs {
+		affected, err := svc.entFromContext(ctx).Channel.Update().
+			Where(
+				channel.ID(channelID),
+				channel.StatusEQ(channel.StatusDisabled),
+				channel.AutoDisabledAtNotNil(),
+				channel.AutoDisableExpiresAtNotNil(),
+				channel.AutoDisableExpiresAtLTE(now),
+			).
+			SetStatus(channel.StatusEnabled).
+			ClearErrorMessage().
+			ClearAutoDisabledAt().
+			ClearAutoDisableExpiresAt().
+			Save(ctx)
+		if err != nil {
+			log.Error(ctx, "Failed to recover expired auto-disabled channel",
+				log.Int("channel_id", channelID),
+				log.Cause(err),
+			)
+			continue
+		}
+		if affected == 0 {
+			continue
+		}
+
+		log.Info(ctx, "Recovered channel after auto-disable expiry",
+			log.Int("channel_id", channelID),
+		)
+		recovered = true
+	}
+
+	return recovered
+}
+
+func (svc *ChannelService) cleanupChannelExpiredDisabledAPIKeys(ctx context.Context, channelID int) (bool, int, error) {
+	svc.apiKeyOpsLock.Lock()
+	defer svc.apiKeyOpsLock.Unlock()
+
+	entClient := svc.entFromContext(ctx)
+	ch, err := entClient.Channel.Get(ctx, channelID)
+	if err != nil {
+		return false, 0, fmt.Errorf("failed to get channel: %w", err)
+	}
+
+	active := lo.Filter(ch.DisabledAPIKeys, func(dk objects.DisabledAPIKey, _ int) bool {
+		return !dk.IsExpired()
 	})
-
-	return disabled, nil
-}
-
-// traceStickyLRUSize is the default LRU cache size for trace-to-key mappings.
-const traceStickyLRUSize = 1024
-
-// TraceStickyKeyProvider selects an API key deterministically per traceID (if present),
-// using cached enabled keys from the channel snapshot.
-//
-// An LRU cache remembers previous traceID→key selections so that, as long as
-// the previously chosen key is still enabled, the same key is returned even when
-// the enabled-key set changes (e.g. a new key is added). This improves sticky
-// stability compared to pure rendezvous hashing alone.
-//
-//nolint:revive // exported for use in transformers via interface.
-type TraceStickyKeyProvider struct {
-	channel *Channel
-	cache   *lru.Cache[string, string]
-}
-
-func NewTraceStickyKeyProvider(channel *Channel) *TraceStickyKeyProvider {
-	cache, _ := lru.New[string, string](traceStickyLRUSize)
-
-	return &TraceStickyKeyProvider{
-		channel: channel,
-		cache:   cache,
-	}
-}
-
-func (p *TraceStickyKeyProvider) Get(ctx context.Context) string {
-	enabled := p.channel.cachedEnabledAPIKeys
-	if len(enabled) == 0 {
-		return p.channel.Credentials.APIKeys[0]
+	removed := len(ch.DisabledAPIKeys) - len(active)
+	if removed == 0 {
+		return false, 0, nil
 	}
 
-	if len(enabled) == 1 {
-		return enabled[0]
+	update := entClient.Channel.UpdateOneID(ch.ID).SetDisabledAPIKeys(active)
+	update = applyRecoveredChannelStatus(ctx, update, ch, ch.Credentials, active)
+	if _, err := update.Save(ctx); err != nil {
+		return false, 0, fmt.Errorf("failed to update channel: %w", err)
 	}
 
-	var selectedKey string
-	if trace, ok := contexts.GetTrace(ctx); ok && trace != nil {
-		if cached, ok := p.cache.Get(trace.TraceID); ok {
-			selectedKey = cached
-		} else {
-			selectedKey = rendezvousSelect(enabled, trace.TraceID)
-			p.cache.Add(trace.TraceID, selectedKey)
-		}
-		if log.DebugEnabled(ctx) {
-			log.Debug(ctx, "Trace sticky key selected",
-				log.String("trace_id", trace.TraceID),
-				log.String("key_prefix", safeAPIKeyPrefix(selectedKey)),
-			)
-		}
-	} else {
-		//nolint:gosec // not a security issue, just a random selection.
-		selectedKey = enabled[rand.IntN(len(enabled))]
-		if log.DebugEnabled(ctx) {
-			log.Debug(ctx, "Random key selected",
-				log.String("key_prefix", safeAPIKeyPrefix(selectedKey)),
-			)
-		}
-	}
-
-	contexts.WithChannelAPIKey(ctx, selectedKey)
-
-	return selectedKey
-}
-
-// rendezvousSelect picks a key using Highest Random Weight (Rendezvous) hashing.
-// This is stable when the key set changes (minimal remapping compared to modulo).
-func rendezvousSelect(keys []string, seed string) string {
-	bestKey := keys[0]
-	bestScore := hashAPIKey(seed + "|" + bestKey)
-
-	for i := 1; i < len(keys); i++ {
-		k := keys[i]
-
-		s := hashAPIKey(seed + "|" + k)
-		if s > bestScore {
-			bestScore = s
-			bestKey = k
-		}
-	}
-
-	return bestKey
-}
-
-func hashAPIKey(s string) uint64 {
-	h := fnv.New64a()
-	_, _ = h.Write([]byte(s))
-
-	return h.Sum64()
-}
-
-func safeAPIKeyPrefix(key string) string {
-	if len(key) >= 2 {
-		return key[:2]
-	}
-
-	return key
+	return true, removed, nil
 }

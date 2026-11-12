@@ -350,6 +350,16 @@ func StatusNotIn(vs ...Status) predicate.Project {
 	return predicate.Project(sql.FieldNotIn(FieldStatus, vs...))
 }
 
+// ProfilesIsNil applies the IsNil predicate on the "profiles" field.
+func ProfilesIsNil() predicate.Project {
+	return predicate.Project(sql.FieldIsNull(FieldProfiles))
+}
+
+// ProfilesNotNil applies the NotNil predicate on the "profiles" field.
+func ProfilesNotNil() predicate.Project {
+	return predicate.Project(sql.FieldNotNull(FieldProfiles))
+}
+
 // HasUsers applies the HasEdge predicate on the "users" edge.
 func HasUsers() predicate.Project {
 	return predicate.Project(func(s *sql.Selector) {
@@ -365,6 +375,29 @@ func HasUsers() predicate.Project {
 func HasUsersWith(preds ...predicate.User) predicate.Project {
 	return predicate.Project(func(s *sql.Selector) {
 		step := newUsersStep()
+		sqlgraph.HasNeighborsWith(s, step, func(s *sql.Selector) {
+			for _, p := range preds {
+				p(s)
+			}
+		})
+	})
+}
+
+// HasInvitations applies the HasEdge predicate on the "invitations" edge.
+func HasInvitations() predicate.Project {
+	return predicate.Project(func(s *sql.Selector) {
+		step := sqlgraph.NewStep(
+			sqlgraph.From(Table, FieldID),
+			sqlgraph.Edge(sqlgraph.O2M, false, InvitationsTable, InvitationsColumn),
+		)
+		sqlgraph.HasNeighbors(s, step)
+	})
+}
+
+// HasInvitationsWith applies the HasEdge predicate on the "invitations" edge with a given conditions (other predicates).
+func HasInvitationsWith(preds ...predicate.Invitation) predicate.Project {
+	return predicate.Project(func(s *sql.Selector) {
+		step := newInvitationsStep()
 		sqlgraph.HasNeighborsWith(s, step, func(s *sql.Selector) {
 			for _, p := range preds {
 				p(s)
@@ -516,7 +549,7 @@ func HasPrompts() predicate.Project {
 	return predicate.Project(func(s *sql.Selector) {
 		step := sqlgraph.NewStep(
 			sqlgraph.From(Table, FieldID),
-			sqlgraph.Edge(sqlgraph.M2M, false, PromptsTable, PromptsPrimaryKey...),
+			sqlgraph.Edge(sqlgraph.O2M, false, PromptsTable, PromptsColumn),
 		)
 		sqlgraph.HasNeighbors(s, step)
 	})
@@ -526,6 +559,29 @@ func HasPrompts() predicate.Project {
 func HasPromptsWith(preds ...predicate.Prompt) predicate.Project {
 	return predicate.Project(func(s *sql.Selector) {
 		step := newPromptsStep()
+		sqlgraph.HasNeighborsWith(s, step, func(s *sql.Selector) {
+			for _, p := range preds {
+				p(s)
+			}
+		})
+	})
+}
+
+// HasAPIKeyProfileTemplates applies the HasEdge predicate on the "api_key_profile_templates" edge.
+func HasAPIKeyProfileTemplates() predicate.Project {
+	return predicate.Project(func(s *sql.Selector) {
+		step := sqlgraph.NewStep(
+			sqlgraph.From(Table, FieldID),
+			sqlgraph.Edge(sqlgraph.O2M, false, APIKeyProfileTemplatesTable, APIKeyProfileTemplatesColumn),
+		)
+		sqlgraph.HasNeighbors(s, step)
+	})
+}
+
+// HasAPIKeyProfileTemplatesWith applies the HasEdge predicate on the "api_key_profile_templates" edge with a given conditions (other predicates).
+func HasAPIKeyProfileTemplatesWith(preds ...predicate.APIKeyProfileTemplate) predicate.Project {
+	return predicate.Project(func(s *sql.Selector) {
+		step := newAPIKeyProfileTemplatesStep()
 		sqlgraph.HasNeighborsWith(s, step, func(s *sql.Selector) {
 			for _, p := range preds {
 				p(s)

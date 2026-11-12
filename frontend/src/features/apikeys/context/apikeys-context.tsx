@@ -8,10 +8,12 @@ type ApiKeyDialogType =
   | 'status'
   | 'view'
   | 'profiles'
+  | 'profileTemplates'
   | 'archive'
   | 'bulkDisable'
   | 'bulkArchive'
-  | 'bulkEnable';
+  | 'bulkEnable'
+  | 'rotate';
 
 interface ApiKeysContextType {
   selectedApiKey: ApiKey | null;
@@ -37,10 +39,12 @@ export function ApiKeysProvider({ children }: { children: React.ReactNode }) {
     status: false,
     view: false,
     profiles: false,
+    profileTemplates: false,
     archive: false,
     bulkDisable: false,
     bulkArchive: false,
     bulkEnable: false,
+    rotate: false,
   });
   const resetRowSelectionRef = useRef<() => void>(() => {});
 
@@ -58,7 +62,7 @@ export function ApiKeysProvider({ children }: { children: React.ReactNode }) {
   const closeDialog = (type?: ApiKeyDialogType) => {
     if (type) {
       setIsDialogOpen((prev) => ({ ...prev, [type]: false }));
-      if (type === 'delete' || type === 'edit' || type === 'view' || type === 'archive' || type === 'status' || type === 'profiles') {
+      if (type === 'delete' || type === 'edit' || type === 'view' || type === 'archive' || type === 'status' || type === 'profiles' || type === 'rotate') {
         setSelectedApiKey(null);
       }
       if (type === 'bulkDisable' || type === 'bulkArchive' || type === 'bulkEnable') {
@@ -73,10 +77,12 @@ export function ApiKeysProvider({ children }: { children: React.ReactNode }) {
         status: false,
         view: false,
         profiles: false,
+        profileTemplates: false,
         archive: false,
         bulkDisable: false,
         bulkArchive: false,
         bulkEnable: false,
+        rotate: false,
       });
       setSelectedApiKey(null);
       setSelectedApiKeys([]);

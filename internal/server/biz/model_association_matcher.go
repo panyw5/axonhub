@@ -18,6 +18,14 @@ type ModelChannelConnection struct {
 	Priority int                 `json:"priority"`
 }
 
+// AssociationMatch groups the connections produced by a single association.
+// Keeping this boundary lets higher layers apply request-specific filtering
+// after structural association resolution has completed.
+type AssociationMatch struct {
+	Association *objects.ModelAssociation `json:"association"`
+	Connections []*ModelChannelConnection `json:"connections"`
+}
+
 // ChannelModelKey represents a unique combination of channel and model.
 type ChannelModelKey struct {
 	ChannelID int
@@ -57,11 +65,11 @@ func (k ChannelModelKey) String() string {
 	return fmt.Sprintf("%d:%s", k.ChannelID, k.ModelID)
 }
 
-// MatchAssociations matches associations against channels and their supported models.
+// MatchConnections matches associations against channels and their supported models.
 // Returns ModelChannelConnection with priority for each match.
 // Results are ordered by the matching order of associations.
 // Deduplication: Same (channel, model) combination will only appear once.
-func MatchAssociations(
+func MatchConnections(
 	associations []*objects.ModelAssociation,
 	channels []*Channel,
 ) []*ModelChannelConnection {
@@ -69,8 +77,41 @@ func MatchAssociations(
 	tracker := NewDuplicateKeyTracker()
 
 	for _, assoc := range associations {
+		if assoc.Disabled {
+			continue
+		}
 		connections := matchSingleAssociation(assoc, channels, tracker)
 		result = append(result, connections...)
+	}
+
+	return result
+}
+
+// MatchAssociations matches associations against channels while
+// preserving the originating association for each batch of resolved connections.
+// Deduplication applies within each association. Cross-association deduplication
+// must happen after request-specific conditions have been evaluated.
+func MatchAssociations(
+	associations []*objects.ModelAssociation,
+	channels []*Channel,
+) []*AssociationMatch {
+	result := make([]*AssociationMatch, 0, len(associations))
+
+	for _, assoc := range associations {
+		if assoc == nil || assoc.Disabled {
+			continue
+		}
+
+		tracker := NewDuplicateKeyTracker()
+		connections := matchSingleAssociation(assoc, channels, tracker)
+		if len(connections) == 0 {
+			continue
+		}
+
+		result = append(result, &AssociationMatch{
+			Association: assoc,
+			Connections: connections,
+		})
 	}
 
 	return result

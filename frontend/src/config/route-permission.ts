@@ -7,6 +7,7 @@ export interface RouteConfig {
   scopeLevel?: ScopeLevel; // 权限级别：system 只检查系统级权限，project 只检查项目级权限，any 检查两者
   mode?: 'hidden' | 'disabled'; // 当没有权限时的处理方式
   children?: RouteConfig[];
+  requireProjectOwner?: boolean; // 是否需要 project owner (或 system owner)
 }
 
 export interface RouteGroup {
@@ -52,13 +53,23 @@ export const routeConfigs: RouteGroup[] = [
         mode: 'hidden',
       },
       {
+        path: '/prompt-protection-rules',
+        requiredScopes: ['read_channels'],
+        mode: 'hidden',
+      },
+      {
         path: '/data-storages',
         requiredScopes: ['read_data_storages'],
         mode: 'hidden',
       },
       {
+        path: '/api-keys',
+        requiredScopes: ['read_api_keys'],
+        mode: 'hidden',
+      },
+      {
         path: '/system',
-        requiredScopes: ['read_system'],
+        requiredScopes: ['read_settings'],
         mode: 'hidden',
       },
       {
@@ -90,6 +101,12 @@ export const routeConfigs: RouteGroup[] = [
         path: '/project/usage-logs',
         requiredScopes: ['read_requests'],
         mode: 'hidden',
+      },
+      {
+        path: '/project/usage-stats',
+        requiredScopes: ['read_requests'],
+        mode: 'hidden',
+        requireProjectOwner: true,
       },
       {
         path: '/project/traces',

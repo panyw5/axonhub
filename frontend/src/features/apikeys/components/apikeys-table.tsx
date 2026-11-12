@@ -18,6 +18,7 @@ import { Button } from '@/components/ui/button';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
 import { TableSkeleton } from '@/components/ui/table-skeleton';
 import { ServerSidePagination } from '@/components/server-side-pagination';
+import type { DateTimeRangeValue } from '@/utils/date-range';
 import { useApiKeysContext } from '../context/apikeys-context';
 import { ApiKey, ApiKeyConnection } from '../data/schema';
 import { DataTableToolbar } from './data-table-toolbar';
@@ -36,17 +37,22 @@ interface DataTableProps {
   pageInfo?: ApiKeyConnection['pageInfo'];
   pageSize: number;
   totalCount?: number;
-  nameFilter: string;
+  searchFilter: string;
   statusFilter: string[];
   userFilter: string[];
+  dateRange?: DateTimeRangeValue;
+  sorting: SortingState;
   onNextPage: () => void;
   onPreviousPage: () => void;
   onPageSizeChange: (pageSize: number) => void;
-  onNameFilterChange: (value: string) => void;
+  onSearchFilterChange: (value: string) => void;
   onStatusFilterChange: (value: string[]) => void;
   onUserFilterChange: (value: string[]) => void;
+  onDateRangeChange: (value: DateTimeRangeValue | undefined) => void;
+  onSortingChange: (updater: SortingState | ((previous: SortingState) => SortingState)) => void;
   onResetFilters?: () => void;
   canWrite?: boolean;
+  canViewCreators?: boolean;
 }
 
 export function ApiKeysTable({
@@ -56,24 +62,28 @@ export function ApiKeysTable({
   pageInfo,
   pageSize,
   totalCount,
-  nameFilter,
+  searchFilter,
   statusFilter,
   userFilter,
+  dateRange,
+  sorting,
   onNextPage,
   onPreviousPage,
   onPageSizeChange,
-  onNameFilterChange,
+  onSearchFilterChange,
   onStatusFilterChange,
   onUserFilterChange,
+  onDateRangeChange,
+  onSortingChange,
   onResetFilters,
   canWrite = true,
+  canViewCreators = false,
 }: DataTableProps) {
   const { t } = useTranslation();
   const { setResetRowSelection, setSelectedApiKeys, openDialog } = useApiKeysContext();
   const [rowSelection, setRowSelection] = useState<RowSelectionState>({});
   const [columnVisibility, setColumnVisibility] = useState<VisibilityState>({});
   const [columnFilters, setColumnFilters] = useState<ColumnFiltersState>([]);
-  const [sorting, setSorting] = useState<SortingState>([]);
 
   useEffect(() => {
     const resetFn = () => {
@@ -84,8 +94,9 @@ export function ApiKeysTable({
 
   React.useEffect(() => {
     const newFilters: ColumnFiltersState = [];
-    if (nameFilter) {
-      newFilters.push({ id: 'name', value: nameFilter });
+    if (searchFilter) {
+      // Use 'name' column for the search filter display
+      newFilters.push({ id: 'name', value: searchFilter });
     }
     if (statusFilter.length > 0) {
       newFilters.push({ id: 'status', value: statusFilter });
@@ -94,7 +105,7 @@ export function ApiKeysTable({
       newFilters.push({ id: 'creator', value: userFilter });
     }
     setColumnFilters(newFilters);
-  }, [nameFilter, statusFilter, userFilter]);
+  }, [searchFilter, statusFilter, userFilter]);
 
   const handleColumnFiltersChange = (updater: ColumnFiltersState | ((prev: ColumnFiltersState) => ColumnFiltersState)) => {
     const newFilters = typeof updater === 'function' ? updater(columnFilters) : updater;
@@ -104,9 +115,10 @@ export function ApiKeysTable({
     const statusFilterValue = newFilters.find((f) => f.id === 'status')?.value;
     const userFilterValue = newFilters.find((f) => f.id === 'creator')?.value;
 
-    const newNameFilter = typeof nameFilterValue === 'string' ? nameFilterValue : '';
-    if (newNameFilter !== nameFilter) {
-      onNameFilterChange(newNameFilter);
+    // The search filter is represented by the 'name' column in the table
+    const newSearchFilter = typeof nameFilterValue === 'string' ? nameFilterValue : '';
+    if (newSearchFilter !== searchFilter) {
+      onSearchFilterChange(newSearchFilter);
     }
 
     const newStatusFilter = Array.isArray(statusFilterValue) ? statusFilterValue : [];
@@ -131,12 +143,13 @@ export function ApiKeysTable({
     },
     enableRowSelection: true,
     onRowSelectionChange: setRowSelection,
-    onSortingChange: setSorting,
+    onSortingChange,
     onColumnFiltersChange: handleColumnFiltersChange,
     onColumnVisibilityChange: setColumnVisibility,
     getCoreRowModel: getCoreRowModel(),
     manualPagination: true,
     manualFiltering: true,
+    manualSorting: true,
     getFacetedRowModel: getFacetedRowModel(),
     getFacetedUniqueValues: getFacetedUniqueValues(),
     getRowId: (row) => row.id,
@@ -172,9 +185,15 @@ export function ApiKeysTable({
   }, [data, rowSelection]);
 
   return (
-    <div className='flex flex-1 flex-col overflow-hidden'>
-      <DataTableToolbar table={table} onResetFilters={onResetFilters} />
-      <div className='shadow-soft relative mt-4 flex-1 overflow-auto overflow-x-hidden rounded-2xl border border-[var(--table-border)]'>
+    <div className='flex min-h-0 flex-1 flex-col overflow-hidden'>
+      <DataTableToolbar
+        table={table}
+        dateRange={dateRange}
+        onDateRangeChange={onDateRangeChange}
+        onResetFilters={onResetFilters}
+        canViewCreators={canViewCreators}
+      />
+      <div data-testid='api-keys-table-scroll' className='shadow-soft relative mt-4 min-h-0 flex-1 overflow-auto rounded-2xl border border-[var(--table-border)]'>
         <Table className='border-separate border-spacing-0 rounded-2xl bg-[var(--table-background)]'>
           <TableHeader className='sticky top-0 z-20 bg-[var(--table-header)] shadow-sm'>
             {table.getHeaderGroups().map((headerGroup) => (
@@ -220,7 +239,7 @@ export function ApiKeysTable({
           </TableBody>
         </Table>
       </div>
-      <div className='mt-4 flex-shrink-0'>
+      <div data-testid='api-keys-pagination' className='mt-4 flex-shrink-0'>
         <ServerSidePagination
           pageInfo={pageInfo}
           pageSize={pageSize}

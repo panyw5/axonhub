@@ -8,9 +8,9 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/looplj/axonhub/internal/authz"
 	"github.com/looplj/axonhub/internal/ent"
 	"github.com/looplj/axonhub/internal/ent/enttest"
-	"github.com/looplj/axonhub/internal/ent/privacy"
 	"github.com/looplj/axonhub/internal/objects"
 	"github.com/looplj/axonhub/internal/server/biz"
 )
@@ -93,7 +93,7 @@ func TestErrorAwareStrategy_Score_WithMockRecentSuccess(t *testing.T) {
 
 func TestErrorAwareStrategy_Score_ConsecutiveFailures(t *testing.T) {
 	ctx := context.Background()
-	ctx = privacy.DecisionContext(ctx, privacy.Allow)
+	ctx = authz.WithTestBypass(ctx)
 
 	client := enttest.NewEntClient(t, "sqlite3", "file:ent?mode=memory&_fk=0")
 	defer client.Close()
@@ -118,7 +118,7 @@ func TestErrorAwareStrategy_Score_ConsecutiveFailures(t *testing.T) {
 			EndTime:          time.Now(),
 			Success:          false,
 			RequestCompleted: true,
-			ErrorStatusCode:  500,
+			ResponseStatusCode:  500,
 		}
 		channelService.RecordPerformance(ctx, perf)
 	}
@@ -135,7 +135,7 @@ func TestErrorAwareStrategy_Score_ConsecutiveFailures(t *testing.T) {
 
 func TestErrorAwareStrategy_Score_RecentSuccess(t *testing.T) {
 	ctx := context.Background()
-	ctx = privacy.DecisionContext(ctx, privacy.Allow)
+	ctx = authz.WithTestBypass(ctx)
 
 	client := enttest.NewEntClient(t, "sqlite3", "file:ent?mode=memory&_fk=0")
 	defer client.Close()
@@ -251,160 +251,6 @@ func TestErrorAwareStrategy_ScoreConsistency(t *testing.T) {
 			// Allow small tolerance for time-based calculations (time.Since() may differ slightly)
 			assert.InDelta(t, score, debugScore, 0.01,
 				"Score and ScoreWithDebug must return nearly identical scores for %s", tc.name)
-		})
-	}
-}
-
-func TestConnectionAwareStrategy_Name(t *testing.T) {
-	client := enttest.NewEntClient(t, "sqlite3", "file:ent?mode=memory&_fk=0")
-	defer client.Close()
-
-	channelService := newTestChannelService(client)
-	tracker := NewDefaultConnectionTracker(10)
-	strategy := NewConnectionAwareStrategy(channelService, tracker)
-	assert.Equal(t, "ConnectionAware", strategy.Name())
-}
-
-func TestConnectionAwareStrategy_Score_NoTracker(t *testing.T) {
-	ctx := context.Background()
-
-	client := enttest.NewEntClient(t, "sqlite3", "file:ent?mode=memory&_fk=0")
-	defer client.Close()
-
-	channelService := newTestChannelService(client)
-	strategy := NewConnectionAwareStrategy(channelService, nil)
-
-	channel := &biz.Channel{
-		Channel: &ent.Channel{ID: 1, Name: "test"},
-	}
-
-	score := strategy.Score(ctx, channel)
-	assert.Equal(t, 25.0, score, "Should return neutral score when no tracker")
-}
-
-func TestConnectionAwareStrategy_Score_NoConnections(t *testing.T) {
-	ctx := context.Background()
-
-	client := enttest.NewEntClient(t, "sqlite3", "file:ent?mode=memory&_fk=0")
-	defer client.Close()
-
-	channelService := newTestChannelService(client)
-	tracker := NewDefaultConnectionTracker(10)
-	strategy := NewConnectionAwareStrategy(channelService, tracker)
-
-	channel := &biz.Channel{
-		Channel: &ent.Channel{ID: 1, Name: "test"},
-	}
-
-	score := strategy.Score(ctx, channel)
-	assert.Equal(t, 50.0, score, "Should return max score when no active connections")
-}
-
-func TestConnectionAwareStrategy_Score_PartialUtilization(t *testing.T) {
-	ctx := context.Background()
-
-	client := enttest.NewEntClient(t, "sqlite3", "file:ent?mode=memory&_fk=0")
-	defer client.Close()
-
-	channelService := newTestChannelService(client)
-	tracker := NewDefaultConnectionTracker(10)
-	strategy := NewConnectionAwareStrategy(channelService, tracker)
-
-	channel := &biz.Channel{
-		Channel: &ent.Channel{ID: 1, Name: "test"},
-	}
-
-	// Simulate 5 active connections out of 10 max (50% utilization)
-	for range 5 {
-		tracker.IncrementConnection(channel.ID)
-	}
-
-	score := strategy.Score(ctx, channel)
-	assert.Equal(t, 25.0, score, "Should return half max score at 50% utilization")
-}
-
-func TestConnectionAwareStrategy_Score_FullUtilization(t *testing.T) {
-	ctx := context.Background()
-
-	client := enttest.NewEntClient(t, "sqlite3", "file:ent?mode=memory&_fk=0")
-	defer client.Close()
-
-	channelService := newTestChannelService(client)
-	tracker := NewDefaultConnectionTracker(10)
-	strategy := NewConnectionAwareStrategy(channelService, tracker)
-
-	channel := &biz.Channel{
-		Channel: &ent.Channel{ID: 1, Name: "test"},
-	}
-
-	// Simulate full utilization
-	for range 10 {
-		tracker.IncrementConnection(channel.ID)
-	}
-
-	score := strategy.Score(ctx, channel)
-	assert.Equal(t, 0.0, score, "Should return 0 at 100% utilization")
-}
-
-func TestConnectionAwareStrategy_ScoreConsistency(t *testing.T) {
-	ctx := context.Background()
-
-	client := enttest.NewEntClient(t, "sqlite3", "file:ent?mode=memory&_fk=0")
-	defer client.Close()
-
-	channelService := newTestChannelService(client)
-
-	testCases := []struct {
-		name              string
-		tracker           ConnectionTracker
-		channelID         int
-		activeConnections int
-	}{
-		{
-			name:      "no tracker",
-			tracker:   nil,
-			channelID: 1,
-		},
-		{
-			name:              "no connections",
-			tracker:           NewDefaultConnectionTracker(10),
-			channelID:         1,
-			activeConnections: 0,
-		},
-		{
-			name:              "partial utilization",
-			tracker:           NewDefaultConnectionTracker(10),
-			channelID:         2,
-			activeConnections: 5,
-		},
-		{
-			name:              "full utilization",
-			tracker:           NewDefaultConnectionTracker(10),
-			channelID:         3,
-			activeConnections: 10,
-		},
-	}
-
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			strategy := NewConnectionAwareStrategy(channelService, tc.tracker)
-
-			if tc.tracker != nil {
-				tracker := tc.tracker.(*DefaultConnectionTracker)
-				for i := 0; i < tc.activeConnections; i++ {
-					tracker.IncrementConnection(tc.channelID)
-				}
-			}
-
-			channel := &biz.Channel{
-				Channel: &ent.Channel{ID: tc.channelID, Name: "test"},
-			}
-
-			score := strategy.Score(ctx, channel)
-			debugScore, _ := strategy.ScoreWithDebug(ctx, channel)
-
-			assert.Equal(t, score, debugScore,
-				"Score and ScoreWithDebug must return identical scores for %s", tc.name)
 		})
 	}
 }

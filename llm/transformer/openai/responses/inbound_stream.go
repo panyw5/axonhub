@@ -3,12 +3,15 @@ package responses
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
+	"log/slog"
+	"net/http"
 	"strings"
 
 	"github.com/samber/lo"
 
-	"github.com/looplj/axonhub/internal/dumper"
 	"github.com/looplj/axonhub/llm"
 	"github.com/looplj/axonhub/llm/httpclient"
 	"github.com/looplj/axonhub/llm/streams"
@@ -19,10 +22,15 @@ func (t *InboundTransformer) TransformStream(
 	ctx context.Context,
 	stream streams.Stream[*llm.Response],
 ) (streams.Stream[*httpclient.StreamEvent], error) {
+	stream = streams.MapErr(stream, func(resp *llm.Response) (*llm.Response, error) {
+		return mapResponseFunctionNames(resp, false), nil
+	})
 	return &responsesInboundStream{
-		source:    stream,
-		ctx:       ctx,
-		toolCalls: make(map[int]*llm.ToolCall),
+		source:              stream,
+		ctx:                 ctx,
+		toolCalls:           make(map[int]*llm.ToolCall),
+		transformerMetadata: make(map[string]any),
+		pendingReasoning:    make(map[string][]string),
 	}, nil
 }
 
@@ -38,9 +46,11 @@ type responsesInboundStream struct {
 	hasResponseCreated      bool
 	hasMessageItemStarted   bool
 	hasReasoningItemStarted bool
+	hasReasoningSummaryPart bool
 	hasContentPartStarted   bool
 	hasFinished             bool
 	responseCompleted       bool
+	pendingAnnotations      []llm.Annotation
 
 	// Response metadata
 	responseID string
@@ -57,6 +67,9 @@ type responsesInboundStream struct {
 	accumulatedText               strings.Builder
 	accumulatedReasoning          strings.Builder
 	accumulatedReasoningSignature strings.Builder
+	currentReasoningSourceID      string
+	pendingReasoning              map[string][]string
+	pendingReasoningOrder         []string
 
 	// Tool call tracking
 	toolCalls           map[int]*llm.ToolCall
@@ -65,16 +78,20 @@ type responsesInboundStream struct {
 	toolCallOutputIndex map[int]int // Maps tool call index to output index
 
 	// Response accumulation using streamAggregator
-	usage      *llm.Usage
-	aggregator *streamAggregator
+	usage               *llm.Usage
+	aggregator          *streamAggregator
+	transformerMetadata map[string]any
+	responseHeaders     http.Header
+	responseHeadersSent bool
 
 	// Event queue
 	eventQueue []*httpclient.StreamEvent
 	queueIndex int
 	err        error
 
-	// For dumping
-	sourceEvents []*llm.Response
+	// Error event tracking - when true, we've already emitted an error event
+	// to the client so Err() should return nil to avoid double error emission
+	errorEventEmitted bool
 }
 
 func (s *responsesInboundStream) enqueueEvent(ev *StreamEvent) error {
@@ -90,6 +107,7 @@ func (s *responsesInboundStream) enqueueEvent(ev *StreamEvent) error {
 		Type: string(ev.Type),
 		Data: eventData,
 	}
+	s.attachResponseHeaders(streamEvent)
 
 	s.eventQueue = append(s.eventQueue, streamEvent)
 
@@ -110,12 +128,47 @@ func (s *responsesInboundStream) Next() bool {
 		return true
 	}
 
+	// Once a terminal outcome is emitted, do not convert a later source error
+	// into a second terminal event.
+	if s.responseCompleted {
+		return false
+	}
+
 	// Clear the queue and reset index for new events
 	s.eventQueue = nil
 	s.queueIndex = 0
 
 	// Try to get the next chunk from source
 	if !s.source.Next() {
+		if s.err == nil && !s.errorEventEmitted && s.source.Err() == nil && s.hasFinished {
+			if err := s.enqueueTerminalResponse(); err != nil {
+				s.err = err
+				return false
+			}
+			return s.Next()
+		}
+
+		// Source stream ended - check if we need to emit an error event
+		if s.err == nil && !s.errorEventEmitted && s.source.Err() != nil {
+			sourceErr := s.source.Err()
+			// Don't emit error event for client cancellation
+			if errors.Is(sourceErr, context.Canceled) {
+				slog.DebugContext(s.ctx, "stream canceled by client")
+				return false
+			}
+			if errors.Is(sourceErr, context.DeadlineExceeded) {
+				slog.DebugContext(s.ctx, "stream deadline exceeded")
+				return false
+			}
+			// Emit an error event for upstream failures
+			if err := s.emitStreamErrorEvent(sourceErr); err != nil {
+				s.err = fmt.Errorf("failed to enqueue stream error event: %w", err)
+				return false
+			}
+
+			return s.Next()
+		}
+
 		return false
 	}
 
@@ -124,13 +177,22 @@ func (s *responsesInboundStream) Next() bool {
 		return s.Next() // Try next chunk
 	}
 
-	if dumper.Enabled() {
-		s.sourceEvents = append(s.sourceEvents, chunk)
-	}
-
 	// Handle [DONE] marker
 	if chunk.Object == "[DONE]" {
 		return s.Next() // Try next chunk
+	}
+
+	if headers, ok := responseTransportHeaders(chunk.TransformerMetadata); ok {
+		s.responseHeaders = headers
+	}
+	if raw, ok := rawResponseMetadataEvent(chunk.TransformerMetadata); ok {
+		event := &httpclient.StreamEvent{
+			Type: string(StreamEventTypeResponseMetadata),
+			Data: raw,
+		}
+		s.attachResponseHeaders(event)
+		s.eventQueue = append(s.eventQueue, event)
+		return s.Next()
 	}
 
 	// Initialize response metadata from first chunk
@@ -152,6 +214,10 @@ func (s *responsesInboundStream) Next() bool {
 		s.usage = chunk.Usage
 	}
 
+	if len(chunk.TransformerMetadata) > 0 {
+		s.mergeTransformerMetadata(chunk.TransformerMetadata)
+	}
+
 	// Generate response.created event if this is the first chunk
 	if !s.hasResponseCreated {
 		s.hasResponseCreated = true
@@ -168,7 +234,6 @@ func (s *responsesInboundStream) Next() bool {
 		if s.usage != nil {
 			response.Usage = ConvertLLMUsageToResponsesUsage(s.usage)
 		}
-
 		err := s.enqueueEvent(&StreamEvent{
 			Type:     StreamEventTypeResponseCreated,
 			Response: response,
@@ -195,7 +260,7 @@ func (s *responsesInboundStream) Next() bool {
 
 		// Handle reasoning content (thinking) delta
 		if choice.Delta != nil && choice.Delta.ReasoningContent != nil && *choice.Delta.ReasoningContent != "" {
-			if err := s.handleReasoningContent(choice.Delta.ReasoningContent); err != nil {
+			if err := s.handleReasoningContent(choice.Delta.ReasoningContent, chunk.TransformerMetadata); err != nil {
 				s.err = err
 				return false
 			}
@@ -203,12 +268,28 @@ func (s *responsesInboundStream) Next() bool {
 
 		// Handle encrypted reasoning content delta (stored in ReasoningSignature)
 		if choice.Delta != nil && choice.Delta.ReasoningSignature != nil && *choice.Delta.ReasoningSignature != "" {
-			s.accumulatedReasoningSignature.WriteString(*choice.Delta.ReasoningSignature)
+			if err := s.handleReasoningSignature(choice.Delta, chunk.TransformerMetadata); err != nil {
+				s.err = err
+				return false
+			}
+		}
+
+		if choice.Message != nil && len(choice.Message.Annotations) > 0 {
+			s.pendingAnnotations = append(s.pendingAnnotations, choice.Message.Annotations...)
+		}
+		if choice.Delta != nil && len(choice.Delta.Annotations) > 0 {
+			s.pendingAnnotations = append(s.pendingAnnotations, choice.Delta.Annotations...)
 		}
 
 		// Handle text content delta
 		if choice.Delta != nil && choice.Delta.Content.Content != nil && *choice.Delta.Content.Content != "" {
 			if err := s.handleTextContent(choice.Delta.Content.Content); err != nil {
+				s.err = err
+				return false
+			}
+		}
+		if choice.Delta != nil && len(choice.Delta.Content.MultipleContent) > 0 {
+			if err := s.handleCompactionContent(choice.Delta.Content.MultipleContent); err != nil {
 				s.err = err
 				return false
 			}
@@ -226,6 +307,25 @@ func (s *responsesInboundStream) Next() bool {
 		if choice.FinishReason != nil && !s.hasFinished {
 			s.hasFinished = true
 
+			// Map the finish_reason to the final Responses status and event type.
+			switch *choice.FinishReason {
+			case "length":
+				s.aggregator.status = "incomplete"
+				s.aggregator.incompleteDetails = &ResponseIncompleteDetails{Reason: "max_output_tokens"}
+			case "content_filter":
+				s.aggregator.status = "incomplete"
+				s.aggregator.incompleteDetails = &ResponseIncompleteDetails{Reason: "content_filter"}
+			case "error":
+				s.aggregator.status = "failed"
+			case "cancelled", "canceled":
+				s.aggregator.status = "cancelled"
+			}
+
+			if err := s.flushPendingReasoning(); err != nil {
+				s.err = err
+				return false
+			}
+
 			// Close any open content parts
 			if err := s.closeCurrentContentPart(); err != nil {
 				s.err = err
@@ -240,22 +340,14 @@ func (s *responsesInboundStream) Next() bool {
 		}
 	}
 
-	// Handle final usage chunk and complete response
-	if chunk.Usage != nil && s.hasFinished && !s.responseCompleted {
-		s.responseCompleted = true
-		s.usage = chunk.Usage
-
-		// Build final response using aggregator
-		s.aggregator.status = "completed"
-		response := s.aggregator.buildResponse()
-		response.Usage = ConvertLLMUsageToResponsesUsage(s.usage)
-
-		err := s.enqueueEvent(&StreamEvent{
-			Type:     StreamEventTypeResponseCompleted,
-			Response: response,
-		})
-		if err != nil {
-			s.err = fmt.Errorf("failed to enqueue response.completed event: %w", err)
+	// Usage follows the finish_reason; emit the final outcome once both arrive.
+	// The terminal event must wait for the choices-less usage-only chunk that carries the
+	// real counts. Some providers (e.g. ModelScope) attach a zeroed usage object to every
+	// chunk, including the one carrying finish_reason; finalizing there would emit the
+	// placeholder zeros and drop the real counts arriving afterwards.
+	if chunk.Usage != nil && len(chunk.Choices) == 0 && s.hasFinished && !s.responseCompleted {
+		if err := s.enqueueTerminalResponse(); err != nil {
+			s.err = err
 			return false
 		}
 	}
@@ -264,34 +356,160 @@ func (s *responsesInboundStream) Next() bool {
 	return s.Next()
 }
 
-func (s *responsesInboundStream) handleReasoningContent(content *string) error {
-	// Start reasoning output item if not started
-	if !s.hasReasoningItemStarted {
-		// Close any previous output item
-		if err := s.closeCurrentOutputItem(); err != nil {
-			return err
-		}
+// enqueueTerminalResponse serves both the final usage chunk and clean stream end.
+func (s *responsesInboundStream) enqueueTerminalResponse() error {
+	if s.aggregator.status == "" || s.aggregator.status == "in_progress" {
+		s.aggregator.status = "completed"
+	}
+	response := s.aggregator.buildResponse()
+	if s.usage != nil {
+		response.Usage = ConvertLLMUsageToResponsesUsage(s.usage)
+	}
+	if calls := getResponseWebSearchCallsFromMetadata(s.transformerMetadata); len(calls) > 0 {
+		response.Output = append(append([]Item(nil), calls...), response.Output...)
+	}
 
-		s.hasReasoningItemStarted = true
-
-		s.currentItemID = generateItemID()
-		item := &Item{
-			ID:      s.currentItemID,
-			Type:    "reasoning",
-			Status:  lo.ToPtr("in_progress"),
-			Summary: []ReasoningSummary{},
+	if raw, ok := s.transformerMetadata[responsesTerminalDetailsTransformerMetadataKey]; ok {
+		// Metadata may have crossed a JSON serialization boundary.
+		data, err := json.Marshal(raw)
+		if err != nil {
+			return fmt.Errorf("failed to encode terminal details: %w", err)
 		}
+		var details responsesTerminalDetails
+		if err := json.Unmarshal(data, &details); err != nil {
+			return fmt.Errorf("failed to decode terminal details: %w", err)
+		}
+		if details.Error != nil {
+			response.Error = details.Error
+		}
+		if details.IncompleteDetails != nil {
+			response.IncompleteDetails = details.IncompleteDetails
+		}
+	}
+
+	eventType := StreamEventTypeResponseCompleted
+	switch s.aggregator.status {
+	case "failed":
+		eventType = StreamEventTypeResponseFailed
+	case "incomplete":
+		eventType = StreamEventTypeResponseIncomplete
+	}
+	// Cancellation keeps the existing response.completed compatibility format.
+	if err := s.enqueueEvent(&StreamEvent{Type: eventType, Response: response}); err != nil {
+		return fmt.Errorf("failed to enqueue terminal response: %w", err)
+	}
+	s.responseCompleted = true
+	return nil
+}
+
+func (s *responsesInboundStream) mergeTransformerMetadata(metadata map[string]any) {
+	if len(metadata) == 0 {
+		return
+	}
+
+	if details, ok := metadata[responsesTerminalDetailsTransformerMetadataKey]; ok {
+		s.transformerMetadata[responsesTerminalDetailsTransformerMetadataKey] = details
+	}
+
+	if calls := getResponseWebSearchCallsFromMetadata(metadata); len(calls) > 0 {
+		existingCalls := getResponseWebSearchCallsFromMetadata(s.transformerMetadata)
+		mergedCalls := append(existingCalls, calls...)
+		s.transformerMetadata[responsesWebSearchCallsTransformerMetadataKey] = mergedCalls
+	}
+}
+
+func rawResponseMetadataEvent(metadata map[string]any) ([]byte, bool) {
+	if len(metadata) == 0 {
+		return nil, false
+	}
+
+	value := metadata[responseMetadataTransformerMetadataKey]
+	switch raw := value.(type) {
+	case json.RawMessage:
+		return append([]byte(nil), raw...), len(raw) > 0
+	case []byte:
+		return append([]byte(nil), raw...), len(raw) > 0
+	default:
+		return nil, false
+	}
+}
+
+func responseTransportHeaders(metadata map[string]any) (http.Header, bool) {
+	if len(metadata) == 0 {
+		return nil, false
+	}
+
+	headers, ok := metadata[responseHeadersTransformerMetadataKey].(http.Header)
+	if !ok || len(headers) == 0 {
+		return nil, false
+	}
+
+	return headers.Clone(), true
+}
+
+func (s *responsesInboundStream) attachResponseHeaders(event *httpclient.StreamEvent) {
+	if event == nil || s.responseHeadersSent || len(s.responseHeaders) == 0 {
+		return
+	}
+
+	event.Headers = s.responseHeaders.Clone()
+	s.responseHeadersSent = true
+}
+
+func getResponsesReasoningItemMetadata(metadata map[string]any) (responsesReasoningItemMetadata, bool) {
+	if len(metadata) == 0 {
+		return responsesReasoningItemMetadata{}, false
+	}
+
+	raw, ok := metadata[responsesReasoningItemTransformerMetadataKey]
+	if !ok || raw == nil {
+		return responsesReasoningItemMetadata{}, false
+	}
+
+	if item, ok := raw.(responsesReasoningItemMetadata); ok {
+		return item, item.ID != ""
+	}
+
+	data, err := json.Marshal(raw)
+	if err != nil {
+		return responsesReasoningItemMetadata{}, false
+	}
+
+	var item responsesReasoningItemMetadata
+	if err := json.Unmarshal(data, &item); err != nil {
+		return responsesReasoningItemMetadata{}, false
+	}
+
+	return item, item.ID != ""
+}
+
+func (s *responsesInboundStream) handleReasoningContent(content *string, metadata map[string]any) error {
+	sourceID := ""
+	if item, ok := getResponsesReasoningItemMetadata(metadata); ok {
+		sourceID = item.ID
+	}
+	if sourceID != "" {
+		if _, exists := s.pendingReasoning[sourceID]; !exists {
+			s.pendingReasoningOrder = append(s.pendingReasoningOrder, sourceID)
+		}
+		s.pendingReasoning[sourceID] = append(s.pendingReasoning[sourceID], *content)
+		return nil
+	}
+
+	return s.emitReasoningContent(content, sourceID)
+}
+
+func (s *responsesInboundStream) emitReasoningContent(content *string, sourceID string) error {
+
+	if err := s.ensureReasoningItemStarted(sourceID); err != nil {
+		return err
+	}
+
+	// Start reasoning summary part only when we actually have summary text.
+	if !s.hasReasoningSummaryPart {
+		s.hasReasoningSummaryPart = true
 
 		err := s.enqueueEvent(&StreamEvent{
-			Type:        StreamEventTypeOutputItemAdded,
-			OutputIndex: s.outputIndex,
-			Item:        item,
-		})
-		if err != nil {
-			return fmt.Errorf("failed to enqueue output_item.added event: %w", err)
-		}
-
-		err = s.enqueueEvent(&StreamEvent{
 			Type:         StreamEventTypeReasoningSummaryPartAdded,
 			ItemID:       &s.currentItemID,
 			OutputIndex:  s.outputIndex,
@@ -321,7 +539,152 @@ func (s *responsesInboundStream) handleReasoningContent(content *string) error {
 	return nil
 }
 
+func (s *responsesInboundStream) handleReasoningSignature(delta *llm.Message, metadata map[string]any) error {
+	sourceID := delta.ID
+	itemMetadata, itemScoped := getResponsesReasoningItemMetadata(metadata)
+	if itemScoped {
+		sourceID = itemMetadata.ID
+	}
+	if sourceID != "" {
+		if contents, ok := s.pendingReasoning[sourceID]; ok {
+			for _, content := range contents {
+				if err := s.emitReasoningContent(lo.ToPtr(content), sourceID); err != nil {
+					return err
+				}
+			}
+			delete(s.pendingReasoning, sourceID)
+			s.removePendingReasoningID(sourceID)
+		}
+	}
+
+	if err := s.ensureReasoningItemStarted(sourceID); err != nil {
+		return err
+	}
+
+	if itemScoped {
+		// Responses encrypted_content is an opaque item-level value. Repeated
+		// values for the same item are provisional/final replacements, not deltas.
+		s.accumulatedReasoningSignature.Reset()
+	}
+	s.accumulatedReasoningSignature.WriteString(*delta.ReasoningSignature)
+
+	// When an item-scoped reasoning item is done, decide whether to coalesce
+	// or close based on whether the item has summary text.
+	//
+	// Upstream (e.g. gpt-5.6-luna xhigh) may emit a series of tiny reasoning
+	// items, each containing a single token of summary text and its own
+	// encrypted_content. By deferring the close when summary text exists,
+	// subsequent reasoning deltas are appended to the same item, producing
+	// one merged reasoning block for the client.
+	//
+	// Items with only encrypted_content (no summary text) — the normal
+	// gpt-5.x behavior — stay separate as the upstream intended.
+	//
+	// The final encrypted_content blob (from the last item.done) is kept as
+	// the item's signature; earlier provisional blobs are discarded.
+	if itemScoped && itemMetadata.Done {
+		if s.accumulatedReasoning.Len() > 0 {
+			// Has summary text — defer close to allow coalescing.
+			return nil
+		}
+		// No summary text (encrypted-only item) — close immediately.
+		return s.closeReasoningItem()
+	}
+
+	// OpenAI Responses encrypted_content is emitted as an opaque item-level blob,
+	// not as a text-style delta. Close the item immediately so consecutive
+	// reasoning blobs from separate upstream items are not concatenated.
+	if sourceID == "" && delta.ReasoningContent == nil {
+		return s.closeReasoningItem()
+	}
+
+	return nil
+}
+
+func (s *responsesInboundStream) removePendingReasoningID(sourceID string) {
+	for i, id := range s.pendingReasoningOrder {
+		if id == sourceID {
+			s.pendingReasoningOrder = append(s.pendingReasoningOrder[:i], s.pendingReasoningOrder[i+1:]...)
+			return
+		}
+	}
+}
+
+func (s *responsesInboundStream) flushPendingReasoning() error {
+	for len(s.pendingReasoningOrder) > 0 {
+		sourceID := s.pendingReasoningOrder[0]
+		contents, ok := s.pendingReasoning[sourceID]
+		if !ok {
+			s.removePendingReasoningID(sourceID)
+			continue
+		}
+		for _, content := range contents {
+			if err := s.emitReasoningContent(lo.ToPtr(content), sourceID); err != nil {
+				return err
+			}
+		}
+		delete(s.pendingReasoning, sourceID)
+		s.removePendingReasoningID(sourceID)
+		if err := s.closeReasoningItem(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *responsesInboundStream) ensureReasoningItemStarted(sourceID string) error {
+	// Start reasoning output item if not started.
+	if s.hasReasoningItemStarted {
+		if sourceID == "" || s.currentReasoningSourceID == "" || s.currentReasoningSourceID == sourceID {
+			return nil
+		}
+
+		// Coalesce mode: a new reasoning sourceID arrived while the current
+		// reasoning item is still open (because we deferred closeReasoningItem
+		// in handleReasoningSignature). Instead of closing and reopening,
+		// keep the current item open and append the new content to it.
+		// Update the sourceID so subsequent signature events can match.
+		s.currentReasoningSourceID = sourceID
+		return nil
+	}
+
+	// Close any previous output item.
+	if err := s.closeCurrentOutputItem(); err != nil {
+		return err
+	}
+
+	s.hasReasoningItemStarted = true
+	s.hasReasoningSummaryPart = false
+	s.currentReasoningSourceID = sourceID
+
+	s.currentItemID = sourceID
+	if s.currentItemID == "" {
+		s.currentItemID = generateItemID()
+	}
+	item := &Item{
+		ID:      s.currentItemID,
+		Type:    "reasoning",
+		Status:  lo.ToPtr("in_progress"),
+		Summary: []ReasoningSummary{},
+	}
+
+	err := s.enqueueEvent(&StreamEvent{
+		Type:        StreamEventTypeOutputItemAdded,
+		OutputIndex: s.outputIndex,
+		Item:        item,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to enqueue output_item.added event: %w", err)
+	}
+
+	return nil
+}
+
 func (s *responsesInboundStream) handleTextContent(content *string) error {
+	if err := s.flushPendingReasoning(); err != nil {
+		return err
+	}
+
 	// Close reasoning item if it was started
 	if s.hasReasoningItemStarted {
 		if err := s.closeReasoningItem(); err != nil {
@@ -355,19 +718,26 @@ func (s *responsesInboundStream) handleTextContent(content *string) error {
 	if !s.hasContentPartStarted {
 		s.hasContentPartStarted = true
 
+		textPartItems, _ := attachAnnotationsToFirstTextItem([]Item{{
+			Type:        "output_text",
+			Annotations: []Annotation{},
+		}}, s.pendingAnnotations)
+
 		err := s.enqueueEvent(&StreamEvent{
 			Type:         StreamEventTypeContentPartAdded,
 			ItemID:       &s.currentItemID,
 			OutputIndex:  s.outputIndex,
 			ContentIndex: &s.contentIndex,
 			Part: &StreamEventContentPart{
-				Type: "output_text",
-				Text: lo.ToPtr(""),
+				Type:        "output_text",
+				Text:        "",
+				Annotations: textPartItems[0].Annotations,
 			},
 		})
 		if err != nil {
 			return fmt.Errorf("failed to enqueue content_part.added event: %w", err)
 		}
+		// Keep pendingAnnotations until output_item.done so the final message item preserves them.
 	}
 
 	// Accumulate text content
@@ -388,7 +758,42 @@ func (s *responsesInboundStream) handleTextContent(content *string) error {
 	return nil
 }
 
+func (s *responsesInboundStream) handleCompactionContent(parts []llm.MessageContentPart) error {
+	for _, part := range parts {
+		if (part.Type != "compaction" && part.Type != "compaction_summary") || part.Compact == nil {
+			continue
+		}
+
+		if err := s.closeCurrentOutputItem(); err != nil {
+			return err
+		}
+
+		item := compactionItemFromPart(part, part.Type)
+		if item.ID == "" {
+			item.ID = generateItemID()
+		}
+
+		for _, eventType := range []StreamEventType{StreamEventTypeOutputItemAdded, StreamEventTypeOutputItemDone} {
+			if err := s.enqueueEvent(&StreamEvent{
+				Type:        eventType,
+				OutputIndex: s.outputIndex,
+				Item:        &item,
+			}); err != nil {
+				return fmt.Errorf("failed to enqueue compaction %s event: %w", eventType, err)
+			}
+		}
+
+		s.outputIndex++
+	}
+
+	return nil
+}
+
 func (s *responsesInboundStream) handleToolCalls(toolCalls []llm.ToolCall) error {
+	if err := s.flushPendingReasoning(); err != nil {
+		return err
+	}
+
 	// Close message item if it was started
 	if s.hasMessageItemStarted {
 		if err := s.closeMessageItem(); err != nil {
@@ -416,73 +821,191 @@ func (s *responsesInboundStream) handleToolCalls(toolCalls []llm.ToolCall) error
 
 		// Initialize tool call tracking if needed
 		if _, ok := s.toolCalls[toolCallIndex]; !ok {
-			if err := s.closeCurrentContentPart(); err != nil {
+			if err := s.initToolCall(tc); err != nil {
 				return err
 			}
-
-			if err := s.closeCurrentOutputItem(); err != nil {
-				return err
-			}
-
-			s.toolCalls[toolCallIndex] = &llm.ToolCall{
-				Index: toolCallIndex,
-				ID:    tc.ID,
-				Type:  tc.Type,
-				Function: llm.FunctionCall{
-					Name:      tc.Function.Name,
-					Arguments: "",
-				},
-			}
-
-			// Emit output_item.added for function_call
-			itemID := tc.ID
-			if itemID == "" {
-				itemID = generateItemID()
-			}
-
-			item := &Item{
-				ID:     itemID,
-				Type:   "function_call",
-				Status: lo.ToPtr("in_progress"),
-				CallID: tc.ID,
-				Name:   tc.Function.Name,
-			}
-
-			err := s.enqueueEvent(&StreamEvent{
-				Type:        StreamEventTypeOutputItemAdded,
-				OutputIndex: s.outputIndex,
-				Item:        item,
-			})
-			if err != nil {
-				return fmt.Errorf("failed to enqueue output_item.added event: %w", err)
-			}
-
-			s.toolCallItemStarted[toolCallIndex] = true
-			s.toolCallOutputIndex[toolCallIndex] = s.outputIndex
-			s.currentItemID = itemID
-			s.outputIndex++
 		}
 
-		// Accumulate arguments
-		s.toolCalls[toolCallIndex].Function.Arguments += tc.Function.Arguments
-
-		// Emit function_call_arguments.delta
-		if tc.Function.Arguments != "" {
-			itemID := s.toolCalls[toolCallIndex].ID
-			if itemID == "" {
-				itemID = s.currentItemID
+		// Process delta based on tool type
+		switch {
+		case tc.ResponseCustomToolCall != nil:
+			if err := s.handleCustomToolCallDelta(tc); err != nil {
+				return err
 			}
-
-			err := s.enqueueEvent(&StreamEvent{
-				Type:         StreamEventTypeFunctionCallArgumentsDelta,
-				ItemID:       &itemID,
-				OutputIndex:  s.outputIndex - 1,
-				ContentIndex: lo.ToPtr(0),
-				Delta:        tc.Function.Arguments,
-			})
-			if err != nil {
-				return fmt.Errorf("failed to enqueue function_call_arguments.delta event: %w", err)
+		default:
+			if err := s.handleFunctionCallDelta(tc); err != nil {
+				return err
 			}
+		}
+	}
+
+	return nil
+}
+
+func (s *responsesInboundStream) initToolCall(tc llm.ToolCall) error {
+	toolCallIndex := tc.Index
+
+	if err := s.closeCurrentContentPart(); err != nil {
+		return err
+	}
+
+	if err := s.closeCurrentOutputItem(); err != nil {
+		return err
+	}
+
+	s.toolCalls[toolCallIndex] = &llm.ToolCall{
+		Index:                  toolCallIndex,
+		ID:                     tc.ID,
+		Type:                   tc.Type,
+		ResponseCustomToolCall: tc.ResponseCustomToolCall,
+		Function: llm.FunctionCall{
+			Name:      tc.Function.Name,
+			Namespace: tc.Function.Namespace,
+			Arguments: "",
+		},
+	}
+
+	// A Responses function_call must include its name in output_item.added for
+	// clients to route it. Some upstreams provide that identity only in a later
+	// arguments delta or done event, so retain the call until it is known.
+	if tc.ResponseCustomToolCall == nil && tc.Function.Name == "" {
+		return nil
+	}
+
+	return s.startToolCallItem(toolCallIndex)
+}
+
+func (s *responsesInboundStream) startToolCallItem(toolCallIndex int) error {
+	if s.toolCallItemStarted[toolCallIndex] {
+		return nil
+	}
+
+	tc := s.toolCalls[toolCallIndex]
+
+	itemID := tc.ID
+	if itemID == "" {
+		itemID = generateItemID()
+	}
+
+	switch {
+	case tc.ResponseCustomToolCall != nil:
+		item := &Item{
+			ID:     itemID,
+			Type:   "custom_tool_call",
+			Status: lo.ToPtr("in_progress"),
+			CallID: tc.ResponseCustomToolCall.CallID,
+			Name:   tc.ResponseCustomToolCall.Name,
+			Input:  lo.ToPtr(""),
+		}
+
+		err := s.enqueueEvent(&StreamEvent{
+			Type:        StreamEventTypeOutputItemAdded,
+			OutputIndex: s.outputIndex,
+			Item:        item,
+		})
+		if err != nil {
+			return fmt.Errorf("failed to enqueue output_item.added event: %w", err)
+		}
+
+	default:
+		item := &Item{
+			ID:        itemID,
+			Type:      "function_call",
+			Status:    lo.ToPtr("in_progress"),
+			CallID:    tc.ID,
+			Name:      tc.Function.Name,
+			Namespace: tc.Function.Namespace,
+		}
+
+		err := s.enqueueEvent(&StreamEvent{
+			Type:        StreamEventTypeOutputItemAdded,
+			OutputIndex: s.outputIndex,
+			Item:        item,
+		})
+		if err != nil {
+			return fmt.Errorf("failed to enqueue output_item.added event: %w", err)
+		}
+	}
+
+	s.toolCallItemStarted[toolCallIndex] = true
+	s.toolCallOutputIndex[toolCallIndex] = s.outputIndex
+	s.currentItemID = itemID
+	s.outputIndex++
+
+	return nil
+}
+
+func (s *responsesInboundStream) handleFunctionCallDelta(tc llm.ToolCall) error {
+	toolCallIndex := tc.Index
+	storedToolCall := s.toolCalls[toolCallIndex]
+	if tc.ID != "" {
+		storedToolCall.ID = tc.ID
+	}
+	if tc.Type != "" {
+		storedToolCall.Type = tc.Type
+	}
+	if tc.Function.Name != "" {
+		storedToolCall.Function.Name = tc.Function.Name
+	}
+	if tc.Function.Namespace != "" {
+		storedToolCall.Function.Namespace = tc.Function.Namespace
+	}
+	storedToolCall.Function.Arguments += tc.Function.Arguments
+
+	argumentsToEmit := tc.Function.Arguments
+	if !s.toolCallItemStarted[toolCallIndex] {
+		if storedToolCall.Function.Name == "" {
+			return nil
+		}
+
+		if err := s.startToolCallItem(toolCallIndex); err != nil {
+			return err
+		}
+
+		// Arguments received before the identity became available have not been
+		// emitted. Replay the complete buffered payload after output_item.added.
+		argumentsToEmit = storedToolCall.Function.Arguments
+	}
+
+	if argumentsToEmit != "" {
+		itemID := storedToolCall.ID
+		if itemID == "" {
+			itemID = s.currentItemID
+		}
+
+		err := s.enqueueEvent(&StreamEvent{
+			Type:         StreamEventTypeFunctionCallArgumentsDelta,
+			ItemID:       &itemID,
+			OutputIndex:  s.toolCallOutputIndex[toolCallIndex],
+			ContentIndex: lo.ToPtr(0),
+			Delta:        argumentsToEmit,
+		})
+		if err != nil {
+			return fmt.Errorf("failed to enqueue function_call_arguments.delta event: %w", err)
+		}
+	}
+
+	return nil
+}
+
+func (s *responsesInboundStream) handleCustomToolCallDelta(tc llm.ToolCall) error {
+	toolCallIndex := tc.Index
+	s.toolCalls[toolCallIndex].ResponseCustomToolCall.Input += tc.ResponseCustomToolCall.Input
+
+	if tc.ResponseCustomToolCall.Input != "" {
+		itemID := s.toolCalls[toolCallIndex].ID
+		if itemID == "" {
+			itemID = s.currentItemID
+		}
+
+		err := s.enqueueEvent(&StreamEvent{
+			Type:        StreamEventTypeCustomToolCallInputDelta,
+			ItemID:      &itemID,
+			OutputIndex: s.toolCallOutputIndex[toolCallIndex],
+			Delta:       tc.ResponseCustomToolCall.Input,
+		})
+		if err != nil {
+			return fmt.Errorf("failed to enqueue custom_tool_call_input.delta event: %w", err)
 		}
 	}
 
@@ -496,51 +1019,66 @@ func (s *responsesInboundStream) closeReasoningItem() error {
 
 	s.hasReasoningItemStarted = false
 	fullReasoning := s.accumulatedReasoning.String()
+	hadSummaryPart := s.hasReasoningSummaryPart
 
-	// Emit reasoning_summary_text.done with accumulated text
-	err := s.enqueueEvent(&StreamEvent{
-		Type:         StreamEventTypeReasoningSummaryTextDone,
-		ItemID:       &s.currentItemID,
-		OutputIndex:  s.outputIndex,
-		SummaryIndex: lo.ToPtr(0),
-		Text:         fullReasoning,
-	})
-	if err != nil {
-		return fmt.Errorf("failed to enqueue reasoning_summary_text.done event: %w", err)
+	// Emit reasoning summary done events only if we started the summary part.
+	if hadSummaryPart {
+		// Emit reasoning_summary_text.done with accumulated text
+		err := s.enqueueEvent(&StreamEvent{
+			Type:         StreamEventTypeReasoningSummaryTextDone,
+			ItemID:       &s.currentItemID,
+			OutputIndex:  s.outputIndex,
+			SummaryIndex: lo.ToPtr(0),
+			Text:         fullReasoning,
+		})
+		if err != nil {
+			return fmt.Errorf("failed to enqueue reasoning_summary_text.done event: %w", err)
+		}
+
+		// Emit reasoning_summary_part.done
+		err = s.enqueueEvent(&StreamEvent{
+			Type:         StreamEventTypeReasoningSummaryPartDone,
+			ItemID:       &s.currentItemID,
+			OutputIndex:  s.outputIndex,
+			SummaryIndex: lo.ToPtr(0),
+			Part: &StreamEventContentPart{
+				Type: "summary_text",
+				Text: fullReasoning,
+			},
+		})
+		if err != nil {
+			return fmt.Errorf("failed to enqueue reasoning_summary_part.done event: %w", err)
+		}
 	}
 
-	// Emit reasoning_summary_part.done
-	err = s.enqueueEvent(&StreamEvent{
-		Type:         StreamEventTypeReasoningSummaryPartDone,
-		ItemID:       &s.currentItemID,
-		OutputIndex:  s.outputIndex,
-		SummaryIndex: lo.ToPtr(0),
-		Part: &StreamEventContentPart{
-			Type: "summary_text",
-			Text: &fullReasoning,
-		},
-	})
-	if err != nil {
-		return fmt.Errorf("failed to enqueue reasoning_summary_part.done event: %w", err)
-	}
+	s.hasReasoningSummaryPart = false
 
 	// Emit output_item.done with complete reasoning item
 	var encryptedContent *string
+
 	if s.accumulatedReasoningSignature.Len() > 0 {
-		encryptedContent = lo.ToPtr(s.accumulatedReasoningSignature.String())
+		encoded := s.accumulatedReasoningSignature.String()
+		encryptedContent = lo.ToPtr(encoded)
+	}
+
+	var summary []ReasoningSummary
+	if hadSummaryPart {
+		summary = []ReasoningSummary{{
+			Type: "summary_text",
+			Text: fullReasoning,
+		}}
+	} else {
+		summary = []ReasoningSummary{}
 	}
 
 	item := Item{
-		ID:   s.currentItemID,
-		Type: "reasoning",
-		Summary: []ReasoningSummary{{
-			Type: "summary_text",
-			Text: fullReasoning,
-		}},
+		ID:               s.currentItemID,
+		Type:             "reasoning",
+		Summary:          summary,
 		EncryptedContent: encryptedContent,
 	}
 
-	err = s.enqueueEvent(&StreamEvent{
+	err := s.enqueueEvent(&StreamEvent{
 		Type:        StreamEventTypeOutputItemDone,
 		OutputIndex: s.outputIndex,
 		Item:        &item,
@@ -552,6 +1090,7 @@ func (s *responsesInboundStream) closeReasoningItem() error {
 	s.outputIndex++
 	s.accumulatedReasoning.Reset()
 	s.accumulatedReasoningSignature.Reset()
+	s.currentReasoningSourceID = ""
 
 	return nil
 }
@@ -583,6 +1122,8 @@ func (s *responsesInboundStream) closeMessageItem() error {
 			}},
 		},
 	}
+	item.Content.Items, _ = attachAnnotationsToFirstTextItem(item.Content.Items, s.pendingAnnotations)
+	s.pendingAnnotations = nil
 
 	err := s.enqueueEvent(&StreamEvent{
 		Type:        StreamEventTypeOutputItemDone,
@@ -621,14 +1162,21 @@ func (s *responsesInboundStream) closeCurrentContentPart() error {
 	}
 
 	// Emit content_part.done with full text
+	contentPartItems, _ := attachAnnotationsToFirstTextItem([]Item{{
+		Type:        "output_text",
+		Text:        lo.ToPtr(fullText),
+		Annotations: []Annotation{},
+	}}, s.pendingAnnotations)
+
 	err = s.enqueueEvent(&StreamEvent{
 		Type:         StreamEventTypeContentPartDone,
 		ItemID:       &s.currentItemID,
 		OutputIndex:  s.outputIndex,
 		ContentIndex: &s.contentIndex,
 		Part: &StreamEventContentPart{
-			Type: "output_text",
-			Text: lo.ToPtr(fullText),
+			Type:        "output_text",
+			Text:        fullText,
+			Annotations: contentPartItems[0].Annotations,
 		},
 	})
 	if err != nil {
@@ -655,31 +1203,37 @@ func (s *responsesInboundStream) closeCurrentOutputItem() error {
 
 	// Close any open tool call items
 	for idx, tc := range s.toolCalls {
-		if s.toolCallItemStarted[idx] {
-			// Emit function_call_arguments.done
-			itemID := tc.ID
-			if itemID == "" {
-				itemID = s.currentItemID
-			}
+		if !s.toolCallItemStarted[idx] {
+			continue
+		}
+
+		itemID := tc.ID
+		if itemID == "" {
+			itemID = s.currentItemID
+		}
+
+		switch {
+		case tc.ResponseCustomToolCall != nil:
+			// Custom tool call - emit custom_tool_call_input.done then output_item.done
+			fullInput := tc.ResponseCustomToolCall.Input
 
 			err := s.enqueueEvent(&StreamEvent{
-				Type:        StreamEventTypeFunctionCallArgumentsDone,
+				Type:        StreamEventTypeCustomToolCallInputDone,
 				ItemID:      &itemID,
 				OutputIndex: s.toolCallOutputIndex[idx],
-				Arguments:   tc.Function.Arguments,
+				Input:       fullInput,
 			})
 			if err != nil {
-				return fmt.Errorf("failed to enqueue function_call_arguments.done event: %w", err)
+				return fmt.Errorf("failed to enqueue custom_tool_call_input.done event: %w", err)
 			}
 
-			// Emit output_item.done
 			item := Item{
-				ID:        itemID,
-				Type:      "function_call",
-				Status:    lo.ToPtr("completed"),
-				CallID:    tc.ID,
-				Name:      tc.Function.Name,
-				Arguments: tc.Function.Arguments,
+				ID:     itemID,
+				Type:   "custom_tool_call",
+				Status: lo.ToPtr("completed"),
+				CallID: tc.ResponseCustomToolCall.CallID,
+				Name:   tc.ResponseCustomToolCall.Name,
+				Input:  lo.ToPtr(fullInput),
 			}
 
 			err = s.enqueueEvent(&StreamEvent{
@@ -691,11 +1245,135 @@ func (s *responsesInboundStream) closeCurrentOutputItem() error {
 				return fmt.Errorf("failed to enqueue output_item.done event: %w", err)
 			}
 
-			s.toolCallItemStarted[idx] = false
+		default:
+			// Function call - emit function_call_arguments.done then output_item.done
+			err := s.enqueueEvent(&StreamEvent{
+				Type:        StreamEventTypeFunctionCallArgumentsDone,
+				ItemID:      &itemID,
+				OutputIndex: s.toolCallOutputIndex[idx],
+				CallID:      tc.ID,
+				Name:        tc.Function.Name,
+				Namespace:   tc.Function.Namespace,
+				Arguments:   tc.Function.Arguments,
+			})
+			if err != nil {
+				return fmt.Errorf("failed to enqueue function_call_arguments.done event: %w", err)
+			}
+
+			item := Item{
+				ID:        itemID,
+				Type:      "function_call",
+				Status:    lo.ToPtr("completed"),
+				CallID:    tc.ID,
+				Name:      tc.Function.Name,
+				Namespace: tc.Function.Namespace,
+				Arguments: tc.Function.Arguments,
+			}
+
+			err = s.enqueueEvent(&StreamEvent{
+				Type:        StreamEventTypeOutputItemDone,
+				OutputIndex: s.toolCallOutputIndex[idx],
+				Item:        &item,
+			})
+			if err != nil {
+				return fmt.Errorf("failed to enqueue output_item.done event: %w", err)
+			}
 		}
+
+		s.toolCallItemStarted[idx] = false
 	}
 
 	return nil
+}
+
+func (s *responsesInboundStream) emitStreamErrorEvent(err error) error {
+	code, message := classifyStreamError(err)
+
+	if s.hasResponseCreated {
+		response := s.buildFailedResponse(code, message)
+		if err := s.enqueueEvent(&StreamEvent{
+			Type:     StreamEventTypeResponseFailed,
+			Response: response,
+		}); err != nil {
+			return err
+		}
+	} else {
+		if err := s.enqueueEvent(&StreamEvent{
+			Type:    StreamEventTypeError,
+			Code:    code,
+			Message: message,
+		}); err != nil {
+			return err
+		}
+	}
+
+	s.errorEventEmitted = true
+
+	return nil
+}
+
+func classifyStreamError(err error) (code, message string) {
+	code = "stream_error"
+	message = err.Error()
+
+	if errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, io.EOF) {
+		code = "upstream_eof"
+		message = "upstream connection closed unexpectedly"
+		return code, message
+	}
+
+	if errors.Is(err, context.Canceled) {
+		code = "client_cancel"
+		message = "client disconnected"
+		return code, message
+	}
+
+	if errors.Is(err, context.DeadlineExceeded) {
+		code = "timeout"
+		message = "request timeout"
+		return code, message
+	}
+
+	var httpErr *httpclient.Error
+	if errors.As(err, &httpErr) {
+		code = "api_error"
+		message = string(httpErr.Body)
+		if message == "" {
+			message = httpErr.Status
+		}
+		return code, message
+	}
+
+	if errors.Is(err, ErrStreamIncomplete) {
+		code = "incomplete_stream"
+		message = "stream ended without terminal event"
+		return code, message
+	}
+
+	return code, message
+}
+
+func (s *responsesInboundStream) buildFailedResponse(code, message string) *Response {
+	response := &Response{
+		Object:    "response",
+		ID:        s.responseID,
+		Model:     s.model,
+		CreatedAt: s.createdAt,
+		Status:    lo.ToPtr("failed"),
+		Output:    []Item{},
+		Error: &Error{
+			Type:    "server_error",
+			Code:    code,
+			Message: message,
+		},
+	}
+
+	if s.aggregator != nil {
+		aggregated := s.aggregator.buildResponse()
+		response.Output = aggregated.Output
+	}
+
+	return response
 }
 
 func (s *responsesInboundStream) Current() *httpclient.StreamEvent {
@@ -710,18 +1388,25 @@ func (s *responsesInboundStream) Current() *httpclient.StreamEvent {
 }
 
 func (s *responsesInboundStream) Err() error {
+	// If we've already emitted an error event to the client, return nil
+	// to avoid double error emission by the SSE writer
+	if s.errorEventEmitted {
+		return nil
+	}
+
 	if s.err != nil {
 		return s.err
+	}
+
+	// A source error after a terminal response must not become a second outcome.
+	if s.responseCompleted {
+		return nil
 	}
 
 	return s.source.Err()
 }
 
 func (s *responsesInboundStream) Close() error {
-	if dumper.Enabled() {
-		dumper.DumpObject(s.ctx, s.sourceEvents, "responses-inbound-stream")
-	}
-
 	return s.source.Close()
 }
 

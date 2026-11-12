@@ -7,12 +7,11 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/require"
-	"github.com/zhenzou/executors"
 
+	"github.com/looplj/axonhub/internal/authz"
 	"github.com/looplj/axonhub/internal/contexts"
 	"github.com/looplj/axonhub/internal/ent"
 	"github.com/looplj/axonhub/internal/ent/enttest"
-	"github.com/looplj/axonhub/internal/ent/privacy"
 	"github.com/looplj/axonhub/internal/ent/project"
 	"github.com/looplj/axonhub/internal/pkg/xcache"
 	"github.com/looplj/axonhub/internal/server/biz"
@@ -34,12 +33,11 @@ func setupTestThreadMiddleware(t *testing.T) (*gin.Engine, *ent.Client, *biz.Thr
 		Client:        client,
 		SystemService: systemService,
 		CacheConfig:   xcache.Config{},
-		Executor:      executors.NewPoolScheduleExecutor(),
 	})
 	channelService := biz.NewChannelServiceForTest(client)
 	usageLogService := biz.NewUsageLogService(client, systemService, channelService)
 	traceService := biz.NewTraceService(biz.TraceServiceParams{
-		RequestService: biz.NewRequestService(client, systemService, usageLogService, dataStorageService),
+		RequestService: biz.NewRequestService(client, systemService.CacheConfig, systemService, usageLogService, dataStorageService, biz.NewLiveStreamRegistry()),
 		Ent:            client,
 	})
 
@@ -54,7 +52,7 @@ func TestWithThreadID_Success(t *testing.T) {
 	router, client, threadService := setupTestThreadMiddleware(t)
 	defer client.Close()
 
-	ctx := privacy.DecisionContext(httptest.NewRequest(http.MethodGet, "/", nil).Context(), privacy.Allow)
+	ctx := authz.WithTestBypass(httptest.NewRequest(http.MethodGet, "/", nil).Context())
 	ctx = ent.NewContext(ctx, client)
 
 	// Create a test project
@@ -67,7 +65,7 @@ func TestWithThreadID_Success(t *testing.T) {
 	// Setup middleware and test endpoint
 	router.Use(func(c *gin.Context) {
 		// Add privacy context
-		ctx := privacy.DecisionContext(c.Request.Context(), privacy.Allow)
+		ctx := authz.WithTestBypass(c.Request.Context())
 		// Add ent client to context
 		ctx = ent.NewContext(ctx, client)
 		// Add project ID to context
@@ -151,7 +149,7 @@ func TestWithThreadID_Idempotent(t *testing.T) {
 	router, client, threadService := setupTestThreadMiddleware(t)
 	defer client.Close()
 
-	ctx := privacy.DecisionContext(httptest.NewRequest(http.MethodGet, "/", nil).Context(), privacy.Allow)
+	ctx := authz.WithTestBypass(httptest.NewRequest(http.MethodGet, "/", nil).Context())
 	ctx = ent.NewContext(ctx, client)
 
 	// Create a test project
@@ -162,7 +160,7 @@ func TestWithThreadID_Idempotent(t *testing.T) {
 	require.NoError(t, err)
 
 	router.Use(func(c *gin.Context) {
-		ctx := privacy.DecisionContext(c.Request.Context(), privacy.Allow)
+		ctx := authz.WithTestBypass(c.Request.Context())
 		ctx = ent.NewContext(ctx, client)
 		ctx = contexts.WithProjectID(ctx, testProject.ID)
 		c.Request = c.Request.WithContext(ctx)

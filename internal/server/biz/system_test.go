@@ -3,17 +3,21 @@ package biz
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/alicebob/miniredis/v2"
 	"github.com/stretchr/testify/require"
 
+	"github.com/looplj/axonhub/internal/authz"
 	"github.com/looplj/axonhub/internal/ent"
 	"github.com/looplj/axonhub/internal/ent/enttest"
-	"github.com/looplj/axonhub/internal/ent/privacy"
+	"github.com/looplj/axonhub/internal/ent/hook"
 	"github.com/looplj/axonhub/internal/objects"
 	"github.com/looplj/axonhub/internal/pkg/xcache"
+	"github.com/looplj/axonhub/internal/pkg/xerrors"
 	"github.com/looplj/axonhub/internal/pkg/xredis"
 )
 
@@ -26,10 +30,11 @@ func TestSystemService_GetSecretKey_NotInitialized(t *testing.T) {
 	ctx = ent.NewContext(ctx, client)
 
 	// Getting secret key before initialization should return error
-	ctx = privacy.DecisionContext(ctx, privacy.Allow)
+	ctx = authz.WithTestBypass(ctx)
 	secretKey, err := service.SecretKey(ctx)
 	require.Error(t, err)
-	require.Contains(t, err.Error(), "secret key not found, system may not be initialized")
+	require.ErrorIs(t, err, ErrSystemNotInitialized)
+	require.Contains(t, err.Error(), "secret key not found")
 	require.Empty(t, secretKey) // Should be empty when error occurs
 }
 
@@ -52,7 +57,7 @@ func TestSystemService_WithMemoryCache(t *testing.T) {
 
 	ctx := context.Background()
 	ctx = ent.NewContext(ctx, client)
-	ctx = privacy.DecisionContext(ctx, privacy.Allow)
+	ctx = authz.WithTestBypass(ctx)
 
 	// Test setting and getting system values with cache
 	testKey := "test_key"
@@ -98,7 +103,7 @@ func TestSystemService_WithRedisCache(t *testing.T) {
 
 	ctx := context.Background()
 	ctx = ent.NewContext(ctx, client)
-	ctx = privacy.DecisionContext(ctx, privacy.Allow)
+	ctx = authz.WithTestBypass(ctx)
 
 	// Test brand name functionality with Redis cache
 	brandName := "Test Brand"
@@ -135,7 +140,7 @@ func TestSystemService_WithTwoLevelCache(t *testing.T) {
 
 	ctx := context.Background()
 	ctx = ent.NewContext(ctx, client)
-	ctx = privacy.DecisionContext(ctx, privacy.Allow)
+	ctx = authz.WithTestBypass(ctx)
 
 	// Test secret key functionality with two-level cache
 	secretKey := "test-secret-key-123456789012345678901234567890123456789012345678901234567890123456789012"
@@ -155,7 +160,7 @@ func TestSystemService_WithNoopCache(t *testing.T) {
 
 	ctx := context.Background()
 	ctx = ent.NewContext(ctx, client)
-	ctx = privacy.DecisionContext(ctx, privacy.Allow)
+	ctx = authz.WithTestBypass(ctx)
 
 	// Test that system service works even with noop cache
 	testKey := "noop_test_key"
@@ -180,11 +185,12 @@ func TestSystemService_StoragePolicy(t *testing.T) {
 
 	ctx := context.Background()
 	ctx = ent.NewContext(ctx, client)
-	ctx = privacy.DecisionContext(ctx, privacy.Allow)
+	ctx = authz.WithTestBypass(ctx)
 
 	// First set a default storage policy to avoid JSON unmarshaling error
 	defaultPolicy := &StoragePolicy{
 		StoreChunks:       false,
+		LivePreview:       false,
 		StoreRequestBody:  true,
 		StoreResponseBody: true,
 		CleanupOptions: []CleanupOption{
@@ -208,13 +214,19 @@ func TestSystemService_StoragePolicy(t *testing.T) {
 	policy, err := service.StoragePolicy(ctx)
 	require.NoError(t, err)
 	require.False(t, policy.StoreChunks)
+	require.False(t, policy.LivePreview)
 	require.True(t, policy.StoreRequestBody)
 	require.True(t, policy.StoreResponseBody)
-	require.Len(t, policy.CleanupOptions, 2)
+	require.True(t, hasCleanupResource(policy.CleanupOptions, CleanupResourceRequests))
+	require.True(t, hasCleanupResource(policy.CleanupOptions, CleanupResourceUsageLogs))
+	require.True(t, hasCleanupResource(policy.CleanupOptions, CleanupResourceRequestBodies))
+	require.True(t, hasCleanupResource(policy.CleanupOptions, CleanupResourceResponseBodies))
+	require.True(t, hasCleanupResource(policy.CleanupOptions, CleanupResourceResponseChunks))
 
 	// Test setting custom storage policy
 	customPolicy := &StoragePolicy{
 		StoreChunks:       true,
+		LivePreview:       true,
 		StoreRequestBody:  false,
 		StoreResponseBody: true,
 		CleanupOptions: []CleanupOption{
@@ -232,15 +244,393 @@ func TestSystemService_StoragePolicy(t *testing.T) {
 	retrievedPolicy, err := service.StoragePolicy(ctx)
 	require.NoError(t, err)
 	require.Equal(t, customPolicy.StoreChunks, retrievedPolicy.StoreChunks)
+	require.Equal(t, customPolicy.LivePreview, retrievedPolicy.LivePreview)
 	require.Equal(t, customPolicy.StoreRequestBody, retrievedPolicy.StoreRequestBody)
 	require.Equal(t, customPolicy.StoreResponseBody, retrievedPolicy.StoreResponseBody)
-	require.Len(t, retrievedPolicy.CleanupOptions, 1)
 	require.Equal(t, "custom_resource", retrievedPolicy.CleanupOptions[0].ResourceType)
+	require.True(t, hasCleanupResource(retrievedPolicy.CleanupOptions, CleanupResourceRequestBodies))
 
 	// Test StoreChunks convenience method
 	storeChunks, err := service.StoreChunks(ctx)
 	require.NoError(t, err)
 	require.True(t, storeChunks)
+}
+
+func TestSystemService_WebhookNotifierConfig(t *testing.T) {
+	cacheConfig := xcache.Config{Mode: xcache.ModeMemory}
+
+	service, client := setupTestSystemService(t, cacheConfig)
+	defer client.Close()
+
+	ctx := context.Background()
+	ctx = ent.NewContext(ctx, client)
+	ctx = authz.WithTestBypass(ctx)
+
+	cfg, err := service.WebhookNotifierConfig(ctx)
+	require.NoError(t, err)
+	require.NotNil(t, cfg)
+	require.Empty(t, cfg.Targets)
+	require.Empty(t, cfg.Subscriptions)
+
+	customCfg := &WebhookNotifierConfig{
+		Targets: []WebhookTarget{
+			{
+				Name:      "default",
+				Enabled:   true,
+				URL:       "https://example.com/webhook",
+				TimeoutMs: 3000,
+				Headers:   []objects.HeaderEntry{{Key: "Content-Type", Value: "application/json"}},
+				Body:      `{"event":"{{.Event}}"}`,
+			},
+		},
+		Subscriptions: []WebhookSubscription{
+			{Event: EventChannelAutoDisabled, TargetNames: []string{"default"}},
+		},
+	}
+
+	err = service.SetWebhookNotifierConfig(ctx, customCfg)
+	require.NoError(t, err)
+
+	retrievedCfg, err := service.WebhookNotifierConfig(ctx)
+	require.NoError(t, err)
+	require.Equal(t, customCfg, retrievedCfg)
+}
+
+func TestSystemService_ChannelSetting_DefaultModelAutoSyncFrequency(t *testing.T) {
+	cacheConfig := xcache.Config{Mode: xcache.ModeMemory}
+
+	service, client := setupTestSystemService(t, cacheConfig)
+	defer client.Close()
+
+	ctx := context.Background()
+	ctx = ent.NewContext(ctx, client)
+	ctx = authz.WithTestBypass(ctx)
+
+	setting, err := service.ChannelSetting(ctx)
+	require.NoError(t, err)
+	require.Equal(t, AutoSyncFrequencyOneHour, setting.AutoSync.Frequency)
+}
+
+func TestSystemService_SetChannelSetting_PersistsModelAutoSyncFrequency(t *testing.T) {
+	cacheConfig := xcache.Config{Mode: xcache.ModeMemory}
+
+	service, client := setupTestSystemService(t, cacheConfig)
+	defer client.Close()
+
+	ctx := context.Background()
+	ctx = ent.NewContext(ctx, client)
+	ctx = authz.WithTestBypass(ctx)
+
+	setting := SystemChannelSettings{
+		Probe: ChannelProbeSetting{
+			Enabled:   true,
+			Frequency: ProbeFrequency5Min,
+		},
+		AutoSync: ChannelModelAutoSyncSetting{
+			Frequency: AutoSyncFrequencySixHours,
+		},
+	}
+
+	err := service.SetChannelSetting(ctx, setting)
+	require.NoError(t, err)
+
+	retrievedSetting, err := service.ChannelSetting(ctx)
+	require.NoError(t, err)
+	require.Equal(t, AutoSyncFrequencySixHours, retrievedSetting.AutoSync.Frequency)
+}
+
+func TestSystemService_UpdateChannelSetting_CreatesMissingSetting(t *testing.T) {
+	service, client := setupTestSystemService(t, xcache.Config{Mode: xcache.ModeMemory})
+	defer client.Close()
+
+	ctx := authz.WithTestBypass(ent.NewContext(t.Context(), client))
+	userPrompt := "custom user prompt"
+	require.NoError(t, service.UpdateChannelSetting(ctx, UpdateSystemChannelSettings{
+		TestUserPrompt: &userPrompt,
+	}))
+
+	setting, err := service.ChannelSetting(ctx)
+	require.NoError(t, err)
+	require.Equal(t, defaultChannelTestSystemPrompt, setting.TestSystemPrompt)
+	require.Equal(t, userPrompt, setting.TestUserPrompt)
+}
+
+func runSystemSettingUpdate(t *testing.T, service *SystemService, ctx context.Context, input UpdateSystemChannelSettings) <-chan error {
+	t.Helper()
+	result := make(chan error, 1)
+	go func() {
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				err := fmt.Errorf("update channel setting panic: %v", recovered)
+				t.Error(err)
+				result <- err
+			}
+		}()
+		result <- service.UpdateChannelSetting(ctx, input)
+	}()
+	return result
+}
+
+func waitForSystemSettingEntry(t *testing.T, entered <-chan int32) int32 {
+	t.Helper()
+	timer := time.NewTimer(5 * time.Second)
+	defer timer.Stop()
+	select {
+	case update := <-entered:
+		return update
+	case <-timer.C:
+		t.Fatal("timed out waiting for system setting mutation")
+		return 0
+	}
+}
+
+func waitForSystemSettingResult(t *testing.T, result <-chan error) error {
+	t.Helper()
+	timer := time.NewTimer(5 * time.Second)
+	defer timer.Stop()
+	select {
+	case err := <-result:
+		return err
+	case <-timer.C:
+		t.Fatal("timed out waiting for system setting update")
+		return nil
+	}
+}
+
+func TestSystemService_UpdateChannelSetting_PreservesConcurrentChanges(t *testing.T) {
+	service, client := setupTestSystemService(t, xcache.Config{Mode: xcache.ModeMemory})
+	defer client.Close()
+
+	ctx := authz.WithTestBypass(ent.NewContext(t.Context(), client))
+	require.NoError(t, service.SetChannelSetting(ctx, defaultChannelSetting))
+
+	entered := make(chan int32, 2)
+	releaseFirst := make(chan struct{}, 1)
+	releaseSecond := make(chan struct{}, 1)
+	t.Cleanup(func() {
+		select {
+		case releaseFirst <- struct{}{}:
+		default:
+		}
+		select {
+		case releaseSecond <- struct{}{}:
+		default:
+		}
+	})
+	var updates atomic.Int32
+	client.System.Use(func(next ent.Mutator) ent.Mutator {
+		return hook.SystemFunc(func(ctx context.Context, mutation *ent.SystemMutation) (ent.Value, error) {
+			if mutation.Op() == ent.OpUpdate {
+				switch update := updates.Add(1); update {
+				case 1:
+					entered <- update
+					<-releaseFirst
+				case 2:
+					entered <- update
+					<-releaseSecond
+				}
+			}
+
+			return next.Mutate(ctx, mutation)
+		})
+	})
+
+	systemPrompt := "concurrent system prompt"
+	first := runSystemSettingUpdate(t, service, ctx, UpdateSystemChannelSettings{TestSystemPrompt: &systemPrompt})
+	require.Equal(t, int32(1), waitForSystemSettingEntry(t, entered))
+
+	userPrompt := "concurrent user prompt"
+	second := runSystemSettingUpdate(t, service, ctx, UpdateSystemChannelSettings{TestUserPrompt: &userPrompt})
+	require.Equal(t, int32(2), waitForSystemSettingEntry(t, entered))
+
+	releaseFirst <- struct{}{}
+	require.NoError(t, waitForSystemSettingResult(t, first))
+	releaseSecond <- struct{}{}
+	require.NoError(t, waitForSystemSettingResult(t, second))
+
+	setting, err := service.ChannelSetting(ctx)
+	require.NoError(t, err)
+	require.Equal(t, systemPrompt, setting.TestSystemPrompt)
+	require.Equal(t, userPrompt, setting.TestUserPrompt)
+}
+
+func TestSystemService_UpdateChannelSetting_PreservesConcurrentCreates(t *testing.T) {
+	service, client := setupTestSystemService(t, xcache.Config{Mode: xcache.ModeMemory})
+	defer client.Close()
+
+	ctx := authz.WithTestBypass(ent.NewContext(t.Context(), client))
+	entered := make(chan int32, 2)
+	releaseFirst := make(chan struct{}, 1)
+	releaseSecond := make(chan struct{}, 1)
+	t.Cleanup(func() {
+		select {
+		case releaseFirst <- struct{}{}:
+		default:
+		}
+		select {
+		case releaseSecond <- struct{}{}:
+		default:
+		}
+	})
+	var creates atomic.Int32
+	client.System.Use(func(next ent.Mutator) ent.Mutator {
+		return hook.SystemFunc(func(ctx context.Context, mutation *ent.SystemMutation) (ent.Value, error) {
+			if mutation.Op() == ent.OpCreate {
+				if create := creates.Add(1); create <= 2 {
+					entered <- create
+					if create == 1 {
+						<-releaseFirst
+					} else {
+						<-releaseSecond
+					}
+				}
+			}
+
+			return next.Mutate(ctx, mutation)
+		})
+	})
+
+	systemPrompt := "concurrent create system prompt"
+	first := runSystemSettingUpdate(t, service, ctx, UpdateSystemChannelSettings{TestSystemPrompt: &systemPrompt})
+	require.Equal(t, int32(1), waitForSystemSettingEntry(t, entered))
+
+	userPrompt := "concurrent create user prompt"
+	second := runSystemSettingUpdate(t, service, ctx, UpdateSystemChannelSettings{TestUserPrompt: &userPrompt})
+	require.Equal(t, int32(2), waitForSystemSettingEntry(t, entered))
+
+	releaseFirst <- struct{}{}
+	require.NoError(t, waitForSystemSettingResult(t, first))
+	releaseSecond <- struct{}{}
+	require.NoError(t, waitForSystemSettingResult(t, second))
+
+	setting, err := service.ChannelSetting(ctx)
+	require.NoError(t, err)
+	require.Equal(t, systemPrompt, setting.TestSystemPrompt)
+	require.Equal(t, userPrompt, setting.TestUserPrompt)
+}
+
+func TestSystemService_ChannelTestPrompts_FallsBackToDefaults(t *testing.T) {
+	t.Run("uses settings through system bypass", func(t *testing.T) {
+		service, client := setupTestSystemService(t, xcache.Config{})
+		defer client.Close()
+
+		writeCtx := authz.WithTestBypass(ent.NewContext(t.Context(), client))
+		require.NoError(t, service.SetChannelSetting(writeCtx, SystemChannelSettings{
+			TestSystemPrompt: "configured system",
+			TestUserPrompt:   "configured user",
+		}))
+
+		readCtx := ent.NewContext(t.Context(), client)
+		systemPrompt, userPrompt, err := service.ChannelTestPrompts(readCtx)
+		require.NoError(t, err)
+		require.Equal(t, "configured system", systemPrompt)
+		require.Equal(t, "configured user", userPrompt)
+	})
+
+	t.Run("missing setting", func(t *testing.T) {
+		service, client := setupTestSystemService(t, xcache.Config{})
+		defer client.Close()
+
+		ctx := ent.NewContext(t.Context(), client)
+		systemPrompt, userPrompt, err := service.ChannelTestPrompts(ctx)
+		require.NoError(t, err)
+		require.Equal(t, defaultChannelTestSystemPrompt, systemPrompt)
+		require.Equal(t, defaultChannelTestUserPrompt, userPrompt)
+	})
+
+	t.Run("malformed setting", func(t *testing.T) {
+		service, client := setupTestSystemService(t, xcache.Config{})
+		defer client.Close()
+
+		ctx := authz.WithTestBypass(ent.NewContext(t.Context(), client))
+		_, err := client.System.Create().
+			SetKey(SystemKeyChannelSettings).
+			SetValue("invalid-json").
+			Save(ctx)
+		require.NoError(t, err)
+
+		systemPrompt, userPrompt, err := service.ChannelTestPrompts(ctx)
+		require.NoError(t, err)
+		require.Equal(t, defaultChannelTestSystemPrompt, systemPrompt)
+		require.Equal(t, defaultChannelTestUserPrompt, userPrompt)
+	})
+
+	t.Run("database unavailable", func(t *testing.T) {
+		service, client := setupTestSystemService(t, xcache.Config{})
+		require.NoError(t, client.Close())
+
+		ctx := authz.WithTestBypass(ent.NewContext(t.Context(), client))
+		systemPrompt, userPrompt, err := service.ChannelTestPrompts(ctx)
+		require.NoError(t, err)
+		require.Equal(t, defaultChannelTestSystemPrompt, systemPrompt)
+		require.Equal(t, defaultChannelTestUserPrompt, userPrompt)
+	})
+}
+
+func TestSystemService_ChannelSetting_BackfillsLegacyModelAutoSyncFrequency(t *testing.T) {
+	cacheConfig := xcache.Config{Mode: xcache.ModeMemory}
+
+	service, client := setupTestSystemService(t, cacheConfig)
+	defer client.Close()
+
+	ctx := context.Background()
+	ctx = ent.NewContext(ctx, client)
+	ctx = authz.WithTestBypass(ctx)
+
+	legacySetting := map[string]any{
+		"probe": map[string]any{
+			"enabled":   true,
+			"frequency": ProbeFrequency5Min,
+		},
+	}
+
+	legacyJSON, err := json.Marshal(legacySetting)
+	require.NoError(t, err)
+
+	_, err = client.System.Create().
+		SetKey(SystemKeyChannelSettings).
+		SetValue(string(legacyJSON)).
+		Save(ctx)
+	require.NoError(t, err)
+
+	setting, err := service.ChannelSetting(ctx)
+	require.NoError(t, err)
+	require.Equal(t, AutoSyncFrequencyOneHour, setting.AutoSync.Frequency)
+	require.Equal(t, ProbeFrequency5Min, setting.Probe.Frequency)
+}
+
+func TestSystemService_ChannelSetting_NormalizesLegacyAutoSyncFrequency(t *testing.T) {
+	cacheConfig := xcache.Config{Mode: xcache.ModeMemory}
+
+	service, client := setupTestSystemService(t, cacheConfig)
+	defer client.Close()
+
+	ctx := context.Background()
+	ctx = ent.NewContext(ctx, client)
+	ctx = authz.WithTestBypass(ctx)
+
+	legacySetting := map[string]any{
+		"probe": map[string]any{
+			"enabled":   true,
+			"frequency": ProbeFrequency5Min,
+		},
+		"auto_sync": map[string]any{
+			"frequency": "5m",
+		},
+	}
+
+	legacyJSON, err := json.Marshal(legacySetting)
+	require.NoError(t, err)
+
+	_, err = client.System.Create().
+		SetKey(SystemKeyChannelSettings).
+		SetValue(string(legacyJSON)).
+		Save(ctx)
+	require.NoError(t, err)
+
+	setting, err := service.ChannelSetting(ctx)
+	require.NoError(t, err)
+	require.Equal(t, AutoSyncFrequencyOneHour, setting.AutoSync.Frequency)
 }
 
 func TestSystemService_Initialize_WithCache(t *testing.T) {
@@ -278,7 +668,7 @@ func TestSystemService_Initialize_WithCache(t *testing.T) {
 	require.True(t, isInitialized)
 
 	// Verify secret key is cached
-	ctx = privacy.DecisionContext(ctx, privacy.Allow)
+	ctx = authz.WithTestBypass(ctx)
 	secretKey, err := service.SecretKey(ctx)
 	require.NoError(t, err)
 	require.NotEmpty(t, secretKey)
@@ -316,7 +706,7 @@ func TestSystemService_CacheExpiration(t *testing.T) {
 
 	ctx := context.Background()
 	ctx = ent.NewContext(ctx, client)
-	ctx = privacy.DecisionContext(ctx, privacy.Allow)
+	ctx = authz.WithTestBypass(ctx)
 
 	// Set a test value
 	testKey := "expiration_test"
@@ -347,7 +737,7 @@ func TestSystemService_InvalidStoragePolicyJSON(t *testing.T) {
 
 	ctx := context.Background()
 	ctx = ent.NewContext(ctx, client)
-	ctx = privacy.DecisionContext(ctx, privacy.Allow)
+	ctx = authz.WithTestBypass(ctx)
 
 	// Manually insert invalid JSON for storage policy
 	_, err := client.System.Create().
@@ -370,7 +760,7 @@ func TestSystemService_BackwardCompatibility(t *testing.T) {
 
 	ctx := context.Background()
 	ctx = ent.NewContext(ctx, client)
-	ctx = privacy.DecisionContext(ctx, privacy.Allow)
+	ctx = authz.WithTestBypass(ctx)
 
 	// Create old-style storage policy without new fields
 	oldPolicy := map[string]any{
@@ -399,7 +789,84 @@ func TestSystemService_BackwardCompatibility(t *testing.T) {
 	require.True(t, policy.StoreChunks)
 	require.True(t, policy.StoreRequestBody)  // Should default to true
 	require.True(t, policy.StoreResponseBody) // Should default to true
-	require.Len(t, policy.CleanupOptions, 1)
+	require.True(t, hasCleanupResource(policy.CleanupOptions, CleanupResourceRequests))
+	require.True(t, hasCleanupResource(policy.CleanupOptions, CleanupResourceRequestBodies))
+	require.True(t, hasCleanupResource(policy.CleanupOptions, CleanupResourceResponseBodies))
+	require.True(t, hasCleanupResource(policy.CleanupOptions, CleanupResourceResponseChunks))
+}
+
+func hasCleanupResource(options []CleanupOption, resourceType string) bool {
+	for _, opt := range options {
+		if opt.ResourceType == resourceType {
+			return true
+		}
+	}
+
+	return false
+}
+
+func TestMergeCleanupOptions(t *testing.T) {
+	merged := mergeCleanupOptions([]CleanupOption{
+		{ResourceType: CleanupResourceRequests, Enabled: true, CleanupDays: 5},
+	})
+
+	require.True(t, hasCleanupResource(merged, CleanupResourceRequests))
+	require.True(t, hasCleanupResource(merged, CleanupResourceUsageLogs))
+	require.True(t, hasCleanupResource(merged, CleanupResourceRequestBodies))
+	require.True(t, hasCleanupResource(merged, CleanupResourceResponseBodies))
+	require.True(t, hasCleanupResource(merged, CleanupResourceResponseChunks))
+
+	for _, opt := range merged {
+		if opt.ResourceType == CleanupResourceRequests {
+			require.True(t, opt.Enabled)
+			require.Equal(t, 5, opt.CleanupDays)
+		}
+
+		if opt.ResourceType == CleanupResourceRequestBodies {
+			require.False(t, opt.Enabled)
+			require.Equal(t, 7, opt.CleanupDays)
+		}
+
+		if opt.ResourceType == CleanupResourceResponseChunks {
+			require.False(t, opt.Enabled)
+			require.Equal(t, 3, opt.CleanupDays)
+		}
+	}
+}
+
+func TestSystemService_ModelSettingsBackwardCompatibility(t *testing.T) {
+	cacheConfig := xcache.Config{Mode: xcache.ModeMemory}
+
+	service, client := setupTestSystemService(t, cacheConfig)
+	defer client.Close()
+
+	ctx := context.Background()
+	ctx = ent.NewContext(ctx, client)
+	ctx = authz.WithTestBypass(ctx)
+
+	oldModelSettings := map[string]any{
+		"fallback_to_channels_on_model_not_found": true,
+		"query_all_channel_models":                true,
+		"default_model_api_include_all":           false,
+		"auto_reasoning_effort":                   false,
+	}
+
+	oldModelSettingsJSON, err := json.Marshal(oldModelSettings)
+	require.NoError(t, err)
+
+	_, err = client.System.Create().
+		SetKey(SystemKeyModelSettings).
+		SetValue(string(oldModelSettingsJSON)).
+		Save(ctx)
+	require.NoError(t, err)
+
+	settings, err := service.ModelSettings(ctx)
+	require.NoError(t, err)
+	require.True(t, settings.FallbackToChannelsOnModelNotFound)
+	require.True(t, settings.QueryAllChannelModels)
+	require.False(t, settings.HideUnroutableModelsInList)
+	require.NotNil(t, settings.DeveloperSettings)
+	require.Empty(t, settings.DeveloperSettings)
 }
 
 func TestSystemService_GetSystemValue_NotFound(t *testing.T) {
@@ -410,7 +877,7 @@ func TestSystemService_GetSystemValue_NotFound(t *testing.T) {
 
 	ctx := context.Background()
 	ctx = ent.NewContext(ctx, client)
-	ctx = privacy.DecisionContext(ctx, privacy.Allow)
+	ctx = authz.WithTestBypass(ctx)
 
 	// Try to get non-existent key
 	value, err := service.getSystemValue(ctx, "non-existent-key")
@@ -427,7 +894,7 @@ func TestSystemService_BrandName_NotSet(t *testing.T) {
 
 	ctx := context.Background()
 	ctx = ent.NewContext(ctx, client)
-	ctx = privacy.DecisionContext(ctx, privacy.Allow)
+	ctx = authz.WithTestBypass(ctx)
 
 	// Brand name not set should return empty string
 	brandName, err := service.BrandName(ctx)
@@ -458,7 +925,7 @@ func TestSystemService_Version(t *testing.T) {
 
 	ctx := context.Background()
 	ctx = ent.NewContext(ctx, client)
-	ctx = privacy.DecisionContext(ctx, privacy.Allow)
+	ctx = authz.WithTestBypass(ctx)
 
 	// Test getting version when not set
 	version, err := service.Version(ctx)
@@ -501,7 +968,7 @@ func TestSystemService_Version_WithCache(t *testing.T) {
 
 	ctx := context.Background()
 	ctx = ent.NewContext(ctx, client)
-	ctx = privacy.DecisionContext(ctx, privacy.Allow)
+	ctx = authz.WithTestBypass(ctx)
 
 	// Set version
 	testVersion := "v0.4.0"
@@ -547,7 +1014,7 @@ func TestSystemService_Initialize_DataMigrationIdempotency(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	ctx = privacy.DecisionContext(ctx, privacy.Allow)
+	ctx = authz.WithTestBypass(ctx)
 
 	// Get initial data storage ID
 	initialID, err := service.DefaultDataStorageID(ctx)
@@ -592,7 +1059,7 @@ func TestSystemService_Initialize_CreatesDefaultProject(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	ctx = privacy.DecisionContext(ctx, privacy.Allow)
+	ctx = authz.WithTestBypass(ctx)
 
 	// Verify default project was created
 	project, err := client.Project.Query().First(ctx)
@@ -628,7 +1095,7 @@ func TestSystemService_Initialize_SetsAllSystemKeys(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	ctx = privacy.DecisionContext(ctx, privacy.Allow)
+	ctx = authz.WithTestBypass(ctx)
 
 	// Verify all system keys are set
 	systemKeys := []string{
@@ -663,7 +1130,7 @@ func TestSystemService_DefaultDataStorageID(t *testing.T) {
 	service := NewSystemService(SystemServiceParams{})
 	ctx := context.Background()
 	ctx = ent.NewContext(ctx, client)
-	ctx = privacy.DecisionContext(ctx, privacy.Allow)
+	ctx = authz.WithTestBypass(ctx)
 
 	// Test getting default data storage ID when not set (should return 0)
 	defaultID, err := service.DefaultDataStorageID(ctx)
@@ -698,7 +1165,7 @@ func TestSystemService_Initialize_TransactionRollback(t *testing.T) {
 	service := NewSystemService(SystemServiceParams{})
 	ctx := t.Context()
 	ctx = ent.NewContext(ctx, client)
-	ctx = privacy.DecisionContext(ctx, privacy.Allow)
+	ctx = authz.WithTestBypass(ctx)
 
 	// First, create a user with the same email to cause a constraint violation
 	_, err := client.User.Create().
@@ -745,4 +1212,226 @@ func TestSystemService_Initialize_TransactionRollback(t *testing.T) {
 	dsCount, err := client.DataStorage.Query().Count(ctx)
 	require.NoError(t, err)
 	require.Equal(t, 0, dsCount)
+}
+
+// TestSystemService_UserAgentPassThrough tests the User-Agent pass-through setting.
+// This table-driven test covers: default value, set true/false, round-trip, cache behavior, and database errors.
+func TestSystemService_UserAgentPassThrough(t *testing.T) {
+	tests := []struct {
+		name        string
+		setupCache  xcache.Config
+		setupFunc   func(ctx context.Context, s *SystemService, client *ent.Client) error
+		want        bool
+		wantErr     bool
+		errContains string
+	}{
+		{
+			name:       "default_value_returns_false",
+			setupCache: xcache.Config{Mode: xcache.ModeMemory},
+			setupFunc:  nil,
+			want:       false,
+		},
+		{
+			name:       "set_true_returns_true",
+			setupCache: xcache.Config{Mode: xcache.ModeMemory},
+			setupFunc: func(ctx context.Context, s *SystemService, client *ent.Client) error {
+				return s.SetUserAgentPassThrough(ctx, true)
+			},
+			want: true,
+		},
+		{
+			name:       "set_false_returns_false",
+			setupCache: xcache.Config{Mode: xcache.ModeMemory},
+			setupFunc: func(ctx context.Context, s *SystemService, client *ent.Client) error {
+				return s.SetUserAgentPassThrough(ctx, false)
+			},
+			want: false,
+		},
+		{
+			name:       "round_trip_toggle",
+			setupCache: xcache.Config{Mode: xcache.ModeMemory},
+			setupFunc: func(ctx context.Context, s *SystemService, client *ent.Client) error {
+				// Start false, set true
+				if err := s.SetUserAgentPassThrough(ctx, true); err != nil {
+					return err
+				}
+				// Verify true
+				val, _ := s.UserAgentPassThrough(ctx)
+				if !val {
+					return fmt.Errorf("expected true after setting")
+				}
+				// Set false
+				if err := s.SetUserAgentPassThrough(ctx, false); err != nil {
+					return err
+				}
+				// Verify false
+				val, _ = s.UserAgentPassThrough(ctx)
+				if val {
+					return fmt.Errorf("expected false after unsetting")
+				}
+				// Set true again
+				return s.SetUserAgentPassThrough(ctx, true)
+			},
+			want: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			service, client := setupTestSystemService(t, tt.setupCache)
+			defer client.Close()
+
+			ctx := context.Background()
+			ctx = ent.NewContext(ctx, client)
+			ctx = authz.WithTestBypass(ctx)
+
+			if tt.setupFunc != nil {
+				if err := tt.setupFunc(ctx, service, client); err != nil {
+					t.Fatalf("setup failed: %v", err)
+				}
+			}
+
+			got, err := service.UserAgentPassThrough(ctx)
+
+			if tt.wantErr {
+				require.Error(t, err)
+
+				if tt.errContains != "" {
+					require.Contains(t, err.Error(), tt.errContains)
+				}
+			} else {
+				require.NoError(t, err)
+				require.Equal(t, tt.want, got, "UserAgentPassThrough() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestSystemService_UserAgentPassThrough_WithCache tests cache behavior specifically.
+func TestSystemService_UserAgentPassThrough_WithCache(t *testing.T) {
+	mr := miniredis.RunT(t)
+	defer mr.Close()
+
+	cacheConfig := xcache.Config{
+		Mode: xcache.ModeRedis,
+		Redis: xredis.Config{
+			Addr: mr.Addr(),
+		},
+	}
+
+	service, client := setupTestSystemService(t, cacheConfig)
+	defer client.Close()
+
+	ctx := context.Background()
+	ctx = ent.NewContext(ctx, client)
+	ctx = authz.WithTestBypass(ctx)
+
+	// Set UserAgentPassThrough to true
+	err := service.SetUserAgentPassThrough(ctx, true)
+	require.NoError(t, err)
+
+	// First call should hit database and cache the result
+	uaPassThrough1, err := service.UserAgentPassThrough(ctx)
+	require.NoError(t, err)
+	require.True(t, uaPassThrough1)
+
+	// Second call should hit cache
+	uaPassThrough2, err := service.UserAgentPassThrough(ctx)
+	require.NoError(t, err)
+	require.True(t, uaPassThrough2)
+
+	// Update value should invalidate cache
+	err = service.SetUserAgentPassThrough(ctx, false)
+	require.NoError(t, err)
+
+	// Should get updated value
+	uaPassThrough3, err := service.UserAgentPassThrough(ctx)
+	require.NoError(t, err)
+	require.False(t, uaPassThrough3)
+}
+
+func TestSystemService_InjectUsageCostEnabled(t *testing.T) {
+	service, client := setupTestSystemService(t, xcache.Config{Mode: xcache.ModeMemory}) //nolint:exhaustruct_v5
+	defer client.Close()
+
+	ctx := context.Background()
+	ctx = ent.NewContext(ctx, client)
+	ctx = authz.WithTestBypass(ctx)
+
+	got, err := service.InjectUsageCostEnabled(ctx)
+	require.NoError(t, err)
+	require.False(t, got)
+
+	require.NoError(t, service.SetInjectUsageCostEnabled(ctx, true))
+	got, err = service.InjectUsageCostEnabled(ctx)
+	require.NoError(t, err)
+	require.True(t, got)
+
+	require.NoError(t, service.SetInjectUsageCostEnabled(ctx, false))
+	got, err = service.InjectUsageCostEnabled(ctx)
+	require.NoError(t, err)
+	require.False(t, got)
+}
+
+func TestNormalizeRetryPolicy_LoadBalancerStrategy(t *testing.T) {
+	t.Run("invalid strategy falls back to default", func(t *testing.T) {
+		policy := &RetryPolicy{LoadBalancerStrategy: "unknown"}
+		normalizeRetryPolicy(policy)
+		require.Equal(t, defaultRetryPolicy.LoadBalancerStrategy, policy.LoadBalancerStrategy)
+	})
+
+	t.Run("legacy weighted migrates to failover", func(t *testing.T) {
+		policy := &RetryPolicy{LoadBalancerStrategy: "weighted"}
+		normalizeRetryPolicy(policy)
+		require.Equal(t, LoadBalancerStrategyFailover, policy.LoadBalancerStrategy)
+	})
+
+	t.Run("valid strategies are preserved", func(t *testing.T) {
+		for _, strategy := range []string{
+			LoadBalancerStrategyAdaptive,
+			LoadBalancerStrategyFailover,
+			LoadBalancerStrategyCircuitBreaker,
+			LoadBalancerStrategyRoundRobin,
+		} {
+			policy := &RetryPolicy{LoadBalancerStrategy: strategy}
+			normalizeRetryPolicy(policy)
+			require.Equal(t, strategy, policy.LoadBalancerStrategy)
+		}
+	})
+}
+
+func TestNormalizeRetryPolicy_MigratesLegacyStatuses(t *testing.T) {
+	raw := `{"auto_disable_channel":{"enabled":true,"statuses":[{"status":401,"times":3}]}}`
+	var policy RetryPolicy
+	require.NoError(t, json.Unmarshal([]byte(raw), &policy))
+	normalizeRetryPolicy(&policy)
+
+	require.True(t, policy.AutoDisableChannel.Enabled)
+	require.Len(t, policy.AutoDisableChannel.Rules, 1)
+	require.Equal(t, []int{401}, policy.AutoDisableChannel.Rules[0].StatusCodes)
+	require.Equal(t, 3, policy.AutoDisableChannel.Rules[0].Times)
+	require.Equal(t, objects.APIKeyAutoDisableActionPermanent, policy.AutoDisableChannel.Rules[0].Action)
+	require.Nil(t, policy.AutoDisableChannel.Statuses)
+}
+
+func TestSetRetryPolicy_RejectsPermanentDelete(t *testing.T) {
+	client := enttest.NewEntClient(t, "sqlite3", "file:ent?mode=memory&_fk=1")
+	defer client.Close()
+
+	service := NewSystemService(SystemServiceParams{Ent: client, CacheConfig: xcache.Config{Mode: xcache.ModeMemory}})
+	ctx := authz.WithTestBypass(ent.NewContext(context.Background(), client))
+
+	err := service.SetRetryPolicy(ctx, &RetryPolicy{
+		AutoDisableChannel: AutoDisableChannel{
+			Enabled: true,
+			Rules: []objects.APIKeyAutoDisableRule{{
+				StatusCodes: []int{401},
+				Times:       1,
+				Action:      objects.APIKeyAutoDisableActionPermanentDelete,
+			}},
+		},
+	})
+	require.Error(t, err)
+	var coded *xerrors.CodedError
+	require.ErrorAs(t, err, &coded)
 }

@@ -3,10 +3,29 @@ package llm
 type RequestType string
 
 const (
-	RequestTypeChat      RequestType = "chat"
-	RequestTypeEmbedding RequestType = "embedding"
-	RequestTypeRerank    RequestType = "rerank"
-	RequestTypeImage     RequestType = "image"
+	RequestTypeChat       RequestType = "chat"
+	RequestTypeEmbedding  RequestType = "embedding"
+	RequestTypeRerank     RequestType = "rerank"
+	RequestTypeImage      RequestType = "image"
+	RequestTypeVideo      RequestType = "video"
+	RequestTypeCompact    RequestType = "compact"
+	RequestTypeCompletion RequestType = "completion"
+
+	// RequestTypeSpeech is the text-to-speech (TTS) request type, maps to /v1/audio/speech.
+	RequestTypeSpeech RequestType = "speech"
+	// RequestTypeTranscription is the speech-to-text (STT) request type, maps to /v1/audio/transcriptions.
+	RequestTypeTranscription RequestType = "transcription"
+	// RequestTypeTranslation is the speech-to-text translation request type, maps to /v1/audio/translations.
+	RequestTypeTranslation RequestType = "translation"
+	// RequestTypeModeration is the content moderation request type, maps to /v1/moderations.
+	RequestTypeModeration RequestType = "moderation"
+	// RequestTypeAlphaSearch is the Codex/CPA alpha search request type, maps to /v1/alpha/search.
+	RequestTypeAlphaSearch RequestType = "alpha_search"
+
+	// RequestTypeSystemOne represents a System One decision inference request.
+	RequestTypeSystemOne RequestType = "systemone"
+	// RequestTypeDecisions represents an OpenAI Decisions request.
+	RequestTypeDecisions RequestType = "decisions"
 )
 
 func (r RequestType) String() string {
@@ -16,19 +35,48 @@ func (r RequestType) String() string {
 type APIFormat string
 
 const (
-	APIFormatOpenAIChatCompletion  APIFormat = "openai/chat_completions"
-	APIFormatOpenAIResponse        APIFormat = "openai/responses"
-	APIFormatOpenAIImageGeneration APIFormat = "openai/image_generation"
-	APIFormatOpenAIImageEdit       APIFormat = "openai/image_edit"
-	APIFormatOpenAIImageVariation  APIFormat = "openai/image_variation"
-	APIFormatOpenAIEmbedding       APIFormat = "openai/embeddings"
-	APIFormatGeminiContents        APIFormat = "gemini/contents"
-	APIFormatAnthropicMessage      APIFormat = "anthropic/messages"
-	APIFormatAiSDKText             APIFormat = "aisdk/text"
-	APIFormatAiSDKDataStream       APIFormat = "aisdk/datastream"
+	APIFormatOpenAIChatCompletion APIFormat = "openai/chat_completions"
+	APIFormatOpenAICompletion     APIFormat = "openai/completions"
+	APIFormatOpenAIResponse       APIFormat = "openai/responses"
+	// APIFormatOpenAIResponseWebSocket identifies a downstream Responses
+	// WebSocket request in persisted request/trace metadata. Upstream channel
+	// selection continues to use APIFormatOpenAIResponse with websocket transport.
+	APIFormatOpenAIResponseWebSocket APIFormat = "openai/responses-ws"
+	APIFormatOpenAIResponseCompact   APIFormat = "openai/responses_compact"
+	APIFormatOpenAIImageGeneration   APIFormat = "openai/image_generation"
+	APIFormatOpenAIImageEdit         APIFormat = "openai/image_edit"
+	APIFormatOpenAIImageVariation    APIFormat = "openai/image_variation"
+	APIFormatOpenAIEmbedding         APIFormat = "openai/embeddings"
+	APIFormatOpenAIVideo             APIFormat = "openai/video"
+
+	APIFormatOpenAISpeech        APIFormat = "openai/audio_speech"
+	APIFormatOpenAITranscription APIFormat = "openai/audio_transcriptions"
+	APIFormatOpenAITranslation   APIFormat = "openai/audio_translations"
+	APIFormatOpenAIModeration    APIFormat = "openai/moderations"
+	APIFormatOpenAIAlphaSearch   APIFormat = "openai/alpha_search"
+	APIFormatGeminiContents      APIFormat = "gemini/contents"
+	APIFormatAnthropicMessage    APIFormat = "anthropic/messages"
+	APIFormatAiSDKText           APIFormat = "aisdk/text"
+	APIFormatAiSDKDataStream     APIFormat = "aisdk/datastream"
+
+	APIFormatGeminiEmbedding APIFormat = "gemini/embeddings"
 
 	APIFormatJinaRerank    APIFormat = "jina/rerank"
 	APIFormatJinaEmbedding APIFormat = "jina/embeddings"
+
+	APIFormatTypeSafeSystemOne APIFormat = "typesafe/systemone"
+	APIFormatOpenAIDecisions   APIFormat = "openai/decisions"
+
+	APIFormatOllamaChat    APIFormat = "ollama/chat"
+	APIFormatDevinChat     APIFormat = "devin/chat"
+	APIFormatSeedanceVideo APIFormat = "seedance/video"
+	APIFormatZenmuxVideo   APIFormat = "zenmux/video"
+
+	// APIFormatModelScopeImage is the ModelScope-native image protocol. ModelScope
+	// serves image generation and image editing on one async endpoint, so a single
+	// provider format covers both directions. It is a provider-only default
+	// endpoint and is intentionally absent from the configurable format list.
+	APIFormatModelScopeImage APIFormat = "modelscope/image_generation"
 )
 
 func (f APIFormat) String() string {
@@ -42,6 +90,9 @@ const (
 	// ToolTypeImageGeneration is the image generation grounding tool type for OpenAI.
 	ToolTypeImageGeneration = "image_generation"
 
+	// ToolTypeWebSearch is the web search grounding tool type.
+	ToolTypeWebSearch = "web_search"
+
 	// ToolTypeGoogleSearch is the Google Search grounding tool type for Gemini.
 	ToolTypeGoogleSearch = "google_search"
 
@@ -51,11 +102,7 @@ const (
 	// ToolTypeGoogleUrlContext is the URL context grounding tool type for Gemini 2.0+.
 	ToolTypeGoogleUrlContext = "google_url_context"
 
-	// ToolTypeAnthropicWebSearch is the native web search tool type for Anthropic (Beta).
-	// This tool is only supported by native Anthropic API format channels.
-	ToolTypeAnthropicWebSearch = "web_search_20250305"
-
-	// AnthropicWebSearchFunctionName is the standard function name that triggers
-	// native Anthropic web search tool transformation.
-	AnthropicWebSearchFunctionName = "web_search"
+	// ToolTypeResponsesCustomTool is the custom tool type for OpenAI Responses API.
+	// Custom tools use freeform input (not JSON) and a grammar-based format definition.
+	ToolTypeResponsesCustomTool = "responses_custom_tool"
 )

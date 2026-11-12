@@ -21,7 +21,7 @@ export function DataTableViewOptions<TData>({ table }: DataTableViewOptionsProps
   return (
     <DropdownMenu modal={false}>
       <DropdownMenuTrigger asChild>
-        <Button variant='outline' size='sm' className='ml-auto hidden h-8 lg:flex'>
+        <Button variant='outline' size='sm' className='h-8'>
           <MixerHorizontalIcon className='mr-2 h-4 w-4' />
           {t('common.view')}
         </Button>
@@ -31,7 +31,12 @@ export function DataTableViewOptions<TData>({ table }: DataTableViewOptionsProps
         <DropdownMenuSeparator />
         {table
           .getAllColumns()
-          .filter((column) => typeof column.accessorFn !== 'undefined' && column.getCanHide())
+          .filter((column) => {
+            const accessorKey = column.columnDef.accessorKey;
+            const isDataColumn = typeof column.accessorFn !== 'undefined' || typeof accessorKey !== 'undefined';
+            const isDetailsColumn = column.id === 'details' || column.id === 'detail';
+            return (isDataColumn || isDetailsColumn) && column.getCanHide();
+          })
           .map((column) => {
             return (
               <DropdownMenuCheckboxItem
@@ -41,7 +46,7 @@ export function DataTableViewOptions<TData>({ table }: DataTableViewOptionsProps
                 onCheckedChange={(value) => column.toggleVisibility(!!value)}
               >
                 {t(`requests.columns.${column.id}`, {
-                  fallback: t(`common.columns.${column.id}`),
+                  defaultValue: t(`common.columns.${column.id}`),
                 })}
               </DropdownMenuCheckboxItem>
             );

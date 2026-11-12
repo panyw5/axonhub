@@ -11,9 +11,10 @@ import (
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
 
+	"github.com/looplj/axonhub/internal/authz"
 	"github.com/looplj/axonhub/internal/ent"
+	"github.com/looplj/axonhub/internal/ent/apikey"
 	"github.com/looplj/axonhub/internal/ent/enttest"
-	"github.com/looplj/axonhub/internal/ent/privacy"
 	"github.com/looplj/axonhub/internal/ent/project"
 	"github.com/looplj/axonhub/internal/ent/user"
 	"github.com/looplj/axonhub/internal/pkg/xcache"
@@ -85,7 +86,7 @@ func setupTestAuthService(t *testing.T, cacheConfig xcache.Config) (*AuthService
 	// Set up a test secret key in the system service
 	ctx := context.Background()
 	ctx = ent.NewContext(ctx, client)
-	ctx = privacy.DecisionContext(ctx, privacy.Allow)
+	ctx = authz.WithTestBypass(ctx)
 
 	// Create system entry for secret key
 	secretKey, err := GenerateSecretKey()
@@ -102,19 +103,22 @@ func setupTestAuthService(t *testing.T, cacheConfig xcache.Config) (*AuthService
 	}
 
 	projectService := &ProjectService{
-		ProjectCache: xcache.NewFromConfig[ent.Project](cacheConfig),
+		ProjectCache: xcache.NewFromConfig[xcache.Entry[ent.Project]](cacheConfig),
 	}
 
 	apiKeyService := NewAPIKeyService(APIKeyServiceParams{
 		CacheConfig:    cacheConfig,
 		Ent:            client,
 		ProjectService: projectService,
+		KeyPrefix:      "ah",
 	})
+	userService.apiKeyService = apiKeyService
 
 	authService := &AuthService{
 		SystemService: systemService,
 		APIKeyService: apiKeyService,
 		UserService:   userService,
+		AllowNoAuth:   false,
 	}
 
 	cleanup := func() {
@@ -134,7 +138,7 @@ func TestAuthService_GenerateJWTToken(t *testing.T) {
 
 	ctx := context.Background()
 	ctx = ent.NewContext(ctx, client)
-	ctx = privacy.DecisionContext(ctx, privacy.Allow)
+	ctx = authz.WithTestBypass(ctx)
 
 	// Create a test user
 	hashedPassword, err := HashPassword("test-password")
@@ -176,6 +180,57 @@ func TestAuthService_GenerateJWTToken(t *testing.T) {
 	require.True(t, exp > float64(time.Now().Unix()))
 }
 
+func TestAuthService_RefreshJWTToken(t *testing.T) {
+	authService, client, cleanup := setupTestAuthService(t, xcache.Config{Mode: xcache.ModeMemory})
+	defer cleanup()
+	defer client.Close()
+
+	ctx := authz.WithTestBypass(ent.NewContext(context.Background(), client))
+	testUser, err := client.User.Create().
+		SetEmail("refresh@example.com").
+		SetPassword("test-password").
+		SetStatus(user.StatusActivated).
+		Save(ctx)
+	require.NoError(t, err)
+
+	now := time.Now().Truncate(time.Second)
+	authTime := now.Add(-25 * 24 * time.Hour)
+	token, err := authService.GenerateJWTTokenAt(ctx, testUser, authTime, authTime)
+	require.NoError(t, err)
+
+	_, renewed, err := authService.RefreshJWTToken(ctx, token, now.Add(-10*24*time.Hour))
+	require.NoError(t, err)
+	require.False(t, renewed)
+
+	refreshed, renewed, err := authService.RefreshJWTToken(ctx, token, now)
+	require.NoError(t, err)
+	require.True(t, renewed)
+	require.NotEqual(t, token, refreshed)
+
+	parsed, _, err := jwt.NewParser().ParseUnverified(refreshed, jwt.MapClaims{})
+	require.NoError(t, err)
+	claims, ok := parsed.Claims.(jwt.MapClaims)
+	require.True(t, ok)
+	require.Equal(t, float64(testUser.ID), claims["user_id"])
+	require.Equal(t, float64(authTime.Unix()), claims["auth_time"])
+	require.Equal(t, float64(now.Add(AdminSessionIdle).Unix()), claims["exp"])
+
+	legacy, err := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+		"user_id": testUser.ID,
+		"exp":     now.Add(24 * time.Hour).Unix(),
+	}).SignedString([]byte(mustTestSecretKey(t, authService, ctx)))
+	require.NoError(t, err)
+	_, renewed, err = authService.RefreshJWTToken(ctx, legacy, now)
+	require.NoError(t, err)
+	require.False(t, renewed)
+}
+
+func mustTestSecretKey(t *testing.T, authService *AuthService, ctx context.Context) string {
+	secretKey, err := authService.SystemService.SecretKey(ctx)
+	require.NoError(t, err)
+	return secretKey
+}
+
 func TestAuthService_AuthenticateUser(t *testing.T) {
 	// Test with Redis cache using miniredis
 	mr := miniredis.RunT(t)
@@ -194,7 +249,7 @@ func TestAuthService_AuthenticateUser(t *testing.T) {
 
 	ctx := context.Background()
 	ctx = ent.NewContext(ctx, client)
-	ctx = privacy.DecisionContext(ctx, privacy.Allow)
+	ctx = authz.WithTestBypass(ctx)
 
 	// Create a test user
 	password := "test-password-123"
@@ -253,7 +308,7 @@ func TestAuthService_AuthenticateJWTToken(t *testing.T) {
 
 	ctx := context.Background()
 	ctx = ent.NewContext(ctx, client)
-	ctx = privacy.DecisionContext(ctx, privacy.Allow)
+	ctx = authz.WithTestBypass(ctx)
 
 	// Create a test user
 	hashedPassword, err := HashPassword("test-password")
@@ -318,7 +373,7 @@ func TestAuthService_AuthenticateJWTToken(t *testing.T) {
 	require.Contains(t, err.Error(), "user not activated")
 }
 
-func TestAuthService_AnthenticateAPIKey(t *testing.T) {
+func TestAuthService_AuthenticateAPIKey(t *testing.T) {
 	// Test with noop cache (no cache configured)
 	cacheConfig := xcache.Config{} // Empty config = noop cache
 
@@ -328,7 +383,7 @@ func TestAuthService_AnthenticateAPIKey(t *testing.T) {
 
 	ctx := context.Background()
 	ctx = ent.NewContext(ctx, client)
-	ctx = privacy.DecisionContext(ctx, privacy.Allow)
+	ctx = authz.WithTestBypass(ctx)
 
 	// Create a test user
 	hashedPassword, err := HashPassword("test-password")
@@ -360,7 +415,7 @@ func TestAuthService_AnthenticateAPIKey(t *testing.T) {
 	require.NoError(t, err)
 
 	// Generate API key
-	apiKeyString, err := GenerateAPIKey()
+	apiKeyString, err := GenerateAPIKey("ah")
 	require.NoError(t, err)
 
 	// Create API key in database
@@ -373,18 +428,18 @@ func TestAuthService_AnthenticateAPIKey(t *testing.T) {
 	require.NoError(t, err)
 
 	// Test successful API key authentication
-	authenticatedAPIKey, err := authService.AnthenticateAPIKey(ctx, apiKeyString)
+	authenticatedAPIKey, err := authService.AuthenticateAPIKey(ctx, apiKeyString)
 	require.NoError(t, err)
 	require.Equal(t, apiKey.ID, authenticatedAPIKey.ID)
 	require.Equal(t, apiKey.Key, authenticatedAPIKey.Key)
 
 	// Test cache behavior - second call should still work (even with noop cache)
-	authenticatedAPIKey2, err := authService.AnthenticateAPIKey(ctx, apiKeyString)
+	authenticatedAPIKey2, err := authService.AuthenticateAPIKey(ctx, apiKeyString)
 	require.NoError(t, err)
 	require.Equal(t, apiKey.ID, authenticatedAPIKey2.ID)
 
 	// Test invalid API key
-	_, err = authService.AnthenticateAPIKey(ctx, "invalid-api-key")
+	_, err = authService.AuthenticateAPIKey(ctx, "invalid-api-key")
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "failed to get api key")
 
@@ -395,7 +450,7 @@ func TestAuthService_AnthenticateAPIKey(t *testing.T) {
 	// Synchronously invalidate the cache for testing (async notification may not complete in time)
 	authService.APIKeyService.APIKeyCache.Invalidate(buildAPIKeyCacheKey(apiKeyString))
 
-	_, err = authService.AnthenticateAPIKey(ctx, apiKeyString)
+	_, err = authService.AuthenticateAPIKey(ctx, apiKeyString)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "api key not enabled")
 
@@ -413,9 +468,75 @@ func TestAuthService_AnthenticateAPIKey(t *testing.T) {
 		Save(ctx)
 	require.NoError(t, err)
 
-	_, err = authService.AnthenticateAPIKey(ctx, apiKeyString)
+	_, err = authService.AuthenticateAPIKey(ctx, apiKeyString)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "api key project not valid")
+}
+
+func TestAuthService_AuthenticateNoAuth(t *testing.T) {
+	cacheConfig := xcache.Config{}
+
+	authService, client, cleanup := setupTestAuthService(t, cacheConfig)
+	defer cleanup()
+	defer client.Close()
+
+	ctx := context.Background()
+	ctx = ent.NewContext(ctx, client)
+	ctx = authz.WithTestBypass(ctx)
+	authService.AllowNoAuth = true
+
+	hashedPassword, err := HashPassword("test-password")
+	require.NoError(t, err)
+
+	owner, err := client.User.Create().
+		SetEmail(fmt.Sprintf("owner-%d@example.com", time.Now().UnixNano())).
+		SetPassword(hashedPassword).
+		SetFirstName("Owner").
+		SetLastName("User").
+		SetIsOwner(true).
+		SetStatus(user.StatusActivated).
+		Save(ctx)
+	require.NoError(t, err)
+
+	defaultProject, err := client.Project.Create().
+		SetName(uuid.NewString()).
+		SetDescription("default").
+		SetStatus(project.StatusActive).
+		Save(ctx)
+	require.NoError(t, err)
+
+	noAuthKey, err := client.APIKey.Create().
+		SetKey(NoAuthAPIKeyValue).
+		SetName(NoAuthAPIKeyName).
+		SetUserID(owner.ID).
+		SetProjectID(defaultProject.ID).
+		SetType(apikey.TypeNoauth).
+		SetStatus(apikey.StatusEnabled).
+		Save(ctx)
+	require.NoError(t, err)
+
+	_, err = authService.AuthenticateAPIKey(ctx, NoAuthAPIKeyValue)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "noauth api key is only available when api auth is disabled")
+
+	authenticatedAPIKey, err := authService.AuthenticateNoAuth(ctx)
+	require.NoError(t, err)
+	require.Equal(t, noAuthKey.ID, authenticatedAPIKey.ID)
+	require.Equal(t, NoAuthAPIKeyValue, authenticatedAPIKey.Key)
+}
+
+func TestAuthService_AuthenticateNoAuth_DisabledByConfig(t *testing.T) {
+	authService, client, cleanup := setupTestAuthService(t, xcache.Config{})
+	defer cleanup()
+	defer client.Close()
+
+	ctx := context.Background()
+	ctx = ent.NewContext(ctx, client)
+	ctx = authz.WithTestBypass(ctx)
+
+	_, err := authService.AuthenticateNoAuth(ctx)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "API key required")
 }
 
 func TestAuthService_WithDifferentCacheConfigs(t *testing.T) {
@@ -468,7 +589,7 @@ func TestAuthService_WithDifferentCacheConfigs(t *testing.T) {
 
 			ctx := context.Background()
 			ctx = ent.NewContext(ctx, client)
-			ctx = privacy.DecisionContext(ctx, privacy.Allow)
+			ctx = authz.WithTestBypass(ctx)
 
 			// Create a test user
 			hashedPassword, err := HashPassword("test-password")
@@ -517,7 +638,7 @@ func TestAuthService_CacheExpiration(t *testing.T) {
 
 	ctx := context.Background()
 	ctx = ent.NewContext(ctx, client)
-	ctx = privacy.DecisionContext(ctx, privacy.Allow)
+	ctx = authz.WithTestBypass(ctx)
 
 	// Create a test user
 	hashedPassword, err := HashPassword("test-password")
@@ -549,7 +670,7 @@ func TestAuthService_CacheExpiration(t *testing.T) {
 	require.NoError(t, err)
 
 	// Generate API key
-	apiKeyString, err := GenerateAPIKey()
+	apiKeyString, err := GenerateAPIKey("ah")
 	require.NoError(t, err)
 
 	apiKey, err := client.APIKey.Create().
@@ -561,7 +682,7 @@ func TestAuthService_CacheExpiration(t *testing.T) {
 	require.NoError(t, err)
 
 	// First call - should cache the result
-	authenticatedAPIKey, err := authService.AnthenticateAPIKey(ctx, apiKeyString)
+	authenticatedAPIKey, err := authService.AuthenticateAPIKey(ctx, apiKeyString)
 	require.NoError(t, err)
 	require.Equal(t, apiKey.ID, authenticatedAPIKey.ID)
 
@@ -569,7 +690,7 @@ func TestAuthService_CacheExpiration(t *testing.T) {
 	time.Sleep(150 * time.Millisecond)
 
 	// Second call - cache should be expired, should hit database again
-	authenticatedAPIKey2, err := authService.AnthenticateAPIKey(ctx, apiKeyString)
+	authenticatedAPIKey2, err := authService.AuthenticateAPIKey(ctx, apiKeyString)
 	require.NoError(t, err)
 	require.Equal(t, apiKey.ID, authenticatedAPIKey2.ID)
 }

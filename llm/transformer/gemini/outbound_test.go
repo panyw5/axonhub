@@ -9,6 +9,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/looplj/axonhub/llm"
+	"github.com/looplj/axonhub/llm/auth"
 	"github.com/looplj/axonhub/llm/httpclient"
 )
 
@@ -106,6 +107,44 @@ func TestClenupConfig(t *testing.T) {
 			require.Equal(t, tt.expected, result)
 		})
 	}
+}
+
+func TestOutboundTransformer_TransformRequest_AccountIdentity(t *testing.T) {
+	outbound, err := NewOutboundTransformerWithConfig(Config{
+		BaseURL:        "https://generativelanguage.googleapis.com",
+		APIKeyProvider: auth.NewStaticKeyProvider("test-api-key"),
+	})
+	require.NoError(t, err)
+
+	req := &llm.Request{
+		Model: "gemini-2.0-flash",
+		Messages: []llm.Message{
+			{Role: "user", Content: llm.MessageContent{Content: lo.ToPtr("hi")}},
+		},
+	}
+
+	hreq, err := outbound.TransformRequest(t.Context(), req)
+	require.NoError(t, err)
+	require.Nil(t, hreq.Metadata)
+}
+
+func TestOutboundTransformer_TransformRequest_OmitsMetadataWhenEmpty(t *testing.T) {
+	outbound, err := NewOutboundTransformerWithConfig(Config{
+		BaseURL:        "https://generativelanguage.googleapis.com",
+		APIKeyProvider: auth.NewStaticKeyProvider(""),
+	})
+	require.NoError(t, err)
+
+	req := &llm.Request{
+		Model: "gemini-2.0-flash",
+		Messages: []llm.Message{
+			{Role: "user", Content: llm.MessageContent{Content: lo.ToPtr("hi")}},
+		},
+	}
+
+	hreq, err := outbound.TransformRequest(t.Context(), req)
+	require.NoError(t, err)
+	require.Nil(t, hreq.Metadata)
 }
 
 func TestOutboundTransformer_buildFullRequestURL(t *testing.T) {
@@ -754,4 +793,58 @@ func TestOutboundTransformer_TransformResponse_MultipleFunctionCalls(t *testing.
 			tt.validate(t, resp)
 		})
 	}
+}
+
+func TestClearFunctionIDsForVertexAI(t *testing.T) {
+	req := &GenerateContentRequest{
+		Contents: []*Content{
+			{
+				Role: "model",
+				Parts: []*Part{
+					{
+						FunctionCall: &FunctionCall{
+							ID:   "call_123",
+							Name: "get_weather",
+							Args: map[string]any{"city": "Paris"},
+						},
+					},
+					{
+						Text: "Some text",
+					},
+				},
+			},
+			{
+				Role: "user",
+				Parts: []*Part{
+					{
+						FunctionResponse: &FunctionResponse{
+							ID:       "call_123",
+							Name:     "get_weather",
+							Response: map[string]any{"temperature": 22},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	// Verify IDs are present before clearing
+	require.Equal(t, "call_123", req.Contents[0].Parts[0].FunctionCall.ID)
+	require.Equal(t, "call_123", req.Contents[1].Parts[0].FunctionResponse.ID)
+
+	// Clear IDs
+	clearFunctionIDsForVertexAI(req)
+
+	// Verify IDs are cleared
+	require.Empty(t, req.Contents[0].Parts[0].FunctionCall.ID)
+	require.Empty(t, req.Contents[1].Parts[0].FunctionResponse.ID)
+
+	// Verify other fields are preserved
+	require.Equal(t, "get_weather", req.Contents[0].Parts[0].FunctionCall.Name)
+	require.Equal(t, "get_weather", req.Contents[1].Parts[0].FunctionResponse.Name)
+
+	// Verify JSON serialization omits ID fields
+	jsonBytes, err := json.Marshal(req)
+	require.NoError(t, err)
+	require.NotContains(t, string(jsonBytes), "\"id\":")
 }

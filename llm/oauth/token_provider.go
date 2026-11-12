@@ -4,16 +4,28 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/zhenzou/executors"
 	"golang.org/x/sync/singleflight"
 
-	"github.com/looplj/axonhub/internal/log"
 	"github.com/looplj/axonhub/llm/httpclient"
 )
+
+func wrapHttpError(err error) error {
+	if err == nil {
+		return nil
+	}
+
+	var httpErr *httpclient.Error
+	if errors.As(err, &httpErr) && len(httpErr.Body) > 0 {
+		return fmt.Errorf("%w (response body: %s)", err, string(httpErr.Body))
+	}
+
+	return err
+}
 
 type OAuthUrls struct {
 	AuthorizeUrl string
@@ -36,10 +48,8 @@ type TokenProvider struct {
 	userAgent   string
 	onRefreshed func(ctx context.Context, refreshed *OAuthCredentials) error
 
-	autoMu         sync.Mutex
-	autoCancel     context.CancelFunc
-	autoExecutor   executors.ScheduledExecutor
-	autoTaskCancel executors.CancelFunc
+	autoMu     sync.Mutex
+	autoCancel context.CancelFunc
 }
 
 type TokenProviderParams struct {
@@ -124,6 +134,7 @@ func (p *TokenProvider) Exchange(ctx context.Context, params ExchangeParams) (*O
 		if strings.Contains(err.Error(), "token request failed:") {
 			return nil, fmt.Errorf("token exchange failed: %s", strings.TrimPrefix(err.Error(), "token request failed: "))
 		}
+
 		return nil, err
 	}
 
@@ -176,7 +187,7 @@ func (p *TokenProvider) Get(ctx context.Context) (*OAuthCredentials, error) {
 
 		if onRefreshed != nil {
 			if err := onRefreshed(ctx, fresh); err != nil {
-				log.Warn(ctx, "failed to persist refreshed credentials", log.Cause(err))
+				slog.WarnContext(ctx, "failed to persist refreshed credentials", slog.Any("error", err))
 			}
 		}
 
@@ -250,7 +261,7 @@ func (p *TokenProvider) EnsureFresh(ctx context.Context, refreshBefore time.Dura
 
 		if onRefreshed != nil {
 			if err := onRefreshed(ctx, fresh); err != nil {
-				log.Warn(ctx, "failed to persist refreshed credentials", log.Cause(err))
+				slog.WarnContext(ctx, "failed to persist refreshed credentials", slog.Any("error", err))
 			}
 		}
 
@@ -269,7 +280,7 @@ func (p *TokenProvider) EnsureFresh(ctx context.Context, refreshBefore time.Dura
 }
 
 func (p *TokenProvider) StartAutoRefresh(ctx context.Context, opts AutoRefreshOptions) {
-	log.Debug(ctx, "start auto refresh token provider")
+	slog.DebugContext(ctx, "start auto refresh token provider")
 
 	fallbackInterval := opts.Interval
 	if fallbackInterval <= 0 {
@@ -290,108 +301,93 @@ func (p *TokenProvider) StartAutoRefresh(ctx context.Context, opts AutoRefreshOp
 
 	autoCtx, cancel := context.WithCancel(ctx)
 	p.autoCancel = cancel
-	p.autoExecutor = executors.NewPoolScheduleExecutor(executors.WithMaxConcurrent(1))
-	exec := p.autoExecutor
 	p.autoMu.Unlock()
 
-	p.scheduleNextAutoRefresh(autoCtx, exec, refreshBefore, fallbackInterval, true)
+	go p.runAutoRefresh(autoCtx, refreshBefore, fallbackInterval)
 }
 
 func (p *TokenProvider) StopAutoRefresh() {
-	log.Debug(context.Background(), "stop auto refresh token provider")
+	slog.DebugContext(context.Background(), "stop auto refresh token provider")
 
 	p.autoMu.Lock()
 	cancel := p.autoCancel
-	exec := p.autoExecutor
-	taskCancel := p.autoTaskCancel
 	p.autoCancel = nil
-	p.autoExecutor = nil
-	p.autoTaskCancel = nil
 	p.autoMu.Unlock()
 
 	if cancel != nil {
 		cancel()
 	}
+}
 
-	if taskCancel != nil {
-		taskCancel()
-	}
+func (p *TokenProvider) runAutoRefresh(
+	autoCtx context.Context,
+	refreshBefore time.Duration,
+	fallbackInterval time.Duration,
+) {
+	defer func() {
+		if r := recover(); r != nil {
+			slog.ErrorContext(autoCtx, "auto refresh token provider goroutine panicked", slog.Any("cause", r))
+		}
+	}()
 
-	if exec != nil {
-		if err := exec.Shutdown(context.Background()); err != nil {
-			log.Warn(context.Background(), "failed to shutdown token provider auto refresh executor", log.Cause(err))
+	delay := time.Duration(0)
+	for {
+		if !sleepForAutoRefresh(autoCtx, delay) {
+			return
+		}
+
+		refreshFailed, ok := p.runAutoRefreshOnce(autoCtx, refreshBefore)
+		if !ok {
+			return
+		}
+
+		if refreshFailed {
+			delay = fallbackInterval
+		} else {
+			delay = p.nextAutoRefreshDelay(refreshBefore, fallbackInterval)
 		}
 	}
 }
 
-func (p *TokenProvider) scheduleNextAutoRefresh(
-	autoCtx context.Context,
-	exec executors.ScheduledExecutor,
-	refreshBefore time.Duration,
-	fallbackInterval time.Duration,
-	runImmediately bool,
-) {
+func (p *TokenProvider) runAutoRefreshOnce(autoCtx context.Context, refreshBefore time.Duration) (refreshFailed bool, ok bool) {
+	defer func() {
+		if r := recover(); r != nil {
+			slog.ErrorContext(autoCtx, "auto refresh token provider panicked", slog.Any("cause", r))
+			refreshFailed = false
+			ok = false
+		}
+	}()
+
 	if autoCtx.Err() != nil {
-		return
+		return false, false
 	}
 
-	delay := time.Duration(0)
-	if !runImmediately {
-		delay = p.nextAutoRefreshDelay(refreshBefore, fallbackInterval)
+	if _, err := p.EnsureFresh(autoCtx, refreshBefore); err != nil {
+		slog.WarnContext(autoCtx, "failed to auto refresh token", slog.Any("error", err))
+		refreshFailed = true
 	}
 
-	p.autoMu.Lock()
-
-	if p.autoCancel == nil || p.autoExecutor == nil || exec != p.autoExecutor {
-		p.autoMu.Unlock()
-		return
+	if autoCtx.Err() != nil {
+		return refreshFailed, false
 	}
 
-	prevCancel := p.autoTaskCancel
-	p.autoTaskCancel = nil
-	p.autoMu.Unlock()
+	return refreshFailed, true
+}
 
-	if prevCancel != nil {
-		prevCancel()
+func sleepForAutoRefresh(ctx context.Context, delay time.Duration) bool {
+	if delay <= 0 {
+		return ctx.Err() == nil
 	}
 
-	cancelFunc, err := exec.ScheduleFunc(func(_ context.Context) {
-		defer func() {
-			if r := recover(); r != nil {
-				log.Error(autoCtx, "auto refresh token provider panicked", log.Any("cause", r))
-			}
-		}()
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
 
-		if autoCtx.Err() != nil {
-			return
-		}
-
-		if _, err := p.EnsureFresh(autoCtx, refreshBefore); err != nil {
-			log.Warn(autoCtx, "failed to auto refresh token", log.Cause(err))
-		}
-
-		if autoCtx.Err() != nil {
-			return
-		}
-
-		p.scheduleNextAutoRefresh(autoCtx, exec, refreshBefore, fallbackInterval, false)
-	}, delay)
-	if err != nil {
-		p.StopAutoRefresh()
-		return
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
 	}
-
-	p.autoMu.Lock()
-
-	if p.autoCancel == nil || p.autoExecutor == nil || exec != p.autoExecutor {
-		p.autoMu.Unlock()
-		cancelFunc()
-
-		return
-	}
-
-	p.autoTaskCancel = cancelFunc
-	p.autoMu.Unlock()
 }
 
 func (p *TokenProvider) nextAutoRefreshDelay(refreshBefore time.Duration, fallbackInterval time.Duration) time.Duration {
@@ -474,6 +470,10 @@ func (p *TokenProvider) refresh(ctx context.Context, creds *OAuthCredentials) (*
 		return nil, errors.New("token URL is empty")
 	}
 
+	if p.httpClient == nil {
+		return nil, errors.New("http client is nil")
+	}
+
 	req, err := p.strategy.BuildRefreshRequest(creds, p.oauthUrls.TokenUrl)
 	if err != nil {
 		return nil, fmt.Errorf("build refresh request: %w", err)
@@ -481,7 +481,7 @@ func (p *TokenProvider) refresh(ctx context.Context, creds *OAuthCredentials) (*
 
 	resp, err := p.httpClient.Do(ctx, req)
 	if err != nil {
-		return nil, err
+		return nil, wrapHttpError(err)
 	}
 
 	refreshed, err := ParseTokenResponse(resp.Body, creds.ClientID)
@@ -494,7 +494,7 @@ func (p *TokenProvider) refresh(ctx context.Context, creds *OAuthCredentials) (*
 		refreshed.RefreshToken = creds.RefreshToken
 	}
 
-	log.Debug(ctx, "oauth token refreshed", log.String("expires_at", refreshed.ExpiresAt.Format(time.RFC3339)))
+	slog.DebugContext(ctx, "oauth token refreshed", slog.String("expires_at", refreshed.ExpiresAt.Format(time.RFC3339)))
 
 	return refreshed, nil
 }

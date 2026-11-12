@@ -15,6 +15,7 @@ import (
 	"github.com/99designs/gqlgen/graphql"
 	"github.com/99designs/gqlgen/graphql/errcode"
 	"github.com/looplj/axonhub/internal/ent/apikey"
+	"github.com/looplj/axonhub/internal/ent/apikeyprofiletemplate"
 	"github.com/looplj/axonhub/internal/ent/channel"
 	"github.com/looplj/axonhub/internal/ent/channelmodelprice"
 	"github.com/looplj/axonhub/internal/ent/channelmodelpriceversion"
@@ -22,8 +23,10 @@ import (
 	"github.com/looplj/axonhub/internal/ent/channelprobe"
 	"github.com/looplj/axonhub/internal/ent/datastorage"
 	"github.com/looplj/axonhub/internal/ent/model"
+	"github.com/looplj/axonhub/internal/ent/oidcidentity"
 	"github.com/looplj/axonhub/internal/ent/project"
 	"github.com/looplj/axonhub/internal/ent/prompt"
+	"github.com/looplj/axonhub/internal/ent/promptprotectionrule"
 	"github.com/looplj/axonhub/internal/ent/providerquotastatus"
 	"github.com/looplj/axonhub/internal/ent/request"
 	"github.com/looplj/axonhub/internal/ent/requestexecution"
@@ -355,6 +358,20 @@ var (
 			}
 		},
 	}
+	// APIKeyOrderFieldName orders APIKey by name.
+	APIKeyOrderFieldName = &APIKeyOrderField{
+		Value: func(_m *APIKey) (ent.Value, error) {
+			return _m.Name, nil
+		},
+		column: apikey.FieldName,
+		toTerm: apikey.ByName,
+		toCursor: func(_m *APIKey) Cursor {
+			return Cursor{
+				ID:    _m.ID,
+				Value: _m.Name,
+			}
+		},
+	}
 )
 
 // String implement fmt.Stringer interface.
@@ -365,6 +382,8 @@ func (f APIKeyOrderField) String() string {
 		str = "CREATED_AT"
 	case APIKeyOrderFieldUpdatedAt.column:
 		str = "UPDATED_AT"
+	case APIKeyOrderFieldName.column:
+		str = "NAME"
 	}
 	return str
 }
@@ -385,6 +404,8 @@ func (f *APIKeyOrderField) UnmarshalGQL(v interface{}) error {
 		*f = *APIKeyOrderFieldCreatedAt
 	case "UPDATED_AT":
 		*f = *APIKeyOrderFieldUpdatedAt
+	case "NAME":
+		*f = *APIKeyOrderFieldName
 	default:
 		return fmt.Errorf("%s is not a valid APIKeyOrderField", str)
 	}
@@ -427,6 +448,320 @@ func (_m *APIKey) ToEdge(order *APIKeyOrder) *APIKeyEdge {
 		order = DefaultAPIKeyOrder
 	}
 	return &APIKeyEdge{
+		Node:   _m,
+		Cursor: order.Field.toCursor(_m),
+	}
+}
+
+// APIKeyProfileTemplateEdge is the edge representation of APIKeyProfileTemplate.
+type APIKeyProfileTemplateEdge struct {
+	Node   *APIKeyProfileTemplate `json:"node"`
+	Cursor Cursor                 `json:"cursor"`
+}
+
+// APIKeyProfileTemplateConnection is the connection containing edges to APIKeyProfileTemplate.
+type APIKeyProfileTemplateConnection struct {
+	Edges      []*APIKeyProfileTemplateEdge `json:"edges"`
+	PageInfo   PageInfo                     `json:"pageInfo"`
+	TotalCount int                          `json:"totalCount"`
+}
+
+func (c *APIKeyProfileTemplateConnection) build(nodes []*APIKeyProfileTemplate, pager *apikeyprofiletemplatePager, after *Cursor, first *int, before *Cursor, last *int) {
+	c.PageInfo.HasNextPage = before != nil
+	c.PageInfo.HasPreviousPage = after != nil
+	if first != nil && *first+1 == len(nodes) {
+		c.PageInfo.HasNextPage = true
+		nodes = nodes[:len(nodes)-1]
+	} else if last != nil && *last+1 == len(nodes) {
+		c.PageInfo.HasPreviousPage = true
+		nodes = nodes[:len(nodes)-1]
+	}
+	var nodeAt func(int) *APIKeyProfileTemplate
+	if last != nil {
+		n := len(nodes) - 1
+		nodeAt = func(i int) *APIKeyProfileTemplate {
+			return nodes[n-i]
+		}
+	} else {
+		nodeAt = func(i int) *APIKeyProfileTemplate {
+			return nodes[i]
+		}
+	}
+	c.Edges = make([]*APIKeyProfileTemplateEdge, len(nodes))
+	for i := range nodes {
+		node := nodeAt(i)
+		c.Edges[i] = &APIKeyProfileTemplateEdge{
+			Node:   node,
+			Cursor: pager.toCursor(node),
+		}
+	}
+	if l := len(c.Edges); l > 0 {
+		c.PageInfo.StartCursor = &c.Edges[0].Cursor
+		c.PageInfo.EndCursor = &c.Edges[l-1].Cursor
+	}
+	if c.TotalCount == 0 {
+		c.TotalCount = len(nodes)
+	}
+}
+
+// APIKeyProfileTemplatePaginateOption enables pagination customization.
+type APIKeyProfileTemplatePaginateOption func(*apikeyprofiletemplatePager) error
+
+// WithAPIKeyProfileTemplateOrder configures pagination ordering.
+func WithAPIKeyProfileTemplateOrder(order *APIKeyProfileTemplateOrder) APIKeyProfileTemplatePaginateOption {
+	if order == nil {
+		order = DefaultAPIKeyProfileTemplateOrder
+	}
+	o := *order
+	return func(pager *apikeyprofiletemplatePager) error {
+		if err := o.Direction.Validate(); err != nil {
+			return err
+		}
+		if o.Field == nil {
+			o.Field = DefaultAPIKeyProfileTemplateOrder.Field
+		}
+		pager.order = &o
+		return nil
+	}
+}
+
+// WithAPIKeyProfileTemplateFilter configures pagination filter.
+func WithAPIKeyProfileTemplateFilter(filter func(*APIKeyProfileTemplateQuery) (*APIKeyProfileTemplateQuery, error)) APIKeyProfileTemplatePaginateOption {
+	return func(pager *apikeyprofiletemplatePager) error {
+		if filter == nil {
+			return errors.New("APIKeyProfileTemplateQuery filter cannot be nil")
+		}
+		pager.filter = filter
+		return nil
+	}
+}
+
+type apikeyprofiletemplatePager struct {
+	reverse bool
+	order   *APIKeyProfileTemplateOrder
+	filter  func(*APIKeyProfileTemplateQuery) (*APIKeyProfileTemplateQuery, error)
+}
+
+func newAPIKeyProfileTemplatePager(opts []APIKeyProfileTemplatePaginateOption, reverse bool) (*apikeyprofiletemplatePager, error) {
+	pager := &apikeyprofiletemplatePager{reverse: reverse}
+	for _, opt := range opts {
+		if err := opt(pager); err != nil {
+			return nil, err
+		}
+	}
+	if pager.order == nil {
+		pager.order = DefaultAPIKeyProfileTemplateOrder
+	}
+	return pager, nil
+}
+
+func (p *apikeyprofiletemplatePager) applyFilter(query *APIKeyProfileTemplateQuery) (*APIKeyProfileTemplateQuery, error) {
+	if p.filter != nil {
+		return p.filter(query)
+	}
+	return query, nil
+}
+
+func (p *apikeyprofiletemplatePager) toCursor(_m *APIKeyProfileTemplate) Cursor {
+	return p.order.Field.toCursor(_m)
+}
+
+func (p *apikeyprofiletemplatePager) applyCursors(query *APIKeyProfileTemplateQuery, after, before *Cursor) (*APIKeyProfileTemplateQuery, error) {
+	direction := p.order.Direction
+	if p.reverse {
+		direction = direction.Reverse()
+	}
+	for _, predicate := range entgql.CursorsPredicate(after, before, DefaultAPIKeyProfileTemplateOrder.Field.column, p.order.Field.column, direction) {
+		query = query.Where(predicate)
+	}
+	return query, nil
+}
+
+func (p *apikeyprofiletemplatePager) applyOrder(query *APIKeyProfileTemplateQuery) *APIKeyProfileTemplateQuery {
+	direction := p.order.Direction
+	if p.reverse {
+		direction = direction.Reverse()
+	}
+	query = query.Order(p.order.Field.toTerm(direction.OrderTermOption()))
+	if p.order.Field != DefaultAPIKeyProfileTemplateOrder.Field {
+		query = query.Order(DefaultAPIKeyProfileTemplateOrder.Field.toTerm(direction.OrderTermOption()))
+	}
+	if len(query.ctx.Fields) > 0 {
+		query.ctx.AppendFieldOnce(p.order.Field.column)
+	}
+	return query
+}
+
+func (p *apikeyprofiletemplatePager) orderExpr(query *APIKeyProfileTemplateQuery) sql.Querier {
+	direction := p.order.Direction
+	if p.reverse {
+		direction = direction.Reverse()
+	}
+	if len(query.ctx.Fields) > 0 {
+		query.ctx.AppendFieldOnce(p.order.Field.column)
+	}
+	return sql.ExprFunc(func(b *sql.Builder) {
+		b.Ident(p.order.Field.column).Pad().WriteString(string(direction))
+		if p.order.Field != DefaultAPIKeyProfileTemplateOrder.Field {
+			b.Comma().Ident(DefaultAPIKeyProfileTemplateOrder.Field.column).Pad().WriteString(string(direction))
+		}
+	})
+}
+
+// Paginate executes the query and returns a relay based cursor connection to APIKeyProfileTemplate.
+func (_m *APIKeyProfileTemplateQuery) Paginate(
+	ctx context.Context, after *Cursor, first *int,
+	before *Cursor, last *int, opts ...APIKeyProfileTemplatePaginateOption,
+) (*APIKeyProfileTemplateConnection, error) {
+	if err := validateFirstLast(first, last); err != nil {
+		return nil, err
+	}
+	pager, err := newAPIKeyProfileTemplatePager(opts, last != nil)
+	if err != nil {
+		return nil, err
+	}
+	if _m, err = pager.applyFilter(_m); err != nil {
+		return nil, err
+	}
+	conn := &APIKeyProfileTemplateConnection{Edges: []*APIKeyProfileTemplateEdge{}}
+	ignoredEdges := !hasCollectedField(ctx, edgesField)
+	if hasCollectedField(ctx, totalCountField) || hasCollectedField(ctx, pageInfoField) {
+		hasPagination := after != nil || first != nil || before != nil || last != nil
+		if hasPagination || ignoredEdges {
+			c := _m.Clone()
+			c.ctx.Fields = nil
+			if conn.TotalCount, err = c.Count(ctx); err != nil {
+				return nil, err
+			}
+			conn.PageInfo.HasNextPage = first != nil && conn.TotalCount > 0
+			conn.PageInfo.HasPreviousPage = last != nil && conn.TotalCount > 0
+		}
+	}
+	if ignoredEdges || (first != nil && *first == 0) || (last != nil && *last == 0) {
+		return conn, nil
+	}
+	if _m, err = pager.applyCursors(_m, after, before); err != nil {
+		return nil, err
+	}
+	limit := paginateLimit(first, last)
+	if limit != 0 {
+		_m.Limit(limit)
+	}
+	if field := collectedField(ctx, edgesField, nodeField); field != nil {
+		if err := _m.collectField(ctx, limit == 1, graphql.GetOperationContext(ctx), *field, []string{edgesField, nodeField}); err != nil {
+			return nil, err
+		}
+	}
+	_m = pager.applyOrder(_m)
+	nodes, err := _m.All(ctx)
+	if err != nil {
+		return nil, err
+	}
+	conn.build(nodes, pager, after, first, before, last)
+	return conn, nil
+}
+
+var (
+	// APIKeyProfileTemplateOrderFieldCreatedAt orders APIKeyProfileTemplate by created_at.
+	APIKeyProfileTemplateOrderFieldCreatedAt = &APIKeyProfileTemplateOrderField{
+		Value: func(_m *APIKeyProfileTemplate) (ent.Value, error) {
+			return _m.CreatedAt, nil
+		},
+		column: apikeyprofiletemplate.FieldCreatedAt,
+		toTerm: apikeyprofiletemplate.ByCreatedAt,
+		toCursor: func(_m *APIKeyProfileTemplate) Cursor {
+			return Cursor{
+				ID:    _m.ID,
+				Value: _m.CreatedAt,
+			}
+		},
+	}
+	// APIKeyProfileTemplateOrderFieldUpdatedAt orders APIKeyProfileTemplate by updated_at.
+	APIKeyProfileTemplateOrderFieldUpdatedAt = &APIKeyProfileTemplateOrderField{
+		Value: func(_m *APIKeyProfileTemplate) (ent.Value, error) {
+			return _m.UpdatedAt, nil
+		},
+		column: apikeyprofiletemplate.FieldUpdatedAt,
+		toTerm: apikeyprofiletemplate.ByUpdatedAt,
+		toCursor: func(_m *APIKeyProfileTemplate) Cursor {
+			return Cursor{
+				ID:    _m.ID,
+				Value: _m.UpdatedAt,
+			}
+		},
+	}
+)
+
+// String implement fmt.Stringer interface.
+func (f APIKeyProfileTemplateOrderField) String() string {
+	var str string
+	switch f.column {
+	case APIKeyProfileTemplateOrderFieldCreatedAt.column:
+		str = "CREATED_AT"
+	case APIKeyProfileTemplateOrderFieldUpdatedAt.column:
+		str = "UPDATED_AT"
+	}
+	return str
+}
+
+// MarshalGQL implements graphql.Marshaler interface.
+func (f APIKeyProfileTemplateOrderField) MarshalGQL(w io.Writer) {
+	io.WriteString(w, strconv.Quote(f.String()))
+}
+
+// UnmarshalGQL implements graphql.Unmarshaler interface.
+func (f *APIKeyProfileTemplateOrderField) UnmarshalGQL(v interface{}) error {
+	str, ok := v.(string)
+	if !ok {
+		return fmt.Errorf("APIKeyProfileTemplateOrderField %T must be a string", v)
+	}
+	switch str {
+	case "CREATED_AT":
+		*f = *APIKeyProfileTemplateOrderFieldCreatedAt
+	case "UPDATED_AT":
+		*f = *APIKeyProfileTemplateOrderFieldUpdatedAt
+	default:
+		return fmt.Errorf("%s is not a valid APIKeyProfileTemplateOrderField", str)
+	}
+	return nil
+}
+
+// APIKeyProfileTemplateOrderField defines the ordering field of APIKeyProfileTemplate.
+type APIKeyProfileTemplateOrderField struct {
+	// Value extracts the ordering value from the given APIKeyProfileTemplate.
+	Value    func(*APIKeyProfileTemplate) (ent.Value, error)
+	column   string // field or computed.
+	toTerm   func(...sql.OrderTermOption) apikeyprofiletemplate.OrderOption
+	toCursor func(*APIKeyProfileTemplate) Cursor
+}
+
+// APIKeyProfileTemplateOrder defines the ordering of APIKeyProfileTemplate.
+type APIKeyProfileTemplateOrder struct {
+	Direction OrderDirection                   `json:"direction"`
+	Field     *APIKeyProfileTemplateOrderField `json:"field"`
+}
+
+// DefaultAPIKeyProfileTemplateOrder is the default ordering of APIKeyProfileTemplate.
+var DefaultAPIKeyProfileTemplateOrder = &APIKeyProfileTemplateOrder{
+	Direction: entgql.OrderDirectionAsc,
+	Field: &APIKeyProfileTemplateOrderField{
+		Value: func(_m *APIKeyProfileTemplate) (ent.Value, error) {
+			return _m.ID, nil
+		},
+		column: apikeyprofiletemplate.FieldID,
+		toTerm: apikeyprofiletemplate.ByID,
+		toCursor: func(_m *APIKeyProfileTemplate) Cursor {
+			return Cursor{ID: _m.ID}
+		},
+	},
+}
+
+// ToEdge converts APIKeyProfileTemplate into APIKeyProfileTemplateEdge.
+func (_m *APIKeyProfileTemplate) ToEdge(order *APIKeyProfileTemplateOrder) *APIKeyProfileTemplateEdge {
+	if order == nil {
+		order = DefaultAPIKeyProfileTemplateOrder
+	}
+	return &APIKeyProfileTemplateEdge{
 		Node:   _m,
 		Cursor: order.Field.toCursor(_m),
 	}
@@ -2655,6 +2990,320 @@ func (_m *Model) ToEdge(order *ModelOrder) *ModelEdge {
 	}
 }
 
+// OIDCIdentityEdge is the edge representation of OIDCIdentity.
+type OIDCIdentityEdge struct {
+	Node   *OIDCIdentity `json:"node"`
+	Cursor Cursor        `json:"cursor"`
+}
+
+// OIDCIdentityConnection is the connection containing edges to OIDCIdentity.
+type OIDCIdentityConnection struct {
+	Edges      []*OIDCIdentityEdge `json:"edges"`
+	PageInfo   PageInfo            `json:"pageInfo"`
+	TotalCount int                 `json:"totalCount"`
+}
+
+func (c *OIDCIdentityConnection) build(nodes []*OIDCIdentity, pager *oidcidentityPager, after *Cursor, first *int, before *Cursor, last *int) {
+	c.PageInfo.HasNextPage = before != nil
+	c.PageInfo.HasPreviousPage = after != nil
+	if first != nil && *first+1 == len(nodes) {
+		c.PageInfo.HasNextPage = true
+		nodes = nodes[:len(nodes)-1]
+	} else if last != nil && *last+1 == len(nodes) {
+		c.PageInfo.HasPreviousPage = true
+		nodes = nodes[:len(nodes)-1]
+	}
+	var nodeAt func(int) *OIDCIdentity
+	if last != nil {
+		n := len(nodes) - 1
+		nodeAt = func(i int) *OIDCIdentity {
+			return nodes[n-i]
+		}
+	} else {
+		nodeAt = func(i int) *OIDCIdentity {
+			return nodes[i]
+		}
+	}
+	c.Edges = make([]*OIDCIdentityEdge, len(nodes))
+	for i := range nodes {
+		node := nodeAt(i)
+		c.Edges[i] = &OIDCIdentityEdge{
+			Node:   node,
+			Cursor: pager.toCursor(node),
+		}
+	}
+	if l := len(c.Edges); l > 0 {
+		c.PageInfo.StartCursor = &c.Edges[0].Cursor
+		c.PageInfo.EndCursor = &c.Edges[l-1].Cursor
+	}
+	if c.TotalCount == 0 {
+		c.TotalCount = len(nodes)
+	}
+}
+
+// OIDCIdentityPaginateOption enables pagination customization.
+type OIDCIdentityPaginateOption func(*oidcidentityPager) error
+
+// WithOIDCIdentityOrder configures pagination ordering.
+func WithOIDCIdentityOrder(order *OIDCIdentityOrder) OIDCIdentityPaginateOption {
+	if order == nil {
+		order = DefaultOIDCIdentityOrder
+	}
+	o := *order
+	return func(pager *oidcidentityPager) error {
+		if err := o.Direction.Validate(); err != nil {
+			return err
+		}
+		if o.Field == nil {
+			o.Field = DefaultOIDCIdentityOrder.Field
+		}
+		pager.order = &o
+		return nil
+	}
+}
+
+// WithOIDCIdentityFilter configures pagination filter.
+func WithOIDCIdentityFilter(filter func(*OIDCIdentityQuery) (*OIDCIdentityQuery, error)) OIDCIdentityPaginateOption {
+	return func(pager *oidcidentityPager) error {
+		if filter == nil {
+			return errors.New("OIDCIdentityQuery filter cannot be nil")
+		}
+		pager.filter = filter
+		return nil
+	}
+}
+
+type oidcidentityPager struct {
+	reverse bool
+	order   *OIDCIdentityOrder
+	filter  func(*OIDCIdentityQuery) (*OIDCIdentityQuery, error)
+}
+
+func newOIDCIdentityPager(opts []OIDCIdentityPaginateOption, reverse bool) (*oidcidentityPager, error) {
+	pager := &oidcidentityPager{reverse: reverse}
+	for _, opt := range opts {
+		if err := opt(pager); err != nil {
+			return nil, err
+		}
+	}
+	if pager.order == nil {
+		pager.order = DefaultOIDCIdentityOrder
+	}
+	return pager, nil
+}
+
+func (p *oidcidentityPager) applyFilter(query *OIDCIdentityQuery) (*OIDCIdentityQuery, error) {
+	if p.filter != nil {
+		return p.filter(query)
+	}
+	return query, nil
+}
+
+func (p *oidcidentityPager) toCursor(_m *OIDCIdentity) Cursor {
+	return p.order.Field.toCursor(_m)
+}
+
+func (p *oidcidentityPager) applyCursors(query *OIDCIdentityQuery, after, before *Cursor) (*OIDCIdentityQuery, error) {
+	direction := p.order.Direction
+	if p.reverse {
+		direction = direction.Reverse()
+	}
+	for _, predicate := range entgql.CursorsPredicate(after, before, DefaultOIDCIdentityOrder.Field.column, p.order.Field.column, direction) {
+		query = query.Where(predicate)
+	}
+	return query, nil
+}
+
+func (p *oidcidentityPager) applyOrder(query *OIDCIdentityQuery) *OIDCIdentityQuery {
+	direction := p.order.Direction
+	if p.reverse {
+		direction = direction.Reverse()
+	}
+	query = query.Order(p.order.Field.toTerm(direction.OrderTermOption()))
+	if p.order.Field != DefaultOIDCIdentityOrder.Field {
+		query = query.Order(DefaultOIDCIdentityOrder.Field.toTerm(direction.OrderTermOption()))
+	}
+	if len(query.ctx.Fields) > 0 {
+		query.ctx.AppendFieldOnce(p.order.Field.column)
+	}
+	return query
+}
+
+func (p *oidcidentityPager) orderExpr(query *OIDCIdentityQuery) sql.Querier {
+	direction := p.order.Direction
+	if p.reverse {
+		direction = direction.Reverse()
+	}
+	if len(query.ctx.Fields) > 0 {
+		query.ctx.AppendFieldOnce(p.order.Field.column)
+	}
+	return sql.ExprFunc(func(b *sql.Builder) {
+		b.Ident(p.order.Field.column).Pad().WriteString(string(direction))
+		if p.order.Field != DefaultOIDCIdentityOrder.Field {
+			b.Comma().Ident(DefaultOIDCIdentityOrder.Field.column).Pad().WriteString(string(direction))
+		}
+	})
+}
+
+// Paginate executes the query and returns a relay based cursor connection to OIDCIdentity.
+func (_m *OIDCIdentityQuery) Paginate(
+	ctx context.Context, after *Cursor, first *int,
+	before *Cursor, last *int, opts ...OIDCIdentityPaginateOption,
+) (*OIDCIdentityConnection, error) {
+	if err := validateFirstLast(first, last); err != nil {
+		return nil, err
+	}
+	pager, err := newOIDCIdentityPager(opts, last != nil)
+	if err != nil {
+		return nil, err
+	}
+	if _m, err = pager.applyFilter(_m); err != nil {
+		return nil, err
+	}
+	conn := &OIDCIdentityConnection{Edges: []*OIDCIdentityEdge{}}
+	ignoredEdges := !hasCollectedField(ctx, edgesField)
+	if hasCollectedField(ctx, totalCountField) || hasCollectedField(ctx, pageInfoField) {
+		hasPagination := after != nil || first != nil || before != nil || last != nil
+		if hasPagination || ignoredEdges {
+			c := _m.Clone()
+			c.ctx.Fields = nil
+			if conn.TotalCount, err = c.Count(ctx); err != nil {
+				return nil, err
+			}
+			conn.PageInfo.HasNextPage = first != nil && conn.TotalCount > 0
+			conn.PageInfo.HasPreviousPage = last != nil && conn.TotalCount > 0
+		}
+	}
+	if ignoredEdges || (first != nil && *first == 0) || (last != nil && *last == 0) {
+		return conn, nil
+	}
+	if _m, err = pager.applyCursors(_m, after, before); err != nil {
+		return nil, err
+	}
+	limit := paginateLimit(first, last)
+	if limit != 0 {
+		_m.Limit(limit)
+	}
+	if field := collectedField(ctx, edgesField, nodeField); field != nil {
+		if err := _m.collectField(ctx, limit == 1, graphql.GetOperationContext(ctx), *field, []string{edgesField, nodeField}); err != nil {
+			return nil, err
+		}
+	}
+	_m = pager.applyOrder(_m)
+	nodes, err := _m.All(ctx)
+	if err != nil {
+		return nil, err
+	}
+	conn.build(nodes, pager, after, first, before, last)
+	return conn, nil
+}
+
+var (
+	// OIDCIdentityOrderFieldCreatedAt orders OIDCIdentity by created_at.
+	OIDCIdentityOrderFieldCreatedAt = &OIDCIdentityOrderField{
+		Value: func(_m *OIDCIdentity) (ent.Value, error) {
+			return _m.CreatedAt, nil
+		},
+		column: oidcidentity.FieldCreatedAt,
+		toTerm: oidcidentity.ByCreatedAt,
+		toCursor: func(_m *OIDCIdentity) Cursor {
+			return Cursor{
+				ID:    _m.ID,
+				Value: _m.CreatedAt,
+			}
+		},
+	}
+	// OIDCIdentityOrderFieldUpdatedAt orders OIDCIdentity by updated_at.
+	OIDCIdentityOrderFieldUpdatedAt = &OIDCIdentityOrderField{
+		Value: func(_m *OIDCIdentity) (ent.Value, error) {
+			return _m.UpdatedAt, nil
+		},
+		column: oidcidentity.FieldUpdatedAt,
+		toTerm: oidcidentity.ByUpdatedAt,
+		toCursor: func(_m *OIDCIdentity) Cursor {
+			return Cursor{
+				ID:    _m.ID,
+				Value: _m.UpdatedAt,
+			}
+		},
+	}
+)
+
+// String implement fmt.Stringer interface.
+func (f OIDCIdentityOrderField) String() string {
+	var str string
+	switch f.column {
+	case OIDCIdentityOrderFieldCreatedAt.column:
+		str = "CREATED_AT"
+	case OIDCIdentityOrderFieldUpdatedAt.column:
+		str = "UPDATED_AT"
+	}
+	return str
+}
+
+// MarshalGQL implements graphql.Marshaler interface.
+func (f OIDCIdentityOrderField) MarshalGQL(w io.Writer) {
+	io.WriteString(w, strconv.Quote(f.String()))
+}
+
+// UnmarshalGQL implements graphql.Unmarshaler interface.
+func (f *OIDCIdentityOrderField) UnmarshalGQL(v interface{}) error {
+	str, ok := v.(string)
+	if !ok {
+		return fmt.Errorf("OIDCIdentityOrderField %T must be a string", v)
+	}
+	switch str {
+	case "CREATED_AT":
+		*f = *OIDCIdentityOrderFieldCreatedAt
+	case "UPDATED_AT":
+		*f = *OIDCIdentityOrderFieldUpdatedAt
+	default:
+		return fmt.Errorf("%s is not a valid OIDCIdentityOrderField", str)
+	}
+	return nil
+}
+
+// OIDCIdentityOrderField defines the ordering field of OIDCIdentity.
+type OIDCIdentityOrderField struct {
+	// Value extracts the ordering value from the given OIDCIdentity.
+	Value    func(*OIDCIdentity) (ent.Value, error)
+	column   string // field or computed.
+	toTerm   func(...sql.OrderTermOption) oidcidentity.OrderOption
+	toCursor func(*OIDCIdentity) Cursor
+}
+
+// OIDCIdentityOrder defines the ordering of OIDCIdentity.
+type OIDCIdentityOrder struct {
+	Direction OrderDirection          `json:"direction"`
+	Field     *OIDCIdentityOrderField `json:"field"`
+}
+
+// DefaultOIDCIdentityOrder is the default ordering of OIDCIdentity.
+var DefaultOIDCIdentityOrder = &OIDCIdentityOrder{
+	Direction: entgql.OrderDirectionAsc,
+	Field: &OIDCIdentityOrderField{
+		Value: func(_m *OIDCIdentity) (ent.Value, error) {
+			return _m.ID, nil
+		},
+		column: oidcidentity.FieldID,
+		toTerm: oidcidentity.ByID,
+		toCursor: func(_m *OIDCIdentity) Cursor {
+			return Cursor{ID: _m.ID}
+		},
+	},
+}
+
+// ToEdge converts OIDCIdentity into OIDCIdentityEdge.
+func (_m *OIDCIdentity) ToEdge(order *OIDCIdentityOrder) *OIDCIdentityEdge {
+	if order == nil {
+		order = DefaultOIDCIdentityOrder
+	}
+	return &OIDCIdentityEdge{
+		Node:   _m,
+		Cursor: order.Field.toCursor(_m),
+	}
+}
+
 // ProjectEdge is the edge representation of Project.
 type ProjectEdge struct {
 	Node   *Project `json:"node"`
@@ -3206,6 +3855,20 @@ var (
 			}
 		},
 	}
+	// PromptOrderFieldOrder orders Prompt by order.
+	PromptOrderFieldOrder = &PromptOrderField{
+		Value: func(_m *Prompt) (ent.Value, error) {
+			return _m.Order, nil
+		},
+		column: prompt.FieldOrder,
+		toTerm: prompt.ByOrder,
+		toCursor: func(_m *Prompt) Cursor {
+			return Cursor{
+				ID:    _m.ID,
+				Value: _m.Order,
+			}
+		},
+	}
 )
 
 // String implement fmt.Stringer interface.
@@ -3216,6 +3879,8 @@ func (f PromptOrderField) String() string {
 		str = "CREATED_AT"
 	case PromptOrderFieldUpdatedAt.column:
 		str = "UPDATED_AT"
+	case PromptOrderFieldOrder.column:
+		str = "ORDER"
 	}
 	return str
 }
@@ -3236,6 +3901,8 @@ func (f *PromptOrderField) UnmarshalGQL(v interface{}) error {
 		*f = *PromptOrderFieldCreatedAt
 	case "UPDATED_AT":
 		*f = *PromptOrderFieldUpdatedAt
+	case "ORDER":
+		*f = *PromptOrderFieldOrder
 	default:
 		return fmt.Errorf("%s is not a valid PromptOrderField", str)
 	}
@@ -3278,6 +3945,338 @@ func (_m *Prompt) ToEdge(order *PromptOrder) *PromptEdge {
 		order = DefaultPromptOrder
 	}
 	return &PromptEdge{
+		Node:   _m,
+		Cursor: order.Field.toCursor(_m),
+	}
+}
+
+// PromptProtectionRuleEdge is the edge representation of PromptProtectionRule.
+type PromptProtectionRuleEdge struct {
+	Node   *PromptProtectionRule `json:"node"`
+	Cursor Cursor                `json:"cursor"`
+}
+
+// PromptProtectionRuleConnection is the connection containing edges to PromptProtectionRule.
+type PromptProtectionRuleConnection struct {
+	Edges      []*PromptProtectionRuleEdge `json:"edges"`
+	PageInfo   PageInfo                    `json:"pageInfo"`
+	TotalCount int                         `json:"totalCount"`
+}
+
+func (c *PromptProtectionRuleConnection) build(nodes []*PromptProtectionRule, pager *promptprotectionrulePager, after *Cursor, first *int, before *Cursor, last *int) {
+	c.PageInfo.HasNextPage = before != nil
+	c.PageInfo.HasPreviousPage = after != nil
+	if first != nil && *first+1 == len(nodes) {
+		c.PageInfo.HasNextPage = true
+		nodes = nodes[:len(nodes)-1]
+	} else if last != nil && *last+1 == len(nodes) {
+		c.PageInfo.HasPreviousPage = true
+		nodes = nodes[:len(nodes)-1]
+	}
+	var nodeAt func(int) *PromptProtectionRule
+	if last != nil {
+		n := len(nodes) - 1
+		nodeAt = func(i int) *PromptProtectionRule {
+			return nodes[n-i]
+		}
+	} else {
+		nodeAt = func(i int) *PromptProtectionRule {
+			return nodes[i]
+		}
+	}
+	c.Edges = make([]*PromptProtectionRuleEdge, len(nodes))
+	for i := range nodes {
+		node := nodeAt(i)
+		c.Edges[i] = &PromptProtectionRuleEdge{
+			Node:   node,
+			Cursor: pager.toCursor(node),
+		}
+	}
+	if l := len(c.Edges); l > 0 {
+		c.PageInfo.StartCursor = &c.Edges[0].Cursor
+		c.PageInfo.EndCursor = &c.Edges[l-1].Cursor
+	}
+	if c.TotalCount == 0 {
+		c.TotalCount = len(nodes)
+	}
+}
+
+// PromptProtectionRulePaginateOption enables pagination customization.
+type PromptProtectionRulePaginateOption func(*promptprotectionrulePager) error
+
+// WithPromptProtectionRuleOrder configures pagination ordering.
+func WithPromptProtectionRuleOrder(order *PromptProtectionRuleOrder) PromptProtectionRulePaginateOption {
+	if order == nil {
+		order = DefaultPromptProtectionRuleOrder
+	}
+	o := *order
+	return func(pager *promptprotectionrulePager) error {
+		if err := o.Direction.Validate(); err != nil {
+			return err
+		}
+		if o.Field == nil {
+			o.Field = DefaultPromptProtectionRuleOrder.Field
+		}
+		pager.order = &o
+		return nil
+	}
+}
+
+// WithPromptProtectionRuleFilter configures pagination filter.
+func WithPromptProtectionRuleFilter(filter func(*PromptProtectionRuleQuery) (*PromptProtectionRuleQuery, error)) PromptProtectionRulePaginateOption {
+	return func(pager *promptprotectionrulePager) error {
+		if filter == nil {
+			return errors.New("PromptProtectionRuleQuery filter cannot be nil")
+		}
+		pager.filter = filter
+		return nil
+	}
+}
+
+type promptprotectionrulePager struct {
+	reverse bool
+	order   *PromptProtectionRuleOrder
+	filter  func(*PromptProtectionRuleQuery) (*PromptProtectionRuleQuery, error)
+}
+
+func newPromptProtectionRulePager(opts []PromptProtectionRulePaginateOption, reverse bool) (*promptprotectionrulePager, error) {
+	pager := &promptprotectionrulePager{reverse: reverse}
+	for _, opt := range opts {
+		if err := opt(pager); err != nil {
+			return nil, err
+		}
+	}
+	if pager.order == nil {
+		pager.order = DefaultPromptProtectionRuleOrder
+	}
+	return pager, nil
+}
+
+func (p *promptprotectionrulePager) applyFilter(query *PromptProtectionRuleQuery) (*PromptProtectionRuleQuery, error) {
+	if p.filter != nil {
+		return p.filter(query)
+	}
+	return query, nil
+}
+
+func (p *promptprotectionrulePager) toCursor(_m *PromptProtectionRule) Cursor {
+	return p.order.Field.toCursor(_m)
+}
+
+func (p *promptprotectionrulePager) applyCursors(query *PromptProtectionRuleQuery, after, before *Cursor) (*PromptProtectionRuleQuery, error) {
+	direction := p.order.Direction
+	if p.reverse {
+		direction = direction.Reverse()
+	}
+	for _, predicate := range entgql.CursorsPredicate(after, before, DefaultPromptProtectionRuleOrder.Field.column, p.order.Field.column, direction) {
+		query = query.Where(predicate)
+	}
+	return query, nil
+}
+
+func (p *promptprotectionrulePager) applyOrder(query *PromptProtectionRuleQuery) *PromptProtectionRuleQuery {
+	direction := p.order.Direction
+	if p.reverse {
+		direction = direction.Reverse()
+	}
+	query = query.Order(p.order.Field.toTerm(direction.OrderTermOption()))
+	if p.order.Field != DefaultPromptProtectionRuleOrder.Field {
+		query = query.Order(DefaultPromptProtectionRuleOrder.Field.toTerm(direction.OrderTermOption()))
+	}
+	if len(query.ctx.Fields) > 0 {
+		query.ctx.AppendFieldOnce(p.order.Field.column)
+	}
+	return query
+}
+
+func (p *promptprotectionrulePager) orderExpr(query *PromptProtectionRuleQuery) sql.Querier {
+	direction := p.order.Direction
+	if p.reverse {
+		direction = direction.Reverse()
+	}
+	if len(query.ctx.Fields) > 0 {
+		query.ctx.AppendFieldOnce(p.order.Field.column)
+	}
+	return sql.ExprFunc(func(b *sql.Builder) {
+		b.Ident(p.order.Field.column).Pad().WriteString(string(direction))
+		if p.order.Field != DefaultPromptProtectionRuleOrder.Field {
+			b.Comma().Ident(DefaultPromptProtectionRuleOrder.Field.column).Pad().WriteString(string(direction))
+		}
+	})
+}
+
+// Paginate executes the query and returns a relay based cursor connection to PromptProtectionRule.
+func (_m *PromptProtectionRuleQuery) Paginate(
+	ctx context.Context, after *Cursor, first *int,
+	before *Cursor, last *int, opts ...PromptProtectionRulePaginateOption,
+) (*PromptProtectionRuleConnection, error) {
+	if err := validateFirstLast(first, last); err != nil {
+		return nil, err
+	}
+	pager, err := newPromptProtectionRulePager(opts, last != nil)
+	if err != nil {
+		return nil, err
+	}
+	if _m, err = pager.applyFilter(_m); err != nil {
+		return nil, err
+	}
+	conn := &PromptProtectionRuleConnection{Edges: []*PromptProtectionRuleEdge{}}
+	ignoredEdges := !hasCollectedField(ctx, edgesField)
+	if hasCollectedField(ctx, totalCountField) || hasCollectedField(ctx, pageInfoField) {
+		hasPagination := after != nil || first != nil || before != nil || last != nil
+		if hasPagination || ignoredEdges {
+			c := _m.Clone()
+			c.ctx.Fields = nil
+			if conn.TotalCount, err = c.Count(ctx); err != nil {
+				return nil, err
+			}
+			conn.PageInfo.HasNextPage = first != nil && conn.TotalCount > 0
+			conn.PageInfo.HasPreviousPage = last != nil && conn.TotalCount > 0
+		}
+	}
+	if ignoredEdges || (first != nil && *first == 0) || (last != nil && *last == 0) {
+		return conn, nil
+	}
+	if _m, err = pager.applyCursors(_m, after, before); err != nil {
+		return nil, err
+	}
+	limit := paginateLimit(first, last)
+	if limit != 0 {
+		_m.Limit(limit)
+	}
+	if field := collectedField(ctx, edgesField, nodeField); field != nil {
+		if err := _m.collectField(ctx, limit == 1, graphql.GetOperationContext(ctx), *field, []string{edgesField, nodeField}); err != nil {
+			return nil, err
+		}
+	}
+	_m = pager.applyOrder(_m)
+	nodes, err := _m.All(ctx)
+	if err != nil {
+		return nil, err
+	}
+	conn.build(nodes, pager, after, first, before, last)
+	return conn, nil
+}
+
+var (
+	// PromptProtectionRuleOrderFieldCreatedAt orders PromptProtectionRule by created_at.
+	PromptProtectionRuleOrderFieldCreatedAt = &PromptProtectionRuleOrderField{
+		Value: func(_m *PromptProtectionRule) (ent.Value, error) {
+			return _m.CreatedAt, nil
+		},
+		column: promptprotectionrule.FieldCreatedAt,
+		toTerm: promptprotectionrule.ByCreatedAt,
+		toCursor: func(_m *PromptProtectionRule) Cursor {
+			return Cursor{
+				ID:    _m.ID,
+				Value: _m.CreatedAt,
+			}
+		},
+	}
+	// PromptProtectionRuleOrderFieldUpdatedAt orders PromptProtectionRule by updated_at.
+	PromptProtectionRuleOrderFieldUpdatedAt = &PromptProtectionRuleOrderField{
+		Value: func(_m *PromptProtectionRule) (ent.Value, error) {
+			return _m.UpdatedAt, nil
+		},
+		column: promptprotectionrule.FieldUpdatedAt,
+		toTerm: promptprotectionrule.ByUpdatedAt,
+		toCursor: func(_m *PromptProtectionRule) Cursor {
+			return Cursor{
+				ID:    _m.ID,
+				Value: _m.UpdatedAt,
+			}
+		},
+	}
+	// PromptProtectionRuleOrderFieldName orders PromptProtectionRule by name.
+	PromptProtectionRuleOrderFieldName = &PromptProtectionRuleOrderField{
+		Value: func(_m *PromptProtectionRule) (ent.Value, error) {
+			return _m.Name, nil
+		},
+		column: promptprotectionrule.FieldName,
+		toTerm: promptprotectionrule.ByName,
+		toCursor: func(_m *PromptProtectionRule) Cursor {
+			return Cursor{
+				ID:    _m.ID,
+				Value: _m.Name,
+			}
+		},
+	}
+)
+
+// String implement fmt.Stringer interface.
+func (f PromptProtectionRuleOrderField) String() string {
+	var str string
+	switch f.column {
+	case PromptProtectionRuleOrderFieldCreatedAt.column:
+		str = "CREATED_AT"
+	case PromptProtectionRuleOrderFieldUpdatedAt.column:
+		str = "UPDATED_AT"
+	case PromptProtectionRuleOrderFieldName.column:
+		str = "NAME"
+	}
+	return str
+}
+
+// MarshalGQL implements graphql.Marshaler interface.
+func (f PromptProtectionRuleOrderField) MarshalGQL(w io.Writer) {
+	io.WriteString(w, strconv.Quote(f.String()))
+}
+
+// UnmarshalGQL implements graphql.Unmarshaler interface.
+func (f *PromptProtectionRuleOrderField) UnmarshalGQL(v interface{}) error {
+	str, ok := v.(string)
+	if !ok {
+		return fmt.Errorf("PromptProtectionRuleOrderField %T must be a string", v)
+	}
+	switch str {
+	case "CREATED_AT":
+		*f = *PromptProtectionRuleOrderFieldCreatedAt
+	case "UPDATED_AT":
+		*f = *PromptProtectionRuleOrderFieldUpdatedAt
+	case "NAME":
+		*f = *PromptProtectionRuleOrderFieldName
+	default:
+		return fmt.Errorf("%s is not a valid PromptProtectionRuleOrderField", str)
+	}
+	return nil
+}
+
+// PromptProtectionRuleOrderField defines the ordering field of PromptProtectionRule.
+type PromptProtectionRuleOrderField struct {
+	// Value extracts the ordering value from the given PromptProtectionRule.
+	Value    func(*PromptProtectionRule) (ent.Value, error)
+	column   string // field or computed.
+	toTerm   func(...sql.OrderTermOption) promptprotectionrule.OrderOption
+	toCursor func(*PromptProtectionRule) Cursor
+}
+
+// PromptProtectionRuleOrder defines the ordering of PromptProtectionRule.
+type PromptProtectionRuleOrder struct {
+	Direction OrderDirection                  `json:"direction"`
+	Field     *PromptProtectionRuleOrderField `json:"field"`
+}
+
+// DefaultPromptProtectionRuleOrder is the default ordering of PromptProtectionRule.
+var DefaultPromptProtectionRuleOrder = &PromptProtectionRuleOrder{
+	Direction: entgql.OrderDirectionAsc,
+	Field: &PromptProtectionRuleOrderField{
+		Value: func(_m *PromptProtectionRule) (ent.Value, error) {
+			return _m.ID, nil
+		},
+		column: promptprotectionrule.FieldID,
+		toTerm: promptprotectionrule.ByID,
+		toCursor: func(_m *PromptProtectionRule) Cursor {
+			return Cursor{ID: _m.ID}
+		},
+	},
+}
+
+// ToEdge converts PromptProtectionRule into PromptProtectionRuleEdge.
+func (_m *PromptProtectionRule) ToEdge(order *PromptProtectionRuleOrder) *PromptProtectionRuleEdge {
+	if order == nil {
+		order = DefaultPromptProtectionRuleOrder
+	}
+	return &PromptProtectionRuleEdge{
 		Node:   _m,
 		Cursor: order.Field.toCursor(_m),
 	}
@@ -3769,7 +4768,7 @@ func (_m *RequestQuery) Paginate(
 	}
 	conn := &RequestConnection{Edges: []*RequestEdge{}}
 	ignoredEdges := !hasCollectedField(ctx, edgesField)
-	if hasCollectedField(ctx, totalCountField) || hasCollectedField(ctx, pageInfoField) {
+	if hasCollectedField(ctx, totalCountField) || (hasCollectedField(ctx, pageInfoField) && ignoredEdges) {
 		hasPagination := after != nil || first != nil || before != nil || last != nil
 		if hasPagination || ignoredEdges {
 			c := _m.Clone()

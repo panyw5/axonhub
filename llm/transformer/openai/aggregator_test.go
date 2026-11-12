@@ -7,9 +7,9 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	"github.com/looplj/axonhub/internal/pkg/xtest"
 	"github.com/looplj/axonhub/llm"
 	"github.com/looplj/axonhub/llm/httpclient"
+	"github.com/looplj/axonhub/llm/internal/pkg/xtest"
 )
 
 func TestAggregateStreamChunks(t *testing.T) {
@@ -176,6 +176,7 @@ func TestAggregateStreamChunks_WithCitations(t *testing.T) {
 	require.NoError(t, err)
 
 	var got llm.Response
+
 	err = json.Unmarshal(gotBytes, &got)
 	require.NoError(t, err)
 
@@ -188,23 +189,16 @@ func TestAggregateStreamChunks_WithCitations(t *testing.T) {
 	require.NotNil(t, got.Choices[0].Message.Content.Content)
 	require.Equal(t, "The meaning of life is...", *got.Choices[0].Message.Content.Content)
 
-	// Verify citations are aggregated and deduplicated
-	require.NotNil(t, got.TransformerMetadata)
-	citationsRaw, ok := got.TransformerMetadata[TransformerMetadataKeyCitations]
-	require.True(t, ok)
+	// Verify citations are aggregated, deduplicated, and projected to the
+	// top-level citations field — the same wire position used by the streaming
+	// chunks themselves and by the direct non-streaming path (ResponseFromLLM) —
+	// without leaking the internal transformer_metadata envelope, which is
+	// documented as never serialized.
+	require.NotContains(t, string(gotBytes), "transformer_metadata")
 
-	// After JSON marshaling/unmarshaling, the citations will be []interface{}
-	citationsSlice, ok := citationsRaw.([]interface{})
-	require.True(t, ok)
-	require.Len(t, citationsSlice, 2)
-
-	// Convert to []string for easier assertion
-	citations := make([]string, len(citationsSlice))
-	for i, v := range citationsSlice {
-		citations[i] = v.(string)
-	}
-	require.Contains(t, citations, "https://example.com/source1")
-	require.Contains(t, citations, "https://example.com/source2")
+	var gotResp Response
+	require.NoError(t, json.Unmarshal(gotBytes, &gotResp))
+	require.Equal(t, []string{"https://example.com/source1", "https://example.com/source2"}, gotResp.Citations)
 }
 
 func TestAggregateStreamChunks_WithoutCitations(t *testing.T) {
@@ -222,6 +216,7 @@ func TestAggregateStreamChunks_WithoutCitations(t *testing.T) {
 	require.NoError(t, err)
 
 	var got llm.Response
+
 	err = json.Unmarshal(gotBytes, &got)
 	require.NoError(t, err)
 
@@ -247,6 +242,7 @@ func TestAggregateStreamChunks_WithAnnotations(t *testing.T) {
 	require.NoError(t, err)
 
 	var got llm.Response
+
 	err = json.Unmarshal(gotBytes, &got)
 	require.NoError(t, err)
 
@@ -271,6 +267,71 @@ func TestAggregateStreamChunks_WithAnnotations(t *testing.T) {
 	require.NotNil(t, got.Choices[0].Message.Annotations[1].URLCitation)
 }
 
+func TestAggregateStreamChunks_DistinctAnnotationSpans(t *testing.T) {
+	chunks := []*httpclient.StreamEvent{
+		{
+			Data: []byte(`{"id":"chatcmpl-123","object":"chat.completion.chunk","created":1677652288,"model":"sonar-deep-research","choices":[{"index":0,"delta":{"role":"assistant","content":"Alpha Beta"},"message":{"role":"assistant","content":"Alpha Beta","annotations":[{"type":"url_citation","start_index":6,"end_index":10,"url_citation":{"url":"https://example.com/source","title":"Example Source"}},{"type":"url_citation","start_index":0,"end_index":5,"url_citation":{"url":"https://example.com/source","title":"Example Source"}}]},"finish_reason":"stop"}]}`),
+		},
+	}
+
+	gotBytes, _, err := AggregateStreamChunks(context.Background(), chunks, DefaultTransformChunk)
+	require.NoError(t, err)
+
+	var got llm.Response
+	err = json.Unmarshal(gotBytes, &got)
+	require.NoError(t, err)
+
+	require.Len(t, got.Choices, 1)
+	require.NotNil(t, got.Choices[0].Message)
+	require.Len(t, got.Choices[0].Message.Annotations, 2)
+
+	first := got.Choices[0].Message.Annotations[0]
+	require.Equal(t, "url_citation", first.Type)
+	require.NotNil(t, first.URLCitation)
+	require.Equal(t, "https://example.com/source", first.URLCitation.URL)
+	require.Equal(t, "Example Source", first.URLCitation.Title)
+	require.NotNil(t, first.StartIndex)
+	require.NotNil(t, first.EndIndex)
+	require.EqualValues(t, 0, *first.StartIndex)
+	require.EqualValues(t, 5, *first.EndIndex)
+
+	second := got.Choices[0].Message.Annotations[1]
+	require.Equal(t, "url_citation", second.Type)
+	require.NotNil(t, second.URLCitation)
+	require.Equal(t, "https://example.com/source", second.URLCitation.URL)
+	require.Equal(t, "Example Source", second.URLCitation.Title)
+	require.NotNil(t, second.StartIndex)
+	require.NotNil(t, second.EndIndex)
+	require.EqualValues(t, 6, *second.StartIndex)
+	require.EqualValues(t, 10, *second.EndIndex)
+}
+
+func TestAggregateStreamChunks_MergesAnnotationTitleAcrossChunks(t *testing.T) {
+	chunks := []*httpclient.StreamEvent{
+		{
+			Data: []byte(`{"id":"chatcmpl-123","object":"chat.completion.chunk","created":1677652288,"model":"sonar-deep-research","choices":[{"index":0,"delta":{"role":"assistant","content":"Alpha"},"message":{"role":"assistant","content":"Alpha","annotations":[{"type":"url_citation","start_index":0,"end_index":5,"url_citation":{"url":"https://example.com/source","title":"Example"}}]}}]}`),
+		},
+		{
+			Data: []byte(`{"id":"chatcmpl-123","object":"chat.completion.chunk","created":1677652288,"model":"sonar-deep-research","choices":[{"index":0,"delta":{"content":" Beta"},"message":{"role":"assistant","content":"Alpha Beta","annotations":[{"type":"url_citation","start_index":0,"end_index":5,"url_citation":{"url":"https://example.com/source","title":"Example Source"}}]},"finish_reason":"stop"}]}`),
+		},
+	}
+
+	gotBytes, _, err := AggregateStreamChunks(context.Background(), chunks, DefaultTransformChunk)
+	require.NoError(t, err)
+
+	var got llm.Response
+	err = json.Unmarshal(gotBytes, &got)
+	require.NoError(t, err)
+
+	require.Len(t, got.Choices, 1)
+	require.NotNil(t, got.Choices[0].Message)
+	require.Len(t, got.Choices[0].Message.Annotations, 1)
+	require.Equal(t, "url_citation", got.Choices[0].Message.Annotations[0].Type)
+	require.NotNil(t, got.Choices[0].Message.Annotations[0].URLCitation)
+	require.Equal(t, "https://example.com/source", got.Choices[0].Message.Annotations[0].URLCitation.URL)
+	require.Equal(t, "Example Source", got.Choices[0].Message.Annotations[0].URLCitation.Title)
+}
+
 func TestAggregateStreamChunks_WithAnnotationsInMessage(t *testing.T) {
 	// Test annotations that come in the Message field (non-streaming style chunks)
 	chunks := []*httpclient.StreamEvent{
@@ -283,6 +344,7 @@ func TestAggregateStreamChunks_WithAnnotationsInMessage(t *testing.T) {
 	require.NoError(t, err)
 
 	var got llm.Response
+
 	err = json.Unmarshal(gotBytes, &got)
 	require.NoError(t, err)
 
@@ -307,6 +369,7 @@ func TestAggregateStreamChunks_WithInvalidAnnotations(t *testing.T) {
 	require.NoError(t, err)
 
 	var got llm.Response
+
 	err = json.Unmarshal(gotBytes, &got)
 	require.NoError(t, err)
 
@@ -318,4 +381,91 @@ func TestAggregateStreamChunks_WithInvalidAnnotations(t *testing.T) {
 	require.NotNil(t, got.Choices[0].Message.Annotations[0].URLCitation)
 	require.Equal(t, "https://example.com/valid", got.Choices[0].Message.Annotations[0].URLCitation.URL)
 	require.Equal(t, "Valid Source", got.Choices[0].Message.Annotations[0].URLCitation.Title)
+}
+
+// TestAggregateStreamChunks_PreservesEmptyReasoningContent verifies that an empty
+// reasoning_content (e.g. produced by DeepSeek thinking mode when reasoning_tokens
+// is 0) is preserved on the aggregated message rather than being silently dropped.
+// This empty string is semantically meaningful and must be round-tripped back to
+// the provider in subsequent multi-turn requests.
+func TestAggregateStreamChunks_PreservesEmptyReasoningContent(t *testing.T) {
+	chunks := []*httpclient.StreamEvent{
+		{
+			Data: []byte(`{"id":"chatcmpl-123","object":"chat.completion.chunk","created":1677652288,"model":"deepseek-reasoner","choices":[{"index":0,"delta":{"role":"assistant","reasoning_content":""}}]}`),
+		},
+		{
+			Data: []byte(`{"id":"chatcmpl-123","object":"chat.completion.chunk","created":1677652288,"model":"deepseek-reasoner","choices":[{"index":0,"delta":{"content":"Hello"},"finish_reason":"stop"}]}`),
+		},
+	}
+
+	gotBytes, _, err := AggregateStreamChunks(context.Background(), chunks, DefaultTransformChunk)
+	require.NoError(t, err)
+
+	var got llm.Response
+
+	err = json.Unmarshal(gotBytes, &got)
+	require.NoError(t, err)
+
+	require.Len(t, got.Choices, 1)
+	require.NotNil(t, got.Choices[0].Message)
+	require.NotNil(t, got.Choices[0].Message.ReasoningContent, "empty reasoning_content must be preserved")
+	require.Equal(t, "", *got.Choices[0].Message.ReasoningContent)
+}
+
+// TestAggregateStreamChunks_TopLevelReasoningTokens verifies that a provider
+// emitting reasoning tokens as a top-level `reasoning_tokens` field (SGLang
+// shape, with no nested completion_tokens_details) has the value merged into
+// the aggregated usage's CompletionTokensDetails.
+func TestAggregateStreamChunks_TopLevelReasoningTokens(t *testing.T) {
+	chunks := []*httpclient.StreamEvent{
+		{
+			Data: []byte(`{"id":"chatcmpl-1","object":"chat.completion.chunk","created":0,"model":"qwen38-27b","choices":[{"index":0,"delta":{"role":"assistant","content":"Hello"},"finish_reason":null}]}`),
+		},
+		{
+			Data: []byte(`{"id":"chatcmpl-1","object":"chat.completion.chunk","created":0,"model":"qwen38-27b","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}`),
+		},
+		{
+			Data: []byte(`{"id":"chatcmpl-1","object":"chat.completion.chunk","created":0,"model":"qwen38-27b","choices":[],"usage":{"prompt_tokens":17680,"completion_tokens":266,"total_tokens":17946,"prompt_tokens_details":{"cached_tokens":2304},"reasoning_tokens":97}}`),
+		},
+	}
+
+	gotBytes, meta, err := AggregateStreamChunks(context.Background(), chunks, DefaultTransformChunk)
+	require.NoError(t, err)
+
+	var got llm.Response
+	err = json.Unmarshal(gotBytes, &got)
+	require.NoError(t, err)
+
+	require.NotNil(t, meta.Usage)
+	require.NotNil(t, meta.Usage.CompletionTokensDetails)
+	require.Equal(t, int64(97), meta.Usage.CompletionTokensDetails.ReasoningTokens)
+
+	require.NotNil(t, got.Usage)
+	require.NotNil(t, got.Usage.CompletionTokensDetails)
+	require.Equal(t, int64(97), got.Usage.CompletionTokensDetails.ReasoningTokens)
+	require.NotNil(t, got.Usage.PromptTokensDetails)
+	require.Equal(t, int64(2304), got.Usage.PromptTokensDetails.CachedTokens)
+}
+
+// TestAggregateStreamChunks_OmitsReasoningContentWhenAbsent verifies that when no
+// delta carries the reasoning_content field at all, the aggregated message does
+// not have ReasoningContent set (nil pointer).
+func TestAggregateStreamChunks_OmitsReasoningContentWhenAbsent(t *testing.T) {
+	chunks := []*httpclient.StreamEvent{
+		{
+			Data: []byte(`{"id":"chatcmpl-123","object":"chat.completion.chunk","created":1677652288,"model":"gpt-4","choices":[{"index":0,"delta":{"role":"assistant","content":"Hello"},"finish_reason":"stop"}]}`),
+		},
+	}
+
+	gotBytes, _, err := AggregateStreamChunks(context.Background(), chunks, DefaultTransformChunk)
+	require.NoError(t, err)
+
+	var got llm.Response
+
+	err = json.Unmarshal(gotBytes, &got)
+	require.NoError(t, err)
+
+	require.Len(t, got.Choices, 1)
+	require.NotNil(t, got.Choices[0].Message)
+	require.Nil(t, got.Choices[0].Message.ReasoningContent)
 }

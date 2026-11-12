@@ -71,6 +71,10 @@ AxonHub model profiles remap incoming model names to provider-specific equivalen
 
 ## Using Claude Code as a Provider Channel
 
+> **⚠️ Important Notice**
+> 
+> Due to the complexity of Claude Code's risk control mechanisms and the scope of this project, we will no longer prioritize maintaining this channel. If you have related needs, we recommend using alternative projects like CLIProxyAPI or sub2api. Existing functionality may not receive updates or optimizations. Please use with caution.
+
 AxonHub can also use your Claude Code subscription as a backend provider, allowing non-Claude Code tools to leverage Claude Code's capabilities. This is useful when you want to route requests from other applications (OpenAI-compatible clients, custom tools, etc.) through Claude Code.
 
 ### Prerequisites
@@ -156,7 +160,7 @@ Adjust the quota check interval in `config.yml`:
 
 ```yaml
 provider_quota:
-  check_interval: "20m"          # Check every 20 minutes (default)
+  check_interval: "5m"           # Check every 5 minutes (default)
 ```
 
 Or via environment variable:
@@ -169,7 +173,7 @@ Supported intervals: `1m`, `2m`, `3m`, `4m`, `5m`, `6m`, `10m`, `12m`, `15m`, `2
 
 **Recommendations:**
 - **Development**: Use shorter intervals (e.g., `5m`) for quick feedback
-- **Production**: Use `20m` or longer to reduce API calls
+- **Production**: Use `5m` (default) for timely quota detection; increase to `10m` or `20m` to reduce API calls
 
 ### Refreshing Quota Data
 
@@ -190,4 +194,4 @@ You can manually trigger a quota refresh by clicking the refresh icon in the quo
 - [OpenAI API](../api-reference/openai-api.md)
 - [Codex Integration Guide](codex-integration.md)
 - [Channel Management Guide](channel-management.md)
-- README sections on [Usage Guide](../../../README.md#usage-guide)
+- README sections on [Usage Guide](../../../README.en-US.md#usage-guide)

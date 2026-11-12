@@ -17,10 +17,16 @@ interface DateRangePickerProps {
   onCancel?: () => void;
   onConfirm?: (range: DateTimeRangeValue) => void;
   className?: string;
+  /** Custom label for the trigger button; defaults to the picked dates. */
+  formatLabel?: (range: DateTimeRangeValue | undefined) => string;
+  /** Rendered in the popover header, right of the selected range. */
+  headerExtra?: React.ReactNode;
+  /** Called when the popover opens or closes, so callers can discard draft state. */
+  onOpenChange?: (open: boolean) => void;
 }
 
 export function DateRangePicker(props: DateRangePickerProps) {
-  const { value, onChange, onCancel, onConfirm, className } = props;
+  const { value, onChange, onCancel, onConfirm, className, formatLabel, headerExtra, onOpenChange } = props;
   const { t } = useTranslation();
   const isControlled = Object.prototype.hasOwnProperty.call(props, 'value');
   const [open, setOpen] = React.useState(false);
@@ -45,6 +51,11 @@ export function DateRangePicker(props: DateRangePickerProps) {
     setPendingValue(nextValue);
   }, []);
 
+  const close = React.useCallback(() => {
+    setOpen(false);
+    onOpenChange?.(false);
+  }, [onOpenChange]);
+
   const handleConfirm = React.useCallback(
     (next: DateTimeRangeValue) => {
       const nextValue = normalizeDateTimeRangeValue(next);
@@ -52,30 +63,38 @@ export function DateRangePicker(props: DateRangePickerProps) {
       if (!hasRange) {
         if (!isControlled) setInternalValue(undefined);
         onChange?.(undefined);
-        setOpen(false);
+        close();
         return;
       }
       if (!isControlled) setInternalValue(nextValue);
       onChange?.(nextValue);
       onConfirm?.(nextValue);
-      setOpen(false);
+      close();
     },
-    [isControlled, onChange, onConfirm]
+    [isControlled, onChange, onConfirm, close]
   );
 
   const handleCancel = React.useCallback(() => {
     const currentValue = isControlled ? normalizedValue : internalValue;
     setPendingValue(currentValue);
-    setOpen(false);
+    close();
     onCancel?.();
-  }, [isControlled, normalizedValue, internalValue, onCancel]);
+  }, [isControlled, normalizedValue, internalValue, onCancel, close]);
 
   const currentValue = isControlled ? normalizedValue : internalValue;
-  const label = formatRange(currentValue?.from, currentValue?.to, t('common.filters.dateRange'));
+  const label = formatLabel
+    ? formatLabel(currentValue)
+    : formatRange(currentValue?.from, currentValue?.to, t('common.filters.dateRange'));
 
   return (
     <div className={cn('grid gap-2', className)}>
-      <Popover open={open} onOpenChange={setOpen}>
+      <Popover
+        open={open}
+        onOpenChange={(next) => {
+          setOpen(next);
+          onOpenChange?.(next);
+        }}
+      >
         <PopoverTrigger asChild>
           <Button
             id='date'
@@ -88,7 +107,13 @@ export function DateRangePicker(props: DateRangePickerProps) {
           </Button>
         </PopoverTrigger>
         <PopoverContent className='w-auto border-none bg-transparent p-0 shadow-none' align='start'>
-          <DateTimeRangePicker value={pendingValue} onChange={handlePendingChange} onCancel={handleCancel} onConfirm={handleConfirm} />
+          <DateTimeRangePicker
+            value={pendingValue}
+            onChange={handlePendingChange}
+            onCancel={handleCancel}
+            onConfirm={handleConfirm}
+            headerExtra={headerExtra}
+          />
         </PopoverContent>
       </Popover>
     </div>

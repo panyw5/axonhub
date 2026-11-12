@@ -20,6 +20,7 @@ import (
 	"github.com/looplj/axonhub/internal/ent/channel"
 	"github.com/looplj/axonhub/internal/objects"
 	"github.com/looplj/axonhub/llm/httpclient"
+	"github.com/looplj/axonhub/llm/oauth"
 	"github.com/looplj/axonhub/llm/transformer/anthropic/claudecode"
 	"github.com/looplj/axonhub/llm/transformer/cline"
 	"github.com/looplj/axonhub/llm/transformer/devin"
@@ -165,6 +166,8 @@ type FetchModelsInput struct {
 	BaseURL     string
 	//nolint:gosec // G117: Field name contains "APIKey" but this is input data, not a hardcoded secret
 	APIKey    *string
+	ProjectID *string
+	Region    *string
 	ChannelID *int
 }
 
@@ -444,8 +447,22 @@ func (f *ModelFetcher) FetchModels(ctx context.Context, input FetchModelsInput) 
 			if apiKey == "" && len(ch.Credentials.APIKeys) > 0 {
 				apiKey = ch.Credentials.APIKeys[0]
 			}
+			if apiKey == "" && ch.Type == channel.TypeGeminiVertex && len(ch.Credentials.VertexAPIKeys) > 0 {
+				apiKey = ch.Credentials.VertexAPIKeys[0].APIKey
+			}
 			input.ChannelType = ch.Type.String()
 			input.BaseURL = ch.BaseURL
+		}
+
+		if ch.Type == channel.TypeGeminiVertex {
+			if credential, ok := ch.Credentials.VertexAPIKey(apiKey); ok {
+				if input.ProjectID == nil || strings.TrimSpace(*input.ProjectID) == "" {
+					input.ProjectID = lo.ToPtr(credential.ProjectID)
+				}
+				if input.Region == nil || strings.TrimSpace(*input.Region) == "" {
+					input.Region = lo.ToPtr(credential.Region)
+				}
+			}
 		}
 
 		if ch.Settings != nil {
@@ -463,6 +480,7 @@ func (f *ModelFetcher) FetchModels(ctx context.Context, input FetchModelsInput) 
 	}
 
 	channelType := channel.Type(input.ChannelType)
+	thirdPartyCodexCatalog := channelType == channel.TypeCodex && codexChannel == nil && !isOAuthJSON(apiKey)
 
 	if apiKey == "" && codexChannel == nil {
 		if isQiniuChannelType(channelType) {
@@ -508,7 +526,7 @@ func (f *ModelFetcher) FetchModels(ctx context.Context, input FetchModelsInput) 
 		}
 	}
 
-	modelsURL, authHeaders := f.prepareModelsEndpoint(channelType, input.BaseURL)
+	modelsURL, authHeaders := f.prepareModelsEndpointWithVertexBinding(channelType, input.BaseURL, input.ProjectID, input.Region)
 
 	// GitHub Copilot uses cached provider conf instead of API endpoint
 	if channelType == channel.TypeGithubCopilot {
@@ -534,7 +552,7 @@ func (f *ModelFetcher) FetchModels(ctx context.Context, input FetchModelsInput) 
 	if proxyConfig != nil {
 		httpClient = httpClient.WithProxy(proxyConfig)
 	}
-	if isCommandCodeChannelType(channelType) || codexChannel != nil {
+	if isCommandCodeChannelType(channelType) || codexChannel != nil || thirdPartyCodexCatalog {
 		httpClient = httpClient.WithRejectHTTPSDowngrade()
 	}
 
@@ -549,6 +567,23 @@ func (f *ModelFetcher) FetchModels(ctx context.Context, input FetchModelsInput) 
 			return &FetchModelsResult{Models: f.getDefaultModelsByType(ctx, channel.TypeCodex), Fallback: true}, nil
 		}
 		parse = parseCodexModels
+	} else if thirdPartyCodexCatalog {
+		httpClient = httpClient.WithRejectRedirects()
+		catalogBaseURL := httpModelsBaseURL(input.BaseURL)
+		parsedCatalogURL, err := url.Parse(strings.TrimRight(catalogBaseURL, "/#"))
+		if err != nil || !strings.EqualFold(parsedCatalogURL.Scheme, "https") || parsedCatalogURL.Host == "" {
+			return &FetchModelsResult{
+				Models: []ModelIdentify{},
+				Error:  lo.ToPtr("failed to prepare Codex models request: Codex catalog URL must use HTTPS"),
+			}, nil
+		}
+		req, err = codex.ModelsRequest(ctx, oauth.NewAPIKeyTokenProvider(func(context.Context) string {
+			return apiKey
+		}), catalogBaseURL)
+		if err != nil {
+			return &FetchModelsResult{Models: []ModelIdentify{}, Error: lo.ToPtr(fmt.Sprintf("failed to prepare Codex models request: %v", err))}, nil
+		}
+		parse = parseThirdPartyCodexModels
 	} else if isCommandCodeChannelType(channelType) {
 		// Command Code authenticates with a Bearer API key, never X-Api-Key.
 		req.Headers.Set("Authorization", "Bearer "+apiKey)
@@ -693,6 +728,14 @@ func logCommandCodeModelFetchError(ctx context.Context, modelsURL, apiKey string
 	slog.ErrorContext(ctx, "Command Code model fetch failed", attrs...)
 }
 
+func parseThirdPartyCodexModels(body []byte) ([]ModelIdentify, error) {
+	ids, err := codex.ParseThirdPartyModelCatalog(body)
+	if err != nil {
+		return nil, err
+	}
+	return lo.Map(ids, func(id string, _ int) ModelIdentify { return ModelIdentify{ID: id} }), nil
+}
+
 type geminiListModelsResponse struct {
 	Models        []GeminiModelResponse `json:"models"`
 	NextPageToken string                `json:"nextPageToken"`
@@ -776,6 +819,10 @@ func withGeminiModelsPagination(modelsURL string, pageSize int, pageToken string
 
 // prepareModelsEndpoint returns the models endpoint URL and auth headers for the given channel type.
 func (f *ModelFetcher) prepareModelsEndpoint(channelType channel.Type, baseURL string) (string, http.Header) {
+	return f.prepareModelsEndpointWithVertexBinding(channelType, baseURL, nil, nil)
+}
+
+func (f *ModelFetcher) prepareModelsEndpointWithVertexBinding(channelType channel.Type, baseURL string, projectID, region *string) (string, http.Header) {
 	headers := make(http.Header)
 
 	baseURL = strings.TrimSuffix(baseURL, "/")
@@ -858,6 +905,19 @@ func (f *ModelFetcher) prepareModelsEndpoint(channelType channel.Type, baseURL s
 		baseURL = strings.TrimSuffix(baseURL, "/anthropic")
 		baseURL = strings.TrimSuffix(baseURL, "/claude")
 
+		if strings.HasSuffix(baseURL, "/v1") {
+			return baseURL + "/models", headers
+		}
+
+		return baseURL + "/v1/models", headers
+	case channelType == channel.TypeGeminiVertex:
+		if projectID != nil && region != nil {
+			project := strings.TrimSpace(*projectID)
+			location := strings.TrimSpace(*region)
+			if project != "" && location != "" {
+				return fmt.Sprintf("%s/projects/%s/locations/%s/publishers/google/models", baseURL, url.PathEscape(project), url.PathEscape(location)), headers
+			}
+		}
 		if strings.HasSuffix(baseURL, "/v1") {
 			return baseURL + "/models", headers
 		}

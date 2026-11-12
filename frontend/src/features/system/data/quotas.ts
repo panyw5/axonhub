@@ -1,3 +1,4 @@
+import { useMemo } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { graphqlRequest } from '@/gql/graphql';
 import type { ChannelQuotaRoutingMode } from '@/features/channels/data/schema';
@@ -9,8 +10,8 @@ const CHECK_PROVIDER_QUOTAS_QUERY = `
 `;
 
 const RESET_CHANNEL_QUOTA_NOW_MUTATION = `
-  mutation ResetChannelQuotaNow($channelID: ID!) {
-    resetChannelQuotaNow(channelID: $channelID)
+  mutation ResetChannelQuotaNow($channelID: ID!, $resetID: String) {
+    resetChannelQuotaNow(channelID: $channelID, resetID: $resetID)
   }
 `;
 
@@ -22,6 +23,7 @@ const PROVIDER_QUOTA_STATUSES_QUERY = `
           id
           name
           type
+          orderingWeight
           settings {
             quotaRoutingMode
           }
@@ -43,11 +45,17 @@ export async function checkProviderQuotas() {
   return graphqlRequest(CHECK_PROVIDER_QUOTAS_QUERY);
 }
 
-export async function resetChannelQuotaNow(channelID: string) {
-  return graphqlRequest(RESET_CHANNEL_QUOTA_NOW_MUTATION, { channelID });
+export async function resetChannelQuotaNow(channelID: string, resetID?: string) {
+  return graphqlRequest(RESET_CHANNEL_QUOTA_NOW_MUTATION, { channelID, resetID });
 }
 
 export type ProviderQuotaReset = {
+  clears?: string[];
+  recommended?: boolean;
+  remaining?: number;
+  redeemable?: boolean;
+  unavailableReason?: string;
+  upstreamReason?: string;
   id: string;
   status: string;
   type?: string;
@@ -57,9 +65,22 @@ export type ProviderQuotaReset = {
 };
 
 export type ProviderQuotaResetList = {
+  ineligibleReason?: string;
+  eligible?: boolean;
+  cooldownUntil?: string;
+  windowModels?: Record<string, string>;
   supported: boolean;
   resets: ProviderQuotaReset[];
   error?: string;
+};
+
+/** A normalized non-window account amount, such as a prepaid credit balance. */
+export type ProviderQuotaBalance = {
+  account?: string;
+  currency?: string;
+  total: number;
+  granted?: number;
+  topped_up?: number;
 };
 
 type ProviderQuotaDataCommon = {
@@ -67,6 +88,7 @@ type ProviderQuotaDataCommon = {
   error?: string;
   error_code?: string;
   _resets?: ProviderQuotaResetList;
+  _balances?: ProviderQuotaBalance[];
 };
 
 type ProviderClaudeQuotaWindow = {
@@ -81,6 +103,7 @@ type ProviderClaudeQuotaData = ProviderQuotaDataCommon & {
     '7d'?: ProviderClaudeQuotaWindow;
     overage?: ProviderClaudeQuotaWindow;
   };
+  model_windows?: (ProviderClaudeQuotaWindow & { model: string })[];
   representative_claim?: string;
 };
 
@@ -173,17 +196,19 @@ export type ProviderNanoGPTQuotaData = ProviderQuotaDataCommon & {
   period?: { currentPeriodEnd?: string };
 };
 
-export type ProviderWaferQuotaData = ProviderQuotaDataCommon & {
-  current_period_used_percent?: number | null;
-  remaining_included_requests?: number | null;
-  included_request_limit?: number | null;
-  overage_request_count?: number | null;
-  window_start?: string | null;
-  window_end?: string | null;
-  plan_tier?: string | null;
-};
-
 export type ProviderSyntheticQuotaData = ProviderQuotaDataCommon & {
+  search?: {
+    hourly?: {
+      limit?: number | null;
+      requests?: number | null;
+      renewsAt?: string | null;
+    } | null;
+  } | null;
+  planWeeklyLimit?: {
+    nextRegenAt?: string | null;
+    percentRemaining?: number | null;
+    nextRegenPercent?: number | null;
+  } | null;
   weeklyTokenLimit?: {
     percentRemaining?: number | null;
     remainingCredits?: string | null;
@@ -214,6 +239,18 @@ export type ProviderNeuralWattQuotaData = ProviderQuotaDataCommon & {
 
 export type ProviderCharmHyperQuotaData = ProviderQuotaDataCommon & {
   balance?: number | null;
+};
+
+export type ProviderDeepseekBalanceInfo = {
+  currency?: string | null;
+  total_balance?: number | string | null;
+  granted_balance?: number | string | null;
+  topped_up_balance?: number | string | null;
+};
+
+export type ProviderDeepseekQuotaData = ProviderQuotaDataCommon & {
+  is_available?: boolean | null;
+  balance_infos?: ProviderDeepseekBalanceInfo[] | null;
 };
 
 export type ProviderApertisQuotaData = ProviderQuotaDataCommon & {
@@ -257,7 +294,6 @@ export type ProviderOpenCodeGoQuotaData = ProviderQuotaDataCommon & {
     monthly?: OpenCodeGoQuotaWindow;
   };
 };
-
 
 export type KimiCodeUsageRow = {
   label: string;
@@ -439,10 +475,7 @@ type ProviderClineErrorQuotaData = ProviderQuotaDataCommon & {
 };
 
 export type ProviderClineQuotaData =
-  | ProviderClinePassQuotaData
-  | ProviderClineUnavailablePassQuotaData
-  | ProviderClineDirectQuotaData
-  | ProviderClineErrorQuotaData;
+  ProviderClinePassQuotaData | ProviderClineUnavailablePassQuotaData | ProviderClineDirectQuotaData | ProviderClineErrorQuotaData;
 
 export function isClineActivePassQuotaData(qd: ProviderClineQuotaData): qd is ProviderClinePassQuotaData {
   return qd.pool === 'cline_pass' && qd.windows != null;
@@ -484,17 +517,21 @@ export type OllamaQuotaWindow = {
 
 export type ProviderOllamaQuotaData = ProviderQuotaDataCommon & {
   windows?: {
+    monthly?: OllamaQuotaWindow;
     '5h'?: OllamaQuotaWindow;
     weekly?: OllamaQuotaWindow;
+  };
+  credits?: {
+    purchased_usd?: number;
   };
 };
 
 /**
  * A single limit window as normalized by the backend and stashed under
- * `quotaData._limits`. `periodCost` is what the channel cost in the current
- * window according to AxonHub usage logs, and `periodQuota` is the money value
- * the whole window is estimated to be worth; both are absent when the backend
- * could not work them out.
+ * `quotaData._limits`. `periodCost` is the money the window has spent, and
+ * `periodQuota` is the money value the whole window is worth: the backend may
+ * derive both from AxonHub usage logs, or the provider may report them itself
+ * (Synthetic's weekly credits); both are absent when no figure exists.
  */
 export type ProviderQuotaLimit = {
   type: string;
@@ -581,6 +618,42 @@ export function parseQuotaLimits(quotaData: unknown): ProviderQuotaLimit[] {
   });
 }
 
+/**
+ * Non-window account amounts normalized by the backend and stashed under
+ * `quotaData._balances` (for example DeepSeek's prepaid balance). The table
+ * renders these as money rows instead of percentage bars.
+ */
+export function parseQuotaBalances(quotaData: unknown): ProviderQuotaBalance[] {
+  if (typeof quotaData !== 'object' || quotaData === null) return [];
+
+  const raw = (quotaData as { _balances?: unknown })._balances;
+  if (!Array.isArray(raw)) return [];
+
+  return raw.flatMap((entry) => {
+    if (typeof entry !== 'object' || entry === null || Array.isArray(entry)) return [];
+
+    const balance = entry as Record<string, unknown>;
+    const total = optionalNumber(balance.total);
+    if (total === undefined) return [];
+
+    return [
+      {
+        account: optionalString(balance.account),
+        currency: optionalString(balance.currency),
+        total,
+        granted: optionalNumber(balance.granted),
+        topped_up: optionalNumber(balance.topped_up),
+      },
+    ];
+  });
+}
+
+/** Formats a normalized balance amount for display. */
+export function formatQuotaBalance(value?: number | null): string | undefined {
+  if (value == null || !Number.isFinite(value)) return undefined;
+  return value.toFixed(2);
+}
+
 const CLAUDE_WINDOW_KEYS = {
   '5h': '5h',
   '7d': '7d',
@@ -650,6 +723,10 @@ function parseClaudeQuotaData(quotaData: unknown, limits: ProviderQuotaLimit[]):
 export type ProviderQuotaChannel = {
   id: string;
   name: string;
+  // Display-sort rank set via the channels page "Order channels" dialog; the
+  // load balancer treats higher weight as higher priority, so the quota
+  // popover mirrors that order in its 'preferred' sort mode.
+  orderingWeight: number;
   // Account identity shared by channels drawing from the same provider account
   // (e.g. the same ZenMux management key). Undefined means the channel has its
   // own quota account.
@@ -698,6 +775,12 @@ export type ProviderQuotaChannel = {
       type: 'github_copilot';
       quotaStatus: {
         quotaData: ProviderGitHubCopilotQuotaData;
+      };
+    }
+  | {
+      type: 'deepseek' | 'deepseek_anthropic';
+      quotaStatus: {
+        quotaData: ProviderDeepseekQuotaData;
       };
     }
   | {
@@ -750,13 +833,6 @@ export type ProviderQuotaChannel = {
     }
   | {
       type: 'openai' | 'openai_responses';
-      providerType: 'wafer';
-      quotaStatus: {
-        quotaData: ProviderWaferQuotaData;
-      };
-    }
-  | {
-      type: 'openai' | 'openai_responses';
       providerType: 'synthetic';
       quotaStatus: {
         quotaData: ProviderSyntheticQuotaData;
@@ -781,6 +857,13 @@ export type ProviderQuotaChannel = {
       providerType: 'charm_hyper';
       quotaStatus: {
         quotaData: ProviderCharmHyperQuotaData;
+      };
+    }
+  | {
+      type: 'openai' | 'openai_responses';
+      providerType: 'deepseek';
+      quotaStatus: {
+        quotaData: ProviderDeepseekQuotaData;
       };
     }
   | {
@@ -817,6 +900,7 @@ type QueryChannelNode = {
   id: string;
   name: string;
   type: string;
+  orderingWeight: number;
   settings: { quotaRoutingMode: ChannelQuotaRoutingMode } | null;
   providerQuotaStatus: ProviderQuotaStatusNode | null;
 };
@@ -837,6 +921,8 @@ function hasProviderQuotaStatus(node: QueryChannelNode | null | undefined): node
   return node?.providerQuotaStatus != null;
 }
 
+// parseChannelNode converts a channel with quota status into the discriminated
+// provider quota view used by the quota popover.
 function parseChannelNode(node: QueryChannelNodeWithQuota): ProviderQuotaChannel {
   const quotaStatus = node.providerQuotaStatus;
   const providerType = quotaStatus.providerType;
@@ -844,6 +930,7 @@ function parseChannelNode(node: QueryChannelNodeWithQuota): ProviderQuotaChannel
   const base = {
     id: node.id,
     name: node.name,
+    orderingWeight: node.orderingWeight,
     quotaRoutingMode: node.settings?.quotaRoutingMode ?? 'INHERIT',
     accountKey: optionalString(quotaStatus.accountKey),
     quotaStatus: {
@@ -899,6 +986,13 @@ function parseChannelNode(node: QueryChannelNodeWithQuota): ProviderQuotaChannel
       quotaStatus: { ...base.quotaStatus, quotaData: node.providerQuotaStatus.quotaData as ProviderGitHubCopilotQuotaData },
     };
   }
+  if (node.type === 'deepseek' || node.type === 'deepseek_anthropic') {
+    return {
+      ...base,
+      type: node.type as 'deepseek' | 'deepseek_anthropic',
+      quotaStatus: { ...base.quotaStatus, quotaData: node.providerQuotaStatus.quotaData as ProviderDeepseekQuotaData },
+    };
+  }
   if (node.type === 'nanogpt') {
     return {
       ...base,
@@ -950,14 +1044,6 @@ function parseChannelNode(node: QueryChannelNodeWithQuota): ProviderQuotaChannel
   }
   if (node.type === 'openai' || node.type === 'openai_responses') {
     const typeVal = node.type as 'openai' | 'openai_responses';
-    if (providerType === 'wafer') {
-      return {
-        ...base,
-        type: typeVal,
-        providerType: 'wafer' as const,
-        quotaStatus: { ...base.quotaStatus, quotaData: node.providerQuotaStatus.quotaData as ProviderWaferQuotaData },
-      };
-    }
     if (providerType === 'synthetic') {
       return {
         ...base,
@@ -988,6 +1074,14 @@ function parseChannelNode(node: QueryChannelNodeWithQuota): ProviderQuotaChannel
         type: typeVal,
         providerType: 'charm_hyper' as const,
         quotaStatus: { ...base.quotaStatus, quotaData: node.providerQuotaStatus.quotaData as ProviderCharmHyperQuotaData },
+      };
+    }
+    if (providerType === 'deepseek') {
+      return {
+        ...base,
+        type: typeVal,
+        providerType: 'deepseek' as const,
+        quotaStatus: { ...base.quotaStatus, quotaData: node.providerQuotaStatus.quotaData as ProviderDeepseekQuotaData },
       };
     }
     return {
@@ -1034,17 +1128,22 @@ export function useProviderQuotaStatuses() {
     refetchIntervalInBackground: true,
   });
 
-  const channels = (query.data?.queryChannels?.edges ?? [])
-    .map((edge) => edge?.node ?? null)
-    .filter(hasProviderQuotaStatus)
-    .filter((c) => {
-      // Skip channels that have no credentials configured, since they cannot be
-      // checked and only add noise to the quota popover. Other failures remain
-      // available with their generic status for administrators to inspect.
-      const quotaData = c.providerQuotaStatus.quotaData as { error?: string; error_code?: string } | undefined;
-      return quotaData?.error_code !== 'missing_credentials' && quotaData?.error !== 'channel has no credentials';
-    })
-    .map(parseChannelNode);
+  const edges = query.data?.queryChannels?.edges;
+  const channels = useMemo(
+    () =>
+      (edges ?? [])
+        .map((edge) => edge?.node ?? null)
+        .filter(hasProviderQuotaStatus)
+        .filter((c) => {
+          // Skip channels that have no credentials configured, since they cannot be
+          // checked and only add noise to the quota popover. Other failures remain
+          // available with their generic status for administrators to inspect.
+          const quotaData = c.providerQuotaStatus.quotaData as { error?: string; error_code?: string } | undefined;
+          return quotaData?.error_code !== 'missing_credentials' && quotaData?.error !== 'channel has no credentials';
+        })
+        .map(parseChannelNode),
+    [edges]
+  );
 
   return {
     channels,

@@ -2,7 +2,10 @@ package orchestrator
 
 import (
 	"context"
+	"errors"
 	"time"
+
+	"github.com/tidwall/gjson"
 
 	"github.com/looplj/axonhub/internal/authz"
 	"github.com/looplj/axonhub/internal/contexts"
@@ -10,6 +13,7 @@ import (
 	"github.com/looplj/axonhub/internal/metrics"
 	"github.com/looplj/axonhub/internal/pkg/xcontext"
 	"github.com/looplj/axonhub/internal/server/biz"
+	"github.com/looplj/axonhub/internal/server/events"
 	"github.com/looplj/axonhub/llm/httpclient"
 	"github.com/looplj/axonhub/llm/pipeline"
 	"github.com/looplj/axonhub/llm/pipeline/cc"
@@ -33,7 +37,10 @@ func NewChatCompletionOrchestrator(
 	liveStreamRegistry *biz.LiveStreamRegistry,
 	channelLimiterManager *ChannelLimiterManager,
 	quotaProvider ProviderQuotaStatusProvider,
+	plugins PluginIntegration,
 ) *ChatCompletionOrchestrator {
+	responsesStore := newResponsesSessionStore(requestService.LoadCompletedResponsesSession)
+	responsesStore.known = requestService.HasCompletedResponsesOrigin
 	rateLimitTracker := NewChannelRequestTracker()
 
 	channelService.SetChannelLimiterForgetter(channelLimiterManager)
@@ -49,22 +56,24 @@ func NewChatCompletionOrchestrator(
 
 	rateLimitStrategy := NewRateLimitAwareStrategy(rateLimitTracker, channelLimiterManager)
 
-	adaptiveLoadBalancer := NewLoadBalancer(systemService, channelService,
-		NewErrorAwareStrategy(channelService),
-		NewWeightRoundRobinStrategy(channelService),
-		NewLatencyAwareStrategy(channelService),
+	adaptiveLoadBalancer := NewLoadBalancer(channelService, channelService,
+		NewErrorAwareStrategy(),
+		NewWeightRoundRobinStrategy(),
+		NewLatencyAwareStrategy(),
 		rateLimitStrategy,
 	)
 
-	failoverLoadBalancer := NewLoadBalancer(systemService, channelService,
+	// Failover and circuit-breaker strategies never read channel metrics, so
+	// these load balancers skip the per-candidate metrics fetch.
+	failoverLoadBalancer := NewLoadBalancer(nil, channelService,
 		NewWeightStrategy(), NewRandomStrategy(), rateLimitStrategy)
 
-	circuitBreakerLoadBalancer := NewLoadBalancer(systemService, channelService,
+	circuitBreakerLoadBalancer := NewLoadBalancer(nil, channelService,
 		NewWeightStrategy(), NewModelAwareCircuitBreakerStrategy(modelCircuitBreaker), rateLimitStrategy)
 
-	roundRobinHealthFilter := NewRoundRobinHealthStrategy(channelService)
-	roundRobinLoadBalancer := NewLoadBalancer(systemService, channelService,
-		NewRoundRobinStrategy(channelService),
+	roundRobinHealthFilter := NewRoundRobinHealthStrategy()
+	roundRobinLoadBalancer := NewLoadBalancer(channelService, channelService,
+		NewRoundRobinStrategy(),
 		rateLimitStrategy,
 	).WithoutWeightTieBreaker().WithRoundRobinHealthFilter(roundRobinHealthFilter)
 
@@ -94,8 +103,10 @@ func NewChatCompletionOrchestrator(
 		roundRobinLoadBalancer:     roundRobinLoadBalancer,
 		modelCircuitBreaker:        modelCircuitBreaker,
 		quotaProvider:              quotaProvider,
+		Plugins:                    plugins,
 		proxy:                      nil,
-		responsesSessions:          newResponsesSessionStore(requestService.LoadCompletedResponsesSession),
+		responsesSessions:          responsesStore,
+		EventBus:                   channelService.EventBus,
 	}
 }
 
@@ -135,11 +146,18 @@ type ChatCompletionOrchestrator struct {
 	// The provider quota status provider for quota-aware load balancing and selection.
 	quotaProvider ProviderQuotaStatusProvider
 
+	// Plugins carries request hooks. A zero value adds no middleware.
+	Plugins PluginIntegration
+
 	// proxy is the proxy configuration for testing
 	// If set, it will override the channel's default proxy configuration
 	proxy *httpclient.ProxyConfig
 
 	responsesSessions *responsesSessionStore
+
+	// EventBus publishes plugin events. Nil skips publication. FX threads the
+	// process bus through ChannelService, and the constructor copies it here.
+	EventBus *events.Bus
 }
 
 func (processor *ChatCompletionOrchestrator) WithChannelSelector(selector CandidateSelector) *ChatCompletionOrchestrator {
@@ -163,32 +181,69 @@ func (processor *ChatCompletionOrchestrator) WithProxy(proxy *httpclient.ProxyCo
 	return &c
 }
 
+// WithEventBus returns a copy that publishes plugin events to bus.
+// A nil bus skips publication. The bus is passed on the orchestrator, not on context.
+func (processor *ChatCompletionOrchestrator) WithEventBus(bus *events.Bus) *ChatCompletionOrchestrator {
+	c := *processor
+	c.EventBus = bus
+
+	return &c
+}
+
+// ResponseRoute identifies the committed upstream attempt without retaining
+// mutable persistence state or exposing provider credentials.
+type ResponseRoute struct {
+	ChannelID int
+	Model     string
+	APIFormat string
+}
+
 type ChatCompletionResult struct {
+	Route                         ResponseRoute
 	ChatCompletion                *httpclient.Response
 	ChatCompletionStream          streams.Stream[*httpclient.StreamEvent]
 	CodexResponseHeadersSupported bool
 }
 
 func (processor *ChatCompletionOrchestrator) Process(ctx context.Context, request *httpclient.Request) (ChatCompletionResult, error) {
-	var preparedResponsesBody []byte
+	lifecycleOwner, executionCtx := newStreamLifecycle(ctx)
+	ctx = executionCtx
+
+	var continuation *responsesContinuation
 	if shared.IsResponsesAPI(ctx) && request != nil && processor.responsesSessions != nil {
-		var sessionID string
-		preparedResponsesBody, sessionID = processor.responsesSessions.prepare(ctx, request.Body)
-		request.Body = preparedResponsesBody
-		ctx = shared.WithSessionID(ctx, sessionID)
+		continuation = newResponsesContinuation(processor.responsesSessions, request.Body)
+		defer func() {
+			if continuation != nil {
+				continuation.releaseRetention()
+				continuation.releaseCapture()
+			}
+		}()
+		ctx = shared.WithResponsesAttempt(ctx, &shared.ResponsesAttempt{})
+		if shared.GetResponsesLane(ctx) == nil {
+			sessionID, _ := shared.GetSessionID(ctx)
+			if record := processor.responsesSessions.lookup(ctx, continuation.previous); record != nil && record.sessionID != "" {
+				sessionID = record.sessionID
+			}
+			ctx = shared.WithSessionID(ctx, responseSessionID(sessionID))
+		}
 	}
 
 	// API key providers cannot return a derived context, so install the shared
 	// request container before provider selection mutates it.
 	ctx = contexts.EnsureContainer(ctx)
 
+	// Install a request-scoped memo so cost injection and usage-log creation share
+	// a single model-library price lookup instead of repeating it per calculation.
+	ctx = biz.WithModelLibraryPriceMemo(ctx)
+
 	// The context is system bypassed to allow the orchestrator to access the system settings.
 	ctx = authz.WithSystemBypass(ctx, "process-chat-completion")
 
 	apiKey, _ := contexts.GetAPIKey(ctx)
 
-	// Get retry policy from system settings
-	retryPolicy := processor.SystemService.RetryPolicyOrDefault(ctx)
+	settings := processor.loadRequestSettings(ctx)
+	ctx = withRequestSettings(ctx, settings)
+	retryPolicy := &settings.RetryPolicy
 
 	if log.DebugEnabled(ctx) {
 		log.Debug(ctx, "chat request received",
@@ -197,15 +252,14 @@ func (processor *ChatCompletionOrchestrator) Process(ctx context.Context, reques
 	}
 
 	state := &PersistenceState{
-		APIKey:              apiKey,
-		RequestService:      processor.RequestService,
-		UsageLogService:     processor.UsageLogService,
-		SystemService:       processor.SystemService,
-		ChannelService:      processor.ChannelService,
-		PromptProvider:      processor.PromptProvider,
-		PromptProtecter:     processor.PromptProtecter,
-		RetryPolicyProvider: processor.SystemService,
-		CandidateSelector:   processor.channelSelector,
+		ResponsesContinuation: continuation,
+		APIKey:                apiKey,
+		RequestService:        processor.RequestService,
+		UsageLogService:       processor.UsageLogService,
+		ChannelService:        processor.ChannelService,
+		PromptProvider:        processor.PromptProvider,
+		PromptProtecter:       processor.PromptProtecter,
+		CandidateSelector:     processor.channelSelector,
 		LoadBalancers: map[string]*LoadBalancer{
 			biz.LoadBalancerStrategyAdaptive:       processor.adaptiveLoadBalancer,
 			biz.LoadBalancerStrategyFailover:       processor.failoverLoadBalancer,
@@ -213,9 +267,11 @@ func (processor *ChatCompletionOrchestrator) Process(ctx context.Context, reques
 			biz.LoadBalancerStrategyRoundRobin:     processor.roundRobinLoadBalancer,
 		},
 		RoutingPolicy:         deriveRoutingPolicy(retryPolicy, apiKey, nil),
+		Settings:              settings,
 		ModelMapper:           processor.ModelMapper,
 		Proxy:                 processor.proxy,
 		CurrentCandidateIndex: 0,
+		EventBus:              processor.EventBus,
 	}
 
 	var pipelineOpts []pipeline.Option
@@ -236,6 +292,10 @@ func (processor *ChatCompletionOrchestrator) Process(ctx context.Context, reques
 			time.Duration(retryPolicy.StreamFirstEventTimeoutSeconds)*time.Second,
 			time.Duration(retryPolicy.NonStreamResponseTimeoutSeconds)*time.Second,
 		))
+	} else {
+		// Retries are switched off globally: a channel-level override must not
+		// turn same-channel retries back on.
+		pipelineOpts = append(pipelineOpts, pipeline.WithRetriesDisabled())
 	}
 
 	var middlewares []pipeline.Middleware
@@ -243,32 +303,44 @@ func (processor *ChatCompletionOrchestrator) Process(ctx context.Context, reques
 	// Add global middlewares
 	middlewares = append(middlewares, processor.Middlewares...)
 	middlewares = append(middlewares, newBillingSystemMessageMiddleware(state))
+	hooks, err := processor.Plugins.RequestHooks(ctx)
+	if err != nil {
+		lifecycleOwner.Close()
+		return ChatCompletionResult{}, err
+	}
+	middlewares = append(middlewares, hooks.requestStage()...)
 
 	inbound, outbound := NewPersistentTransformers(state, processor.Inbound, middlewares...)
 
 	// Add inbound middlewares (executed after inbound.TransformRequest)
 	middlewares = append(middlewares,
 		enforceQuota(inbound, processor.QuotaService),
-		applyAutoReasoningEffort(processor.SystemService),
+		applyAutoReasoningEffort(settings),
 		checkApiKeyModelAccess(inbound),
 		applyModelMapping(inbound),
-		selectCandidates(inbound, processor.quotaProvider, processor.SystemService),
+		selectCandidates(inbound, processor.quotaProvider),
 		injectPrompts(inbound),
 		protectPrompts(inbound),
 		// Response pass-through middlewares run before persistRequest so the raw provider
 		// response is saved when pass-through is enabled.
-		applyPassThroughResponse(outbound, processor.SystemService),
-		applyPassThroughStream(outbound, processor.SystemService),
+		applyPassThroughResponse(outbound),
+		applyPassThroughStream(outbound),
 		persistRequest(inbound),
 	)
 
 	// Add outbound middlewares (executed after outbound.TransformRequest)
 	middlewares = append(middlewares,
 		// applyPassThroughBody runs first so that override operations can still modify the pass-through body.
-		applyPassThroughRequestBody(outbound, processor.SystemService),
+		applyPassThroughRequestBody(outbound, processor.Plugins.Hooks),
+		// Responses HTTP/WS adaptation reuses the effective body before continuation and overrides.
+		applyResponsesTransportRequestBody(outbound),
 		// Codex Responses metadata must travel with a pass-through body so compatible
 		// upstreams preserve the client's protocol behavior.
 		applyPassThroughRequestHeaders(outbound),
+		applyResponsesContinuationBody(outbound),
+	)
+	middlewares = append(middlewares, hooks.attemptStage(outbound)...)
+	middlewares = append(middlewares,
 		applyOverrideRequestBody(outbound),
 		// applyUserAgentPassThrough runs before header overrides to set the initial
 		// User-Agent value (either from client pass-through or default "axonhub/1.0").
@@ -276,23 +348,24 @@ func (processor *ChatCompletionOrchestrator) Process(ctx context.Context, reques
 		// (e.g. GitHubCopilotChat on Copilot channels) is preserved when
 		// pass-through is disabled. Override headers can still modify the
 		// User-Agent if configured.
-		applyUserAgentPassThrough(outbound, processor.SystemService),
+		applyUserAgentPassThrough(outbound),
 		applyOverrideRequestHeaders(outbound),
 		// Remove transport-incompatible fields after pass-through and overrides,
 		// so persistence and execution observe the same provider request.
+		verifyResponsesAttempt(outbound),
 		finalizeTransportRequest(outbound),
 
 		// Unified performance tracking middleware.
-		withPerformanceRecording(outbound),
+		withoutResponsesRecoveryPenalty(withPerformanceRecording(outbound)),
 
-		withModelCircuitBreaker(outbound, processor.modelCircuitBreaker),
+		withoutResponsesRecoveryPenalty(withModelCircuitBreaker(outbound, processor.modelCircuitBreaker)),
 
 		// The request execution middleware must be the final middleware
 		// to ensure that the request execution is created with the correct request bodys.
 		persistRequestExecution(outbound),
 
 		// Forward the events to the live streaming.
-		withLivePreview(state, processor.SystemService, processor.LiveStreamRegistry),
+		withLivePreview(state, processor.LiveStreamRegistry),
 
 		// Per-channel concurrency admission runs before RPM admission so a locally
 		// rejected queue attempt does not consume RPM for a request that never
@@ -305,8 +378,11 @@ func (processor *ChatCompletionOrchestrator) Process(ctx context.Context, reques
 
 		// Response pass-through capture middlewares must be last in the outbound list
 		// so they run first in reverse order (before any other OnOutboundRawResponse/OnOutboundRawStream handlers).
-		captureRawProviderResponse(outbound, processor.SystemService),
-		captureRawProviderStream(outbound, processor.SystemService),
+		captureRawProviderResponse(outbound),
+		captureRawProviderStream(outbound),
+		captureResponsesProvider(outbound),
+		// Run first on raw responses (reverse order), before pass-through capture.
+		closeCompletedAnthropicStream(outbound),
 	)
 
 	pipelineOpts = append(pipelineOpts, pipeline.WithMiddlewares(middlewares...))
@@ -319,55 +395,82 @@ func (processor *ChatCompletionOrchestrator) Process(ctx context.Context, reques
 
 	result, err := pipe.Process(ctx, request)
 	if err != nil {
+		lifecycleOwner.Close()
 		persistCtx, cancel := xcontext.DetachWithTimeout(ctx, time.Second*10)
 		defer cancel()
 
-		// Update the last request execution status based on error if it exists
-		// This ensures that when retry fails completely, the last execution is properly marked
-		if requestExec := outbound.GetRequestExecution(); requestExec != nil {
+		// Finish the failed execution, unless plugin admission stopped this attempt
+		// before persistence ran: this attempt has no execution record.
+		if requestExec := outbound.GetRequestExecution(); requestExec != nil && !isPluginOverloaded(err) {
 			if updateErr := persistRequestExecutionFailure(
 				persistCtx,
 				processor.RequestService,
-				requestExec.ID,
+				requestExec,
 				err,
 				nil,
 				"",
+				state.executionResponseHeaders(requestExec.ID),
 			); updateErr != nil {
 				log.Warn(persistCtx, "Failed to update request execution status from error", log.Cause(updateErr))
 			}
-			maybeEvaluateChannelAPIKeyRulesOnFailure(persistCtx, outbound, err)
+			if !errors.Is(err, shared.ErrResponsesContinuationUnavailable) {
+				maybeEvaluateChannelAPIKeyRulesOnFailure(persistCtx, outbound, err)
+			}
 		}
 
 		// Update the main request status based on error
 		if request := outbound.GetRequest(); request != nil {
 			if updateErr := processor.RequestService.UpdateRequestStatusFromError(
 				persistCtx,
-				request.ID,
+				request,
 				err,
+				finalRequestResponseHeaders(persistCtx, state),
 			); updateErr != nil {
 				log.Warn(persistCtx, "Failed to update request status from error", log.Cause(updateErr))
 			}
 		}
 
+		publishRequestFailed(persistCtx, state, err)
+
 		return ChatCompletionResult{}, err
+	}
+
+	// Pipeline retries finish before the response is returned. Snapshot the final
+	// route so downstream display estimates cannot share calibration across routes.
+	var route ResponseRoute
+	if channel := outbound.GetCurrentChannel(); channel != nil {
+		route.ChannelID = channel.ID
+	}
+	if state.RawProviderRequest != nil {
+		route.Model = gjson.GetBytes(state.RawProviderRequest.Body, "model").String()
+		route.APIFormat = state.RawProviderRequest.APIFormat
+	}
+	if route.Model == "" && state.RequestExec != nil {
+		route.Model = state.RequestExec.ModelID
 	}
 
 	// Return result based on stream type
 	if result.Stream {
-		if preparedResponsesBody != nil {
-			result.EventStream = processor.responsesSessions.wrapStream(ctx, preparedResponsesBody, result.EventStream)
+		if continuation != nil {
+			source := result.EventStream
+			accepted := &responsesAcceptedStream{Stream: source, ctx: ctx, continuation: continuation}
+			result.EventStream = httpclient.WithResponseHeaders(preserveDeliveryCapabilities(source, accepted), httpclient.GetResponseHeaders(source))
+			continuation = nil
 		}
 		return ChatCompletionResult{
+			Route:                         route,
 			ChatCompletion:                nil,
 			ChatCompletionStream:          result.EventStream,
 			CodexResponseHeadersSupported: outbound.SupportsCodexResponseHeaders(),
 		}, nil
 	}
-	if preparedResponsesBody != nil && result.Response != nil {
-		processor.responsesSessions.record(ctx, preparedResponsesBody, result.Response.Body)
+	if continuation != nil && result.Response != nil {
+		continuation.accept(ctx)
 	}
+	lifecycleOwner.Close()
 
 	return ChatCompletionResult{
+		Route:                         route,
 		ChatCompletion:                result.Response,
 		ChatCompletionStream:          nil,
 		CodexResponseHeadersSupported: outbound.SupportsCodexResponseHeaders(),
@@ -379,6 +482,9 @@ func maybeEvaluateChannelAPIKeyRulesOnFailure(
 	outbound *PersistentOutboundTransformer,
 	rawErr error,
 ) {
+	if isLocalAdmissionError(rawErr) {
+		return
+	}
 	if outbound == nil || outbound.state == nil || outbound.state.ChannelService == nil {
 		return
 	}

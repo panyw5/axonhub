@@ -52,10 +52,22 @@ type Loader struct {
 	configFile string
 }
 
+// explicitConfigFile, when set, is the only file Load and NewLoader read.
+// The desktop process sets it before starting the server. An empty value
+// keeps the historical search paths, which cmd/axonhub relies on.
+var explicitConfigFile string
+
+// SetConfigFile selects the configuration file for Load and NewLoader.
+// A non-empty path disables the search paths. An empty path restores them.
+// Call it from one goroutine before the first load.
+func SetConfigFile(path string) {
+	explicitConfigFile = path
+}
+
 // NewLoader reads the initial configuration and records the selected config
 // file for subsequent runtime reloads.
 func NewLoader() (Config, *Loader, error) {
-	cfg, configFile, err := loadConfig("")
+	cfg, configFile, err := loadConfig(explicitConfigFile)
 	if err != nil {
 		return Config{}, nil, err
 	}
@@ -150,6 +162,26 @@ func unmarshal(v *viper.Viper) (Config, error) {
 		return Config{}, fmt.Errorf("failed to unmarshal config: %w", err)
 	}
 
+	config.APIServer.Safeguards.ClassifierModel = strings.TrimSpace(config.APIServer.Safeguards.ClassifierModel)
+	seenReviewers := map[string]bool{config.APIServer.Safeguards.ClassifierModel: true}
+	for i, model := range config.APIServer.Safeguards.FallbackModels {
+		model = strings.TrimSpace(model)
+		if model == "" || seenReviewers[model] {
+			return Config{}, fmt.Errorf("server.safeguards.fallback_models must contain nonempty, distinct models different from classifier_model")
+		}
+		seenReviewers[model] = true
+		config.APIServer.Safeguards.FallbackModels[i] = model
+	}
+	if cfg := config.APIServer.Safeguards; cfg.Timeout <= 0 || cfg.Timeout > 2*time.Minute {
+		return Config{}, fmt.Errorf("server.safeguards.timeout must be greater than zero and at most 2m")
+	} else if cfg.AttemptTimeout < 0 || cfg.AttemptTimeout > 2*time.Minute {
+		return Config{}, fmt.Errorf("server.safeguards.attempt_timeout must be between zero and 2m")
+	} else if cfg.MaxTokens < 1 || cfg.MaxTokens > 16384 {
+		return Config{}, fmt.Errorf("server.safeguards.max_tokens must be between 1 and 16384")
+	} else if cfg.TranscriptCharBudget < 1 || cfg.TranscriptCharBudget > 1000000 {
+		return Config{}, fmt.Errorf("server.safeguards.transcript_char_budget must be between 1 and 1000000")
+	}
+
 	config.DisableSSLVerify = config.APIServer.DisableSSLVerify
 	config.AllowNoAuth = config.APIServer.API.Auth.AllowNoAuth
 	config.APIKeyPrefix = config.APIServer.API.Auth.KeyPrefix
@@ -233,6 +265,16 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("server.trace.codex_trace_enabled", true)
 	v.SetDefault("server.trace.opencode_trace_enabled", true)
 
+	// Server-side tool-review defaults. Register every key for env-only configuration.
+	v.SetDefault("server.safeguards.classifier_model", "")
+	v.SetDefault("server.safeguards.policy", "")
+	v.SetDefault("server.safeguards.fallback_models", []string{})
+	v.SetDefault("server.safeguards.escalate_on_denial", false)
+	v.SetDefault("server.safeguards.attempt_timeout", "0s")
+	v.SetDefault("server.safeguards.timeout", "30s")
+	v.SetDefault("server.safeguards.max_tokens", 4096)
+	v.SetDefault("server.safeguards.transcript_char_budget", 24000)
+
 	// Dashboard defaults
 	v.SetDefault("server.dashboard.all_time_token_stats_soft_ttl", "1h")
 	v.SetDefault("server.dashboard.all_time_token_stats_hard_ttl", "24h")
@@ -243,6 +285,10 @@ func setDefaults(v *viper.Viper) {
 	// Max multipart memory for file uploads (backup restore, etc.)
 	// Default: 32M (matching Gin's default). Supports K/M/G suffixes, e.g. "512M", "1G".
 	v.SetDefault("server.max_multipart_memory", "32M")
+
+	// Go runtime profiling, served on its own loopback-only listener.
+	v.SetDefault("server.pprof.enabled", false)
+	v.SetDefault("server.pprof.addr", "127.0.0.1:6060")
 
 	// CORS defaults
 	v.SetDefault("server.cors.enabled", false)

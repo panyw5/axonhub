@@ -10,7 +10,7 @@ import { formatNumber } from '@/utils/format-number';
 import { Button } from '@/components/ui/button';
 import { Calendar } from '@/components/ui/calendar';
 import { Checkbox } from '@/components/ui/checkbox';
-import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from '@/components/ui/dialog';
+import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 import { Form, FormControl, FormField, FormItem, FormLabel, FormMessage } from '@/components/ui/form';
 import { Input } from '@/components/ui/input';
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
@@ -22,6 +22,7 @@ import { useModels } from '../context/models-context';
 import { DEVELOPER_IDS, DEVELOPER_ICONS } from '../data/constants';
 import { useCreateModel, useUpdateModel } from '../data/models';
 import { useDevelopersData } from '../data/providers';
+import { isSuggestedModel, withMiniMaxFlash } from '../data/model-suggestions';
 import { type Provider, type ProviderModel, resolveVision } from '../data/providers.schema';
 import { REASONING_EFFORTS, deriveReasoningEfforts } from '../data/reasoning-efforts';
 import {
@@ -64,7 +65,7 @@ export function ModelsActionDialog() {
       .map(([key, provider]: [string, Provider]) => ({
         id: key,
         name: provider.display_name || provider.name,
-        models: provider.models || [],
+        models: withMiniMaxFlash(provider.models || [], key),
       }));
   }, [developersData]);
 
@@ -90,10 +91,12 @@ export function ModelsActionDialog() {
   }, [getDeveloperLabel]);
 
   const modelIdOptions = useMemo(() => {
-    return selectedProviderModels.map((m: ProviderModel) => ({
-      value: m.id,
-      label: m.id,
-    }));
+    return selectedProviderModels
+      .filter((model) => isSuggestedModel(model.id))
+      .map((m: ProviderModel) => ({
+        value: m.id,
+        label: m.id,
+      }));
   }, [selectedProviderModels]);
 
   const iconOptions = useMemo(() => {
@@ -888,14 +891,14 @@ export function ModelsActionDialog() {
               </div>
             </div>
 
-            <div className='flex flex-shrink-0 justify-end gap-2 border-t pt-4'>
+            <DialogFooter pinned divided>
               <Button type='button' variant='outline' onClick={handleClose}>
                 {t('common.buttons.cancel')}
               </Button>
               <Button type='submit' disabled={createModel.isPending || updateModel.isPending}>
                 {isEdit ? t('common.buttons.save') : t('common.buttons.create')}
               </Button>
-            </div>
+            </DialogFooter>
           </form>
         </Form>
       </DialogContent>

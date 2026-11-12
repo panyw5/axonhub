@@ -6,8 +6,85 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/looplj/axonhub/internal/ent"
+	"github.com/looplj/axonhub/internal/ent/channel"
 	"github.com/looplj/axonhub/internal/objects"
+	"github.com/looplj/axonhub/llm"
 )
+
+func TestChannelService_BuildResponsesWebSocketOutbound(t *testing.T) {
+	// Given a channel with a WebSocket Responses endpoint and a usable key
+	entity := &ent.Channel{
+		ID:          1,
+		Name:        "responses-ws",
+		Type:        channel.TypeOpenaiResponses,
+		BaseURL:     "https://provider.test",
+		Credentials: objects.ChannelCredentials{APIKeys: []string{"test-key"}},
+	}
+	ch := &Channel{Channel: entity, cachedEnabledAPIKeys: []string{"test-key"}}
+
+	// When the endpoint-specific outbound is built
+	outbound, err := (&ChannelService{}).buildNonDefaultEndpointOutbound(entity, ch, objects.ChannelEndpoint{
+		APIFormat: llm.APIFormatOpenAIResponseWebSocket.String(),
+		BaseURL:   entity.BaseURL,
+	})
+
+	// Then the transformer reports the exact selected protocol
+	require.NoError(t, err)
+	require.Equal(t, llm.APIFormatOpenAIResponseWebSocket, outbound.APIFormat())
+}
+
+func TestBuildNonDefaultEndpointOutbound_OAuthOnlyChannelReturnsError(t *testing.T) {
+	entity := &ent.Channel{
+		ID:      1,
+		Name:    "Google",
+		Type:    channel.TypeAntigravity,
+		BaseURL: "https://upstream.example",
+		Credentials: objects.ChannelCredentials{
+			APIKey: "refresh-token|project-id",
+			OAuth: &objects.OAuthCredentials{
+				AccessToken:  "access-token",
+				RefreshToken: "refresh-token",
+			},
+		},
+	}
+	ch := &Channel{Channel: entity}
+
+	for _, format := range []string{
+		llm.APIFormatOpenAIChatCompletion.String(),
+		llm.APIFormatOpenAIResponse.String(),
+		llm.APIFormatAnthropicMessage.String(),
+	} {
+		outbound, err := (&ChannelService{}).buildNonDefaultEndpointOutbound(entity, ch, objects.ChannelEndpoint{
+			APIFormat: format,
+		})
+		require.Error(t, err)
+		require.Nil(t, outbound)
+		require.ErrorContains(t, err, `no enabled api key`)
+		require.ErrorContains(t, err, format)
+	}
+}
+
+func TestBuildNonDefaultEndpointOutbound_CodexOAuthResponsesKeepsTokenProvider(t *testing.T) {
+	entity := &ent.Channel{
+		ID:      1,
+		Name:    "codex",
+		Type:    channel.TypeCodex,
+		BaseURL: "https://chatgpt.com/backend-api/codex",
+		Credentials: objects.ChannelCredentials{
+			OAuth: &objects.OAuthCredentials{
+				AccessToken:  "access-token",
+				RefreshToken: "refresh-token",
+			},
+		},
+	}
+	ch := &Channel{Channel: entity}
+
+	outbound, err := (&ChannelService{}).buildNonDefaultEndpointOutbound(entity, ch, objects.ChannelEndpoint{
+		APIFormat: llm.APIFormatOpenAIResponse.String(),
+	})
+	require.NoError(t, err)
+	require.Equal(t, llm.APIFormatOpenAIResponse, outbound.APIFormat())
+}
 
 func TestChannel_IsModelSupported_WithExtraModelPrefix(t *testing.T) {
 	tests := []struct {

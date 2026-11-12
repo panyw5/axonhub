@@ -35,7 +35,7 @@ const { pageInfoSchema } = await import(
 );
 globalThis.__importStubs = { z, pageInfoSchema };
 
-const { parseQuotaLimits } = await loadModule('features/system/data/quotas.ts', (s) =>
+const { parseQuotaBalances, parseQuotaLimits } = await loadModule('features/system/data/quotas.ts', (s) =>
   s.replace(/export function useProviderQuotaStatuses[\s\S]*$/m, '')
 );
 
@@ -155,6 +155,30 @@ test('normalized limits: malformed required fields produce no rendered limits', 
   assert.deepEqual(limits, []);
 });
 
+test('normalized balances: parser returns every _balances entry without fabrication', () => {
+  const balances = parseQuotaBalances({
+    _balances: [
+      { currency: 'CNY', total: 110, granted: 10, topped_up: 100 },
+      { currency: 'USD', total: 5 },
+    ],
+  });
+
+  assert.equal(balances.length, 2);
+  assert.deepEqual(balances[0], { account: undefined, currency: 'CNY', total: 110, granted: 10, topped_up: 100 });
+  assert.deepEqual(balances[1], { account: undefined, currency: 'USD', total: 5, granted: undefined, topped_up: undefined });
+});
+
+test('normalized balances: malformed entries fail closed', () => {
+  for (const rawBalances of [null, {}, 'broken', 42]) {
+    assert.deepEqual(parseQuotaBalances({ _balances: rawBalances }), [], `malformed _balances value ${String(rawBalances)} must be unavailable`);
+  }
+
+  const balances = parseQuotaBalances({
+    _balances: [null, 42, { currency: 'CNY' }, { total: '110' }, { total: 10, granted: 'x', topped_up: 5 }],
+  });
+  assert.deepEqual(balances, [{ account: undefined, currency: undefined, total: 10, granted: undefined, topped_up: 5 }]);
+});
+
 test('no provider fallback: channels table renders quota for any channel type with normalized limits', () => {
   // Given a non-allowlisted channel type whose quota status carries _limits,
   // When the quota cell decides whether to render rows,
@@ -197,6 +221,11 @@ test('no provider fallback: channels table renders quota for any channel type wi
     /parseQuotaLimits/,
     'the channel table should consume the shared provider-neutral normalized-limit parser'
   );
+  assert.match(
+    columnsSource,
+    /parseQuotaBalances/,
+    'the channel table should consume the shared provider-neutral normalized-balance parser'
+  );
 });
 
 test('no provider fallback: quota cell has no provider-specific raw-data parsing branches', () => {
@@ -211,6 +240,8 @@ test('no provider fallback: quota cell has no provider-specific raw-data parsing
     /channel\.type === 'codex'/,
     /channel\.type === 'antigravity'/,
     /channel\.type === 'github_copilot'/,
+    /providerType === 'deepseek'/,
+    /balance_infos/,
     /data\.billing/,
     /data\.windows/,
     /data\.models/,
@@ -278,4 +309,77 @@ test('more than five normalized limits expose the remaining rows for expansion',
   assert.deepEqual(limits.map((limit) => limit.window), ['5h', '7d', '30d', 'daily', 'weekly', 'monthly']);
   assert.match(columns, /const visibleLimits = isExpanded \? limits : limits\.slice\(0, QUOTA_VISIBLE_LIMIT\)/);
   assert.match(columns, /const hiddenCount = limits\.length - QUOTA_VISIBLE_LIMIT/);
+});
+
+test('the search quota reaches the table with its production label', () => {
+  assert.match(
+    columnsSource,
+    /search_hourly:\s*'quota\.window\.search_hourly'/,
+    'the table must map the search window through the production label map'
+  );
+
+  const limits = parseQuotaLimits({
+    _limits: [{ type: 'search', window: 'search_hourly', status: 'available', ready: true, usageRatio: 0.4 }],
+  });
+  assert.deepEqual(
+    limits.map(({ type, window, usageRatio }) => ({ type, window, usageRatio })),
+    [{ type: 'search', window: 'search_hourly', usageRatio: 0.4 }]
+  );
+});
+
+test('channels table container allows horizontal scroll and wraps in min-w-max without table-fixed', () => {
+  const tableSource = read('features/channels/components/channels-table.tsx');
+  assert.doesNotMatch(tableSource, /overflow-x-hidden/, 'table container must not disable horizontal scroll');
+  assert.match(tableSource, /min-w-max/, 'table must be wrapped in min-w-max to preserve column widths');
+  assert.doesNotMatch(tableSource, /table-fixed/, 'table must not be table-fixed which crushes columns to 0');
+});
+
+test('channel columns have minimum widths and are not hidden by responsive display gates', () => {
+  const columnsSource = read('features/channels/components/channels-columns.tsx');
+
+  const columnMeta = (columnId) => {
+    const idIndex = columnsSource.indexOf("id: '" + columnId + "'");
+    const keyIndex = idIndex === -1 ? columnsSource.indexOf("accessorKey: '" + columnId + "'") : idIndex;
+    assert.notEqual(keyIndex, -1, columnId + ' column should exist');
+    const columnEnd = columnsSource.indexOf('\n    },', keyIndex);
+    assert.notEqual(columnEnd, -1, columnId + ' column boundary should be found');
+    const metaIndex = columnsSource.indexOf('meta: {', keyIndex);
+    assert.notEqual(metaIndex, -1, columnId + ' column should define meta');
+    assert.ok(metaIndex < columnEnd, columnId + ' meta should belong to the column');
+    const classNameIndex = columnsSource.indexOf('className:', metaIndex);
+    assert.notEqual(classNameIndex, -1, columnId + ' column should define meta.className');
+    assert.ok(classNameIndex < columnEnd, columnId + ' className should belong to the column');
+    const end = columnsSource.indexOf('\n', classNameIndex);
+    return columnsSource.slice(classNameIndex, end);
+  };
+
+  for (const columnId of ['quota', 'tags', 'proxy', 'createdAt']) {
+    const meta = columnMeta(columnId);
+    assert.doesNotMatch(meta, /\bhidden\b/, columnId + ' must not be hidden by responsive display gate');
+    assert.doesNotMatch(meta, /(?:xl|2xl):table-cell/, columnId + ' must not be gated by a responsive breakpoint');
+  }
+
+  for (const columnId of ['name', 'provider', 'status', 'supportedModels']) {
+    const meta = columnMeta(columnId);
+    assert.doesNotMatch(meta, /min-w-0/, columnId + ' must have a non-zero minimum width');
+    assert.match(meta, /min-w-\d+/, columnId + ' must have an explicit min-w-* class to prevent collapse');
+  }
+});
+
+test('channel percentage column widths sum to 100', () => {
+  const columnsSource = read('features/channels/components/channels-columns.tsx');
+  const percentages = [...columnsSource.matchAll(/w-\[([0-9.]+)%\]/g)].map((match) => Number(match[1]));
+
+  assert.ok(percentages.length > 0, 'expected percentage-width channel columns');
+  const total = percentages.reduce((sum, value) => sum + value, 0);
+  assert.equal(total, 100, 'channel column percentages must sum to 100, got ' + total);
+});
+
+test('supported models cell bounds badge container width to prevent horizontal stretching', () => {
+  const columnsSource = read('features/channels/components/channels-columns.tsx');
+  assert.match(
+    columnsSource,
+    /max-w-(?:72|80|xs|sm)[^']*flex-wrap/,
+    'supported models badge container must have a max-width wrapper so badges wrap instead of stretching the table'
+  );
 });

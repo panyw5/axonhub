@@ -3,6 +3,7 @@ package biz
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/looplj/axonhub/internal/authz"
@@ -64,9 +65,17 @@ func (svc *ChannelService) onCacheRefreshed(ctx context.Context, current []*Chan
 }
 
 func (svc *ChannelService) onTokenRefreshed(ch *ent.Channel) func(ctx context.Context, refreshed *oauth.OAuthCredentials) error {
+	snapshot := *ch
+	var mu sync.Mutex
 	return func(ctx context.Context, refreshed *oauth.OAuthCredentials) error {
-		ctx = authz.WithSystemBypass(ctx, "channel-refresh-cache")
-		return svc.refreshOAuthToken(ctx, ch, refreshed)
+		mu.Lock()
+		defer mu.Unlock()
+		// The channel was authorized before constructing the provider. Persist only
+		// its refreshed credentials as a host operation, preserving the caller's client.
+		_, err := authz.RunAsHost(ctx, svc.entFromContext(ctx), "channel-refresh-credentials", func(hostCtx context.Context) (struct{}, error) {
+			return struct{}{}, svc.refreshOAuthToken(hostCtx, &snapshot, refreshed)
+		})
+		return err
 	}
 }
 

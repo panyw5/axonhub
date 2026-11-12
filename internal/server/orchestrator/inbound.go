@@ -3,6 +3,7 @@ package orchestrator
 import (
 	"context"
 	"errors"
+	"sync"
 
 	"github.com/tidwall/gjson"
 
@@ -15,6 +16,7 @@ import (
 	"github.com/looplj/axonhub/llm/httpclient"
 	"github.com/looplj/axonhub/llm/streams"
 	"github.com/looplj/axonhub/llm/transformer"
+	"github.com/looplj/axonhub/llm/transformer/shared"
 )
 
 // ErrStreamIncomplete reports an upstream stream that ended without a terminal
@@ -48,8 +50,12 @@ type InboundPersistentStream struct {
 	terminalState   streamTerminalState
 	outcome         streamOutcome
 	closed          bool
+	closeMu         sync.Mutex
+	stateMu         sync.Mutex
+	closeDone       chan struct{}
 	state           *PersistenceState
 	terminalTracker *StreamTerminalTracker
+	lifecycle       *streamLifecycle
 }
 
 var _ streams.Stream[*httpclient.StreamEvent] = (*InboundPersistentStream)(nil)
@@ -74,8 +80,10 @@ func NewInboundPersistentStream(
 		perf:            perf,
 		responseChunks:  make([]*httpclient.StreamEvent, 0),
 		closed:          false,
+		closeDone:       make(chan struct{}),
 		state:           state,
 		terminalTracker: NewStreamTerminalTrackerForRequest(request),
+		lifecycle:       streamLifecycleFromContext(ctx),
 	}
 
 	return s
@@ -100,10 +108,12 @@ func (ts *InboundPersistentStream) Current() *httpclient.StreamEvent {
 				ts.state.CleanEOFCompletionEvidence = true
 			}
 			if ts.terminalTracker.Observe(event) {
+				ts.stateMu.Lock()
 				ts.terminalState = classifyAcceptedTerminalEvent(event)
 				ts.terminalState = ts.finalTerminalState()
-				ts.outcome.observeTerminal(ts.terminalState)
-				ts.state.StreamCompleted = ts.outcome.finalState() == streamTerminalCompleted
+				ts.outcome.observeTerminalEvent(ts.terminalState, event)
+				ts.state.StreamCompleted = ts.outcome.deliveryState() == streamTerminalCompleted
+				ts.stateMu.Unlock()
 			}
 		}
 	}
@@ -197,6 +207,69 @@ func (ts *InboundPersistentStream) Err() error {
 	return ts.stream.Err()
 }
 
+func (ts *InboundPersistentStream) Deliver(ctx context.Context, write func() (bool, error)) error {
+	if ts.lifecycle != nil {
+		terminal, err := deliverAndTrack(write, func(write func() (bool, error)) error {
+			return ts.lifecycle.Deliver(ctx, write)
+		})
+		if err == nil && terminal {
+			ts.AcknowledgeDelivery()
+		}
+		return err
+	}
+	if boundary, ok := ts.stream.(streams.DeliveryBoundary); ok {
+		terminal, err := deliverAndTrack(write, func(write func() (bool, error)) error {
+			return boundary.Deliver(ctx, write)
+		})
+		if err == nil && terminal {
+			ts.AcknowledgeDelivery()
+		}
+		return err
+	}
+	terminal, err := write()
+	if err == nil && terminal {
+		ts.AcknowledgeDelivery()
+	}
+	return err
+}
+
+func deliverAndTrack(write func() (bool, error), deliver func(func() (bool, error)) error) (bool, error) {
+	terminal := false
+	err := deliver(func() (bool, error) {
+		var writeErr error
+		terminal, writeErr = write()
+		return terminal, writeErr
+	})
+	return terminal, err
+}
+
+func (ts *InboundPersistentStream) AcknowledgeDelivery() {
+	ts.stateMu.Lock()
+	defer ts.stateMu.Unlock()
+	if ts.lifecycle != nil {
+		ts.lifecycle.AcknowledgeDelivery()
+		if !ts.lifecycle.DeliveryAcknowledged() {
+			return
+		}
+	}
+	ts.outcome.observeDeliveryAcknowledgement()
+	ts.state.DeliveryAcknowledged = true
+}
+
+func (ts *InboundPersistentStream) DeliveryAcknowledged() bool {
+	if ts.lifecycle != nil {
+		return ts.lifecycle.DeliveryAcknowledged()
+	}
+
+	return ts.state != nil && ts.state.DeliveryAcknowledged
+}
+
+func (ts *InboundPersistentStream) WaitForFinalization() {
+	if ts.lifecycle != nil {
+		ts.lifecycle.WaitForFinalization()
+	}
+}
+
 func (ts *InboundPersistentStream) finalTerminalState() streamTerminalState {
 	// Generic finish_reason/message_stop events can lose the provider's failure
 	// or cancellation. Preserve that outcome even if the client disconnects
@@ -211,12 +284,40 @@ func (ts *InboundPersistentStream) finalTerminalState() streamTerminalState {
 }
 
 func (ts *InboundPersistentStream) Close() error {
+	ts.closeMu.Lock()
 	if ts.closed {
+		done := ts.closeDone
+		ts.closeMu.Unlock()
+		<-done
 		return nil
 	}
-
 	ts.closed = true
+	ts.closeMu.Unlock()
+	defer close(ts.closeDone)
+
+	// The lifecycle finalizes the upstream attempt before the chain is closed:
+	// closing the chain may cancel the attempt's transport before its tail is read.
+	if ts.lifecycle != nil {
+		ts.lifecycle.Close()
+		_ = ts.stream.Close()
+	}
+
+	ts.stateMu.Lock()
+	defer ts.stateMu.Unlock()
+
+	if ts.lifecycle != nil && ts.lifecycle.DeliveryAcknowledged() {
+		ts.outcome.observeDeliveryAcknowledgement()
+		ts.state.DeliveryAcknowledged = true
+	}
 	ctx := ts.ctx
+	// Close is idempotent; publish only after the final outcome and persistence
+	// have been resolved, including failures arriving after Process returned.
+	defer func() {
+		if ts.terminalState == streamTerminalNone || ts.terminalState == streamTerminalCompleted {
+			return
+		}
+		publishRequestFailed(context.WithoutCancel(ctx), ts.state, ts.outcome.deliveryDecision().cause)
+	}()
 
 	log.Debug(ctx, "Closing persistent stream", log.Int("chunk_count", len(ts.responseChunks)), log.Bool("request_completed", ts.state.StreamCompleted))
 
@@ -224,15 +325,17 @@ func (ts *InboundPersistentStream) Close() error {
 	ctxErr := ctx.Err()
 	ts.outcome.observeTransportError(streamErr)
 	ts.outcome.observeContextError(ctxErr)
+	decision := ts.outcome.deliveryDecision()
+	deliveryBlocked := ts.outcome.finalDecision().state == streamTerminalCompleted && decision.state != streamTerminalCompleted
 	ts.terminalState = ts.finalTerminalState()
 	if ts.outcome.hasFinalEvidence() {
-		ts.terminalState = ts.outcome.finalState()
+		ts.terminalState = decision.state
 		ts.state.StreamCompleted = ts.terminalState == streamTerminalCompleted
 	}
 
 	// A terminal event carries the final stream outcome. Persist its structured
 	// response even if a transport or context error arrives afterward.
-	if ts.terminalState != streamTerminalNone {
+	if ts.terminalState != streamTerminalNone && !deliveryBlocked {
 		log.Debug(ctx, "Stream terminal event received, performing final persistence",
 			log.String("terminal_state", string(ts.terminalState)))
 		ts.persistResponseChunks(ctx)
@@ -249,8 +352,13 @@ func (ts *InboundPersistentStream) Close() error {
 	if len(ts.responseChunks) > 0 && !ts.outcome.hasFinalEvidence() {
 		responseBody, meta, aggErr = ts.transformer.AggregateStreamChunks(context.WithoutCancel(ctx), ts.responseChunks)
 		aggregatedCompleted := isCompletedAggregated(meta)
-		if ts.request != nil && ts.request.Format == llm.APIFormatOpenAIChatCompletion.String() && (streamErr != nil || ctxErr != nil) {
-			aggregatedCompleted = aggregatedCompleted && ts.terminalTracker.AllChoicesFinished()
+		if ts.request != nil && ts.request.Format == llm.APIFormatOpenAIChatCompletion.String() &&
+			(streamErr != nil || ctxErr != nil) {
+			if ts.state.CleanEOFCompletionEvidence {
+				aggregatedCompleted = aggregatedCompleted && ts.terminalTracker.AllChoicesObserved()
+			} else {
+				aggregatedCompleted = aggregatedCompleted && ts.terminalTracker.AllChoicesFinished()
+			}
 		}
 		if aggErr == nil && meta.ID != "" && len(responseBody) > 0 && aggregatedCompleted {
 			log.Debug(ctx, "Stream has valid complete response without terminal event, treating as completed")
@@ -263,20 +371,19 @@ func (ts *InboundPersistentStream) Close() error {
 		}
 	}
 	if ts.outcome.hasFinalEvidence() {
-		ts.terminalState = ts.outcome.finalState()
+		ts.terminalState = ts.outcome.deliveryDecision().state
 		ts.state.StreamCompleted = ts.terminalState == streamTerminalCompleted
 	}
-	decision := ts.outcome.finalDecision()
+	decision = ts.outcome.deliveryDecision()
 	if ts.terminalState == streamTerminalNone {
 		ts.terminalState = decision.state
 	}
 
 	if decision.state != streamTerminalCompleted && (streamErr != nil || ctxErr != nil) {
 		persistCtx := context.WithoutCancel(ctx)
-		ts.persistFailureChunks(persistCtx)
 
 		if ts.request != nil {
-			if err := ts.requestService.UpdateRequestStatusFromError(persistCtx, ts.request.ID, decision.cause); err != nil {
+			if err := ts.requestService.UpdateRequestStatusFromError(persistCtx, ts.request, decision.cause, finalRequestResponseHeaders(persistCtx, ts.state), ts.responseChunks...); err != nil {
 				log.Warn(persistCtx, "Failed to update request status from error", log.Cause(err))
 			}
 		}
@@ -292,11 +399,9 @@ func (ts *InboundPersistentStream) Close() error {
 		log.Debug(ctx, "Stream ended without terminal event or completed response, treating as incomplete")
 
 		persistCtx := context.WithoutCancel(ctx)
-		// Persist partial chunks for debugging; do not mark the request completed.
-		ts.persistFailureChunks(persistCtx)
-
+		// Persist partial chunks with the failed status for debugging.
 		if ts.request != nil {
-			if err := ts.requestService.UpdateRequestStatusFromError(persistCtx, ts.request.ID, decision.cause); err != nil {
+			if err := ts.requestService.UpdateRequestStatusFromError(persistCtx, ts.request, decision.cause, finalRequestResponseHeaders(persistCtx, ts.state), ts.responseChunks...); err != nil {
 				log.Warn(persistCtx, "Failed to update request status from error", log.Cause(err))
 			}
 		}
@@ -337,19 +442,6 @@ func (ts *InboundPersistentStream) persistResponseChunks(ctx context.Context) {
 	ts._persistResponse(persistCtx, responseBody, meta)
 }
 
-// persistFailureChunks stores buffered SSE chunks for a failed/incomplete stream
-// without marking the request completed. Used so truncated upstream responses remain
-// inspectable when store_chunks is enabled.
-func (ts *InboundPersistentStream) persistFailureChunks(ctx context.Context) {
-	if ts.request == nil || len(ts.responseChunks) == 0 {
-		return
-	}
-
-	if err := ts.requestService.SaveRequestChunks(ctx, ts.request.ID, ts.responseChunks); err != nil {
-		log.Warn(ctx, "Failed to save request chunks after stream failure", log.Cause(err))
-	}
-}
-
 // _persistResponse performs the actual persistence with pre-aggregated data.
 // This avoids redundant aggregation when the data is already available.
 func (ts *InboundPersistentStream) _persistResponse(ctx context.Context, responseBody []byte, meta llm.ResponseMeta) {
@@ -372,14 +464,12 @@ func (ts *InboundPersistentStream) _persistResponse(ctx context.Context, respons
 	}
 
 	status := ts.terminalState.requestStatus()
-	err := ts.requestService.UpdateRequestFinalized(ctx, ts.request.ID, status, meta.ID, responseBody, metrics)
+	err := ts.requestService.UpdateRequestFinalized(ctx, ts.request, status, meta.ID, responseBody, metrics, finalRequestResponseHeaders(ctx, ts.state), ts.responseChunks...)
 	if err != nil {
 		log.Warn(ctx, "Failed to update finalized request", log.Cause(err), log.Any("status", status))
 	}
-
-	// Save all response chunks at once
-	if err := ts.requestService.SaveRequestChunks(ctx, ts.request.ID, ts.responseChunks); err != nil {
-		log.Warn(ctx, "Failed to save request chunks", log.Cause(err))
+	if status == request.StatusCompleted {
+		publishRequestCompleted(ctx, ts.state, meta.Usage, true, metrics)
 	}
 }
 
@@ -408,6 +498,9 @@ func (p *PersistentInboundTransformer) TransformRequest(ctx context.Context, req
 	llmRequest, err := p.wrapped.TransformRequest(ctx, request)
 	if err != nil {
 		return nil, err
+	}
+	if shared.IsResponsesWebSocket(ctx) && llmRequest.APIFormat == llm.APIFormatOpenAIResponse {
+		llmRequest.APIFormat = llm.APIFormatOpenAIResponseWebSocket
 	}
 
 	llmRequest.RawRequest = request

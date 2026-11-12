@@ -3,11 +3,64 @@ package conf
 import (
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 	"time"
 
 	"go.uber.org/zap/zapcore"
 )
+
+func TestExplicitConfigFileSkipsSearchPaths(t *testing.T) {
+	t.Cleanup(func() { SetConfigFile("") })
+
+	searchDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(searchDir, "config.yml"), []byte("server:\n  port: 1111\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(searchDir)
+
+	explicit := writeTestConfig(t, "server:\n  host: 127.0.0.1\n  port: 18090\n")
+	SetConfigFile(explicit)
+
+	cfg, loader, err := NewLoader()
+	if err != nil {
+		t.Fatalf("NewLoader() error = %v", err)
+	}
+	if cfg.APIServer.Host != "127.0.0.1" || cfg.APIServer.Port != 18090 {
+		t.Fatalf("explicit file host = %q port = %d, want 127.0.0.1:18090", cfg.APIServer.Host, cfg.APIServer.Port)
+	}
+	abs, err := filepath.Abs(explicit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loader.ConfigFile() != abs {
+		t.Fatalf("ConfigFile() = %q, want %q", loader.ConfigFile(), abs)
+	}
+
+	SetConfigFile("")
+	searched, _, err := NewLoader()
+	if err != nil {
+		t.Fatalf("search NewLoader() error = %v", err)
+	}
+	if searched.APIServer.Port != 1111 {
+		t.Fatalf("search port = %d, want 1111", searched.APIServer.Port)
+	}
+}
+
+func TestExplicitConfigFileMissingDoesNotSearch(t *testing.T) {
+	t.Cleanup(func() { SetConfigFile("") })
+
+	searchDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(searchDir, "config.yml"), []byte("server:\n  port: 2222\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(searchDir)
+
+	SetConfigFile(filepath.Join(t.TempDir(), "missing.yml"))
+	if _, _, err := NewLoader(); err == nil {
+		t.Fatal("missing explicit config file was ignored and a search path was used")
+	}
+}
 
 func TestLoaderReloadUsesFreshViper(t *testing.T) {
 	configFile := writeTestConfig(t, `
@@ -104,6 +157,37 @@ func TestMetricsExporterConfigFromEnvironment(t *testing.T) {
 	}
 }
 
+func TestPprofDefaultsToDisabledOnLoopback(t *testing.T) {
+	configFile := writeTestConfig(t, "")
+	cfg, _, err := loadConfig(configFile)
+	if err != nil {
+		t.Fatalf("loadConfig() error = %v", err)
+	}
+	if cfg.APIServer.Pprof.Enabled {
+		t.Fatal("pprof should default to disabled")
+	}
+	if cfg.APIServer.Pprof.Addr != "127.0.0.1:6060" {
+		t.Fatalf("pprof addr = %q, want %q", cfg.APIServer.Pprof.Addr, "127.0.0.1:6060")
+	}
+}
+
+func TestPprofConfigFromEnvironment(t *testing.T) {
+	t.Setenv("AXONHUB_SERVER_PPROF_ENABLED", "true")
+	t.Setenv("AXONHUB_SERVER_PPROF_ADDR", "127.0.0.1:7070")
+
+	configFile := writeTestConfig(t, "")
+	cfg, _, err := loadConfig(configFile)
+	if err != nil {
+		t.Fatalf("loadConfig() error = %v", err)
+	}
+	if !cfg.APIServer.Pprof.Enabled {
+		t.Fatal("pprof should be enabled from environment")
+	}
+	if cfg.APIServer.Pprof.Addr != "127.0.0.1:7070" {
+		t.Fatalf("pprof addr = %q, want %q", cfg.APIServer.Pprof.Addr, "127.0.0.1:7070")
+	}
+}
+
 func TestTraceExtractionDefaultsToEnabled(t *testing.T) {
 	configFile := writeTestConfig(t, "")
 
@@ -132,4 +216,130 @@ func writeTestConfig(t *testing.T, contents string) string {
 		t.Fatalf("write test config: %v", err)
 	}
 	return configFile
+}
+
+func TestSafeguardsConfigDefaults(t *testing.T) {
+	cfg, _, err := loadConfig(writeTestConfig(t, ""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := cfg.APIServer.Safeguards
+	if got.Policy != "" || got.EscalateOnDenial || got.ClassifierModel != "" || len(got.FallbackModels) != 0 || got.AttemptTimeout != 0 || got.Timeout != 30*time.Second || got.MaxTokens != 4096 || got.TranscriptCharBudget != 24000 {
+		t.Fatalf("unexpected safeguards defaults: %+v", got)
+	}
+}
+
+func TestSafeguardsConfigEnvironmentOverridesYAML(t *testing.T) {
+	t.Setenv("AXONHUB_SERVER_SAFEGUARDS_POLICY", "Allow feature branch updates.\nFlag secret disclosure.")
+	t.Setenv("AXONHUB_SERVER_SAFEGUARDS_ESCALATE_ON_DENIAL", "true")
+	t.Setenv("AXONHUB_SERVER_SAFEGUARDS_CLASSIFIER_MODEL", " gemini-3.8-flash ")
+	t.Setenv("AXONHUB_SERVER_SAFEGUARDS_FALLBACK_MODELS", `[" codex-auto-review ","backup"]`)
+	t.Setenv("AXONHUB_SERVER_SAFEGUARDS_ATTEMPT_TIMEOUT", "4s")
+	t.Setenv("AXONHUB_SERVER_SAFEGUARDS_TIMEOUT", "12s")
+	t.Setenv("AXONHUB_SERVER_SAFEGUARDS_MAX_TOKENS", "2048")
+	t.Setenv("AXONHUB_SERVER_SAFEGUARDS_TRANSCRIPT_CHAR_BUDGET", "12000")
+	for _, source := range []string{"", `server:
+  safeguards:
+    classifier_model: other-model
+    policy: YAML policy
+    fallback_models: [other-backup]
+    attempt_timeout: 5s
+    timeout: 20s
+    max_tokens: 1024
+    transcript_char_budget: 6000
+`} {
+		cfg, _, err := loadConfig(writeTestConfig(t, source))
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := cfg.APIServer.Safeguards
+		if got.Policy != "Allow feature branch updates.\nFlag secret disclosure." {
+			t.Fatalf("policy environment override was not applied: %q", got.Policy)
+		}
+		if !got.EscalateOnDenial || got.ClassifierModel != "gemini-3.8-flash" || !slices.Equal(got.FallbackModels, []string{"codex-auto-review", "backup"}) || got.AttemptTimeout != 4*time.Second || got.Timeout != 12*time.Second || got.MaxTokens != 2048 || got.TranscriptCharBudget != 12000 {
+			t.Fatalf("environment overrides were not applied: %+v", got)
+		}
+	}
+}
+
+func TestSafeguardsPolicyYAML(t *testing.T) {
+	cfg, _, err := loadConfig(writeTestConfig(t, `server:
+  safeguards:
+    policy: |
+      Allow feature branch updates.
+      Flag secret disclosure.
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg.APIServer.Safeguards.Policy; got != "Allow feature branch updates.\nFlag secret disclosure.\n" {
+		t.Fatalf("multiline policy was not preserved: %q", got)
+	}
+}
+
+func TestSafeguardsPolicyEmptyEnvironmentOverride(t *testing.T) {
+	for _, tc := range []struct {
+		name, value, want string
+	}{
+		{name: "empty preserves YAML", value: "", want: "YAML policy"},
+		{name: "whitespace overrides YAML", value: " \n\t", want: " \n\t"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("AXONHUB_SERVER_SAFEGUARDS_POLICY", tc.value)
+			cfg, _, err := loadConfig(writeTestConfig(t, "server:\n  safeguards:\n    policy: YAML policy\n"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := cfg.APIServer.Safeguards.Policy; got != tc.want {
+				t.Fatalf("unexpected policy for environment value %q: got %q, want %q", tc.value, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestSafeguardsConfigRejectsInvalidLimits(t *testing.T) {
+	for _, config := range []string{
+		"timeout: 0s", "timeout: -1s", "timeout: 121s", "timeout: invalid",
+		"max_tokens: 0", "max_tokens: 16385",
+		"attempt_timeout: -1s", "attempt_timeout: 121s", "attempt_timeout: invalid",
+		`fallback_models: [" "]`, `fallback_models: ["backup", " backup "]`,
+		"classifier_model: primary\n    fallback_models: [primary]",
+		"transcript_char_budget: 0", "transcript_char_budget: 1000001",
+	} {
+		t.Run(config, func(t *testing.T) {
+			_, _, err := loadConfig(writeTestConfig(t, "server:\n  safeguards:\n    "+config+"\n"))
+			if err == nil {
+				t.Fatalf("expected error for %s", config)
+			}
+		})
+	}
+}
+
+func TestSafeguardsFallbackYAML(t *testing.T) {
+	cfg, _, err := loadConfig(writeTestConfig(t, `server:
+  safeguards:
+    classifier_model: " codex-auto-review "
+    fallback_models:
+      - " gemini-3.8-flash "
+      - other-reviewer
+    attempt_timeout: 10s
+    timeout: 30s
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := cfg.APIServer.Safeguards
+	if got.ClassifierModel != "codex-auto-review" || !slices.Equal(got.FallbackModels, []string{"gemini-3.8-flash", "other-reviewer"}) || got.AttemptTimeout != 10*time.Second || got.Timeout != 30*time.Second {
+		t.Fatalf("unexpected fallback configuration: %+v", got)
+	}
+}
+
+func TestSafeguardsEscalationYAML(t *testing.T) {
+	cfg, _, err := loadConfig(writeTestConfig(t, "server:\n  safeguards:\n    escalate_on_denial: true\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.APIServer.Safeguards.EscalateOnDenial {
+		t.Fatal("YAML escalation toggle ignored")
+	}
 }

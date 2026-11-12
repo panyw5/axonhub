@@ -12,6 +12,8 @@ import (
 	entprivacy "github.com/looplj/axonhub/internal/ent/privacy"
 	"github.com/looplj/axonhub/internal/server/biz"
 	"github.com/looplj/axonhub/internal/server/orchestrator"
+	"github.com/looplj/axonhub/internal/server/plugin"
+	"github.com/looplj/axonhub/internal/server/safeguards"
 	"github.com/looplj/axonhub/llm/httpclient"
 	"github.com/looplj/axonhub/llm/transformer/anthropic"
 )
@@ -32,7 +34,9 @@ type AnthropicHandlersParams struct {
 	LiveStreamRegistry          *biz.LiveStreamRegistry
 	ChannelLimiterManager       *orchestrator.ChannelLimiterManager
 	ProviderQuotaStatusProvider orchestrator.ProviderQuotaStatusProvider
+	PluginManager               *plugin.Manager
 	SSEKeepAliveConfig          SSEKeepAliveConfig
+	SafeguardsConfig            safeguards.Config `optional:"true"`
 }
 
 type AnthropicHandlers struct {
@@ -43,7 +47,7 @@ type AnthropicHandlers struct {
 }
 
 func NewAnthropicHandlers(params AnthropicHandlersParams) *AnthropicHandlers {
-	return &AnthropicHandlers{
+	handlers := &AnthropicHandlers{
 		ChatCompletionHandlers: &ChatCompletionHandlers{
 			ChatCompletionOrchestrator: orchestrator.NewChatCompletionOrchestrator(
 				params.ChannelService,
@@ -59,14 +63,19 @@ func NewAnthropicHandlers(params AnthropicHandlersParams) *AnthropicHandlers {
 				params.LiveStreamRegistry,
 				params.ChannelLimiterManager,
 				params.ProviderQuotaStatusProvider,
-			),
-			sseKeepAlive:       params.SSEKeepAliveConfig,
-			sseHeartbeatFormat: sseHeartbeatAnthropic,
+				orchestratorPlugins(params.PluginManager)),
+			sseKeepAlive:             params.SSEKeepAliveConfig,
+			sseHeartbeatFormat:       sseHeartbeatAnthropic,
+			safeguardsConfig:         params.SafeguardsConfig,
+			safeguardsConfigProvider: params.SystemService.ClaudeCodeSafeguardsConfig,
+			inputUsageCache:          newInputUsageCache(),
 		},
 		ChannelService: params.ChannelService,
 		ModelService:   params.ModelService,
 		SystemService:  params.SystemService,
 	}
+	handlers.ChatCompletionHandlers.reviewer = newSafeguardsClassifier(handlers.ChatCompletionHandlers.ChatCompletionOrchestrator)
+	return handlers
 }
 
 func (handlers *AnthropicHandlers) CreateMessage(c *gin.Context) {

@@ -12,7 +12,7 @@
 [![测试状态](https://github.com/looplj/axonhub/actions/workflows/test.yml/badge.svg)](https://github.com/looplj/axonhub/actions/workflows/test.yml)
 [![Lint 状态](https://github.com/looplj/axonhub/actions/workflows/lint.yml/badge.svg)](https://github.com/looplj/axonhub/actions/workflows/lint.yml)
 [![Go 版本](https://img.shields.io/github/go-mod/go-version/looplj/axonhub?logo=go&logoColor=white)](https://golang.org/)
-[![Docker Ready](https://img.shields.io/badge/docker-ready-2496ED?logo=docker&logoColor=white)](https://docker.com)
+[![Docker Ready](https://img.shields.io/badge/docker-ready-2496ED?logo=docker&logoColor=white)](https://hub.docker.com/r/looplj/axonhub)
 [![Greptile: The War on Bugs](https://www.greptile.com/badge.svg)](https://www.greptile.com/?utm_source=oss_badge&utm_medium=readme&utm_campaign=greptile_for_open_source)
 
 [English](README.en-US.md) | [中文](README.md) | [日本語](README.ja-JP.md)
@@ -21,7 +21,9 @@
 
 ---
 
-## ❤️ 赞助商
+> 🚀 **试试我的新项目 [Reveric（幻界）](https://lj.s.gy/LDfOjx)**：Agent Native 创作工作台，从小说、剧本到自动生成视频、自动剪辑成片，让智能体参与创作全流程。
+
+## ❤️ 赞助
 
 <div align="center">
 
@@ -77,7 +79,7 @@
 <table border="1" cellspacing="0" cellpadding="16">
   <thead>
     <tr>
-      <th align="center" width="220">赞助商</th>
+      <th align="center" width="220">赞助</th>
       <th align="left">详情</th>
     </tr>
   </thead>
@@ -175,9 +177,9 @@
 
 ## 🎯 演示 | Demo
 
-在我们的 [演示实例](https://axonhub.onrender.com) 上体验 AxonHub！
+在我们的 [演示实例](https://axonhub.reveric.app) 上体验 AxonHub！
 
-**注意**：演示网站目前配置了 Zhipu 和 OpenRouter 的免费模型。
+**注意**：演示实例已配置 OpenRouter 免费模型。
 
 ### 演示账号 | Demo Account
 - **邮箱 Email**: demo@example.com
@@ -338,6 +340,12 @@ print(response.choices[0].message.content)
         <sub><b>llc1123</b></sub>
       </a>
     </td>
+    <td align="center">
+      <a href="https://github.com/djdembeck">
+        <img src="https://github.com/djdembeck.png?size=100" width="100" alt="djdembeck"/><br/>
+        <sub><b>djdembeck</b></sub>
+      </a>
+    </td>
   </tr>
 </table>
 
@@ -351,8 +359,6 @@ print(response.choices[0].message.content)
 - 🌐 [gin-gonic/gin](https://github.com/gin-gonic/gin) - HTTP 框架
 - 🗄️ [ent/ent](https://github.com/ent/ent) - ORM 框架
 - 🔧 [air-verse/air](https://github.com/air-verse/air) - 自动重载 Go 服务
-- ☁️ [render](https://render.com) - 免费云部署平台，用于部署 demo
-- 🗄️ [tidbcloud](https://www.pingcap.com/tidb-cloud/) - Serverless 数据库平台，用于部署 demo
 
 ---
 

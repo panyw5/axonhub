@@ -69,7 +69,9 @@ type anthropicInboundStream struct {
 
 	// Buffered citations for the currently open text block. These are emitted as
 	// citations_delta events immediately before the text block is closed.
-	pendingTextCitations []TextCitation
+	pendingTextCitations     []TextCitation
+	responsesSearches        map[string]responsesSearchState
+	responsesSearchCitations []responsesSearchSource
 }
 
 // generateSignature generates a random signature using base64(uuid).
@@ -541,6 +543,11 @@ func (s *anthropicInboundStream) Next() bool {
 			}
 		}
 
+		if err := s.emitResponsesSearchBlocks(nil, true); err != nil {
+			s.err = fmt.Errorf("failed to finalize search blocks: %w", err)
+			return false
+		}
+
 		if err := s.closeOpenContentBlocks(); err != nil {
 			s.err = fmt.Errorf("failed to close content blocks at stream end: %w", err)
 			return false
@@ -593,10 +600,9 @@ func (s *anthropicInboundStream) Next() bool {
 	if !s.hasStarted {
 		s.hasStarted = true
 
-		usage := &Usage{
-			InputTokens:  1,
-			OutputTokens: 1,
-		}
+		// Usage is unknown until the provider reports it. The API layer can add
+		// a client-only input estimate without contaminating persisted usage.
+		usage := &Usage{}
 		if chunk.Usage != nil {
 			usage = convertToAnthropicUsage(chunk.Usage)
 		}
@@ -618,6 +624,21 @@ func (s *anthropicInboundStream) Next() bool {
 			s.err = fmt.Errorf("failed to enqueue message_start event: %w", err)
 			return false
 		}
+	}
+
+	if len(chunk.Choices) > 0 {
+		choice := chunk.Choices[0]
+		if choice.Message != nil {
+			s.responsesSearchCitations = appendResponsesSearchCitations(s.responsesSearchCitations, choice.Message.Annotations)
+		}
+		if choice.Delta != nil {
+			s.responsesSearchCitations = appendResponsesSearchCitations(s.responsesSearchCitations, choice.Delta.Annotations)
+		}
+	}
+	finalSearchSnapshot := len(chunk.Choices) > 0 && chunk.Choices[0].FinishReason != nil
+	if err := s.emitResponsesSearchBlocks(chunk.TransformerMetadata, finalSearchSnapshot); err != nil {
+		s.err = fmt.Errorf("failed to emit search blocks: %w", err)
+		return false
 	}
 
 	// Process the current chunk
@@ -921,7 +942,7 @@ func (s *anthropicInboundStream) Next() bool {
 						Index: &s.contentIndex,
 						ContentBlock: &MessageContentBlock{
 							Type:   blockType,
-							ID:     deltaToolCall.ID,
+							ID:     anthropicToolBlockID(blockType, deltaToolCall.ID),
 							Name:   &deltaToolCall.Function.Name,
 							Input:  json.RawMessage("{}"),
 							Caller: getAnthropicCaller(deltaToolCall.TransformerMetadata),
@@ -1053,7 +1074,7 @@ func (s *anthropicInboundStream) Next() bool {
 		if choice.FinishReason != nil && !s.hasFinished {
 			s.hasFinished = true
 
-			contentClosed := false
+			contentClosed := s.lastEventType == "content_block_stop"
 
 			if err := s.closeThinkingBlock(); err != nil {
 				s.err = fmt.Errorf("failed to close thinking block: %w", err)
@@ -1117,6 +1138,8 @@ func (s *anthropicInboundStream) Next() bool {
 				stopReason = "max_tokens"
 			case "tool_calls":
 				stopReason = "tool_use"
+			case "content_filter":
+				stopReason = "refusal"
 			default:
 				stopReason = "end_turn"
 			}
@@ -1127,11 +1150,13 @@ func (s *anthropicInboundStream) Next() bool {
 		}
 	}
 
-	// The terminal event must wait for the choices-less usage-only chunk that carries the
-	// real counts. Some providers (e.g. ModelScope) attach a zeroed usage object to every
-	// chunk, including the one carrying finish_reason; finalizing there would emit the
-	// placeholder zeros and drop the real counts arriving afterwards.
-	if chunk.Usage != nil && len(chunk.Choices) == 0 && s.hasFinished && !s.messageStoped {
+	// The terminal event must carry the real counts, so it is emitted as soon as a
+	// post-finish chunk supplies them. The discriminator is the content of `usage`,
+	// not the shape of `choices`: providers that pad every chunk with a zeroed usage
+	// object (ModelScope, see #2615) keep waiting, while providers that put the real
+	// counts on the finish_reason chunk itself (agent2api and many
+	// OpenAI-compatible relays) finalize right here instead of at stream end.
+	if chunk.Usage.HasRealCounts() && s.hasFinished && !s.messageStoped {
 		// Usage-only chunk after finish_reason - generate message_delta with both stop reason and usage.
 		if err := s.enqueueTerminalEvents(); err != nil {
 			s.err = err

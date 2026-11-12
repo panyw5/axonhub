@@ -3,6 +3,8 @@ package orchestrator
 import (
 	"context"
 	"errors"
+
+	"github.com/looplj/axonhub/llm/httpclient"
 )
 
 // streamOutcome is the single monotonic view of a stream's terminal facts.
@@ -10,13 +12,36 @@ import (
 // after them; a transport error can only be replaced by a completed outcome
 // when aggregation provides explicit completion evidence.
 type streamOutcome struct {
-	terminalState       streamTerminalState
-	providerTerminal    bool
-	aggregatedCompleted bool
-	validatedCompleted  bool
-	transportErr        error
-	contextErr          error
-	contextState        streamTerminalState
+	terminalState          streamTerminalState
+	terminalCause          error
+	providerTerminal       bool
+	aggregatedCompleted    bool
+	validatedCompleted     bool
+	transportErr           error
+	contextErr             error
+	contextState           streamTerminalState
+	deadlineBeforeTerminal bool
+	deliveryAcknowledged   bool
+}
+
+func (o *streamOutcome) observeDeliveryAcknowledgement() {
+	o.deliveryAcknowledged = true
+}
+
+func (o streamOutcome) deliveryState() streamTerminalState {
+	return o.deliveryDecision().state
+}
+
+func (o streamOutcome) deliveryDecision() streamOutcomeDecision {
+	decision := o.finalDecision()
+	if decision.state != streamTerminalCompleted {
+		return decision
+	}
+	if !o.deliveryAcknowledged {
+		decision.state = streamTerminalIncomplete
+		decision.cause = ErrStreamIncomplete
+	}
+	return decision
 }
 
 type streamOutcomeDecision struct {
@@ -31,6 +56,19 @@ func (o *streamOutcome) observeTerminal(state streamTerminalState) {
 
 	o.providerTerminal = true
 	o.terminalState = state
+	if state != streamTerminalCompleted {
+		o.terminalCause = errors.New(string(state))
+	}
+}
+
+func (o *streamOutcome) observeTerminalEvent(state streamTerminalState, event *httpclient.StreamEvent) {
+	if o.providerTerminal || state == streamTerminalNone {
+		return
+	}
+	o.observeTerminal(state)
+	if state != streamTerminalCompleted {
+		o.terminalCause = errors.New(streamTerminalErrorMessage(event, state))
+	}
 }
 
 func (o *streamOutcome) observeAggregatedCompletion(completed bool) {
@@ -61,6 +99,7 @@ func (o *streamOutcome) observeContextError(err error) {
 		if errors.Is(err, context.DeadlineExceeded) {
 			o.contextState = streamTerminalFailed
 			o.contextErr = err
+			o.deadlineBeforeTerminal = o.deadlineBeforeTerminal || !o.providerTerminal
 			return
 		}
 		if o.contextState == streamTerminalNone {
@@ -71,14 +110,14 @@ func (o *streamOutcome) observeContextError(err error) {
 }
 
 func (o streamOutcome) finalDecision() streamOutcomeDecision {
+	if o.contextState == streamTerminalFailed && o.deadlineBeforeTerminal {
+		return streamOutcomeDecision{state: streamTerminalFailed, cause: o.contextErr}
+	}
 	if o.providerTerminal {
-		return streamOutcomeDecision{state: o.terminalState}
+		return streamOutcomeDecision{state: o.terminalState, cause: o.terminalCause}
 	}
 	if o.validatedCompleted {
 		return streamOutcomeDecision{state: streamTerminalCompleted}
-	}
-	if o.contextState == streamTerminalFailed {
-		return streamOutcomeDecision{state: streamTerminalFailed, cause: o.contextErr}
 	}
 	if o.transportErr != nil {
 		return streamOutcomeDecision{state: streamTerminalFailed, cause: o.transportErr}

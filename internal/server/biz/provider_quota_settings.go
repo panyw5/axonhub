@@ -15,9 +15,9 @@ var supportedProviderQuotaTypes = []string{
 	"devin",
 	"claudecode", "codex", "antigravity", "github_copilot", "nanogpt", "cline",
 	"xai_subscription",
-	"wafer", "synthetic", "neuralwatt", "apertis", "opencode_go",
+	"synthetic", "neuralwatt", "apertis", "opencode_go",
 	"kimi_code", "minimax", "zhipu", "zai", "charm_hyper", "zenmux", "commandcode",
-	"ollama",
+	"deepseek", "ollama",
 }
 
 var supportedProviderQuotaTypeSet = func() map[string]struct{} {
@@ -65,6 +65,16 @@ func SupportedProviderQuotaTypes() []string {
 	result := make([]string, len(supportedProviderQuotaTypes))
 	copy(result, supportedProviderQuotaTypes)
 	return result
+}
+
+// IsSupportedProviderQuotaType reports whether providerType is a quota
+// collection type the server still supports. A false answer also covers
+// retired types persisted in legacy rows (e.g. 'wafer'); callers that render
+// stored rows (not user input) should treat those as "no status" rather than
+// an error.
+func IsSupportedProviderQuotaType(providerType string) bool {
+	_, ok := supportedProviderQuotaTypeSet[providerType]
+	return ok
 }
 
 func (s *SystemService) ProviderQuotaCollectionSettings(ctx context.Context) (*ProviderQuotaCollectionSettings, error) {
@@ -134,23 +144,7 @@ func (s *SystemService) UpdateProviderQuotaCollectionSettings(
 	if err != nil {
 		return fmt.Errorf("failed to marshal provider quota collection settings: %w", err)
 	}
-	if err := s.setSystemValue(ctx, SystemKeyProviderQuotaCollectionSettings, string(jsonBytes)); err != nil {
-		return err
-	}
-
-	// Publish the exact primary value only after the surrounding transaction
-	// commits. This avoids exposing rolled-back settings while still preventing
-	// a lagging read replica from repopulating the cache with an older value.
-	runAfterCommit(ctx, func(ctx context.Context) {
-		if err := s.Cache.Set(ctx, "system:"+SystemKeyProviderQuotaCollectionSettings, ent.System{
-			Key:   SystemKeyProviderQuotaCollectionSettings,
-			Value: string(jsonBytes),
-		}); err != nil {
-			log.Warn(ctx, "failed to cache provider quota collection settings", log.Cause(err))
-		}
-	})
-
-	return nil
+	return s.setSystemValue(ctx, SystemKeyProviderQuotaCollectionSettings, string(jsonBytes))
 }
 
 func (s *SystemService) IsProviderQuotaCollectionEnabled(ctx context.Context, providerType string) (bool, error) {

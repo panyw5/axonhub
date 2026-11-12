@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"slices"
 	"sort"
 	"strings"
 
@@ -48,8 +49,17 @@ func ModelsRequest(ctx context.Context, tokens oauth.TokenGetter, baseURL string
 	}, nil
 }
 
+// ParseThirdPartyModelCatalog returns only models explicitly listed by a third-party catalog.
+func ParseThirdPartyModelCatalog(body []byte) ([]string, error) {
+	return parseModelCatalog(body, false, false)
+}
+
 // ParseModelCatalog returns only picker-visible models in upstream priority order.
 func ParseModelCatalog(body []byte) ([]string, error) {
+	return parseModelCatalog(body, true, true)
+}
+
+func parseModelCatalog(body []byte, supplementImageModel, requireListVisibility bool) ([]string, error) {
 	var response struct {
 		Models []struct {
 			Slug       string `json:"slug"`
@@ -64,13 +74,31 @@ func ParseModelCatalog(body []byte) ([]string, error) {
 		return response.Models[i].Priority < response.Models[j].Priority
 	})
 	models := make([]string, 0, len(response.Models))
+	imageModelsIncluded := make(map[string]bool, len(codexImageModels))
 	for _, model := range response.Models {
-		if model.Visibility == "list" && strings.TrimSpace(model.Slug) != "" {
+		if (!requireListVisibility || model.Visibility == "list") && strings.TrimSpace(model.Slug) != "" {
+			if isCodexImageModel(model.Slug) {
+				if imageModelsIncluded[model.Slug] {
+					continue
+				}
+				imageModelsIncluded[model.Slug] = true
+			}
 			models = append(models, model.Slug)
 		}
 	}
 	if len(models) == 0 {
 		return nil, fmt.Errorf("Codex catalog has no visible models")
 	}
+	if supplementImageModel {
+		for _, imageModel := range codexImageModels {
+			if !imageModelsIncluded[imageModel] {
+				models = append(models, imageModel)
+			}
+		}
+	}
 	return models, nil
+}
+
+func isCodexImageModel(model string) bool {
+	return slices.Contains(codexImageModels, model)
 }

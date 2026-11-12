@@ -28,6 +28,26 @@ const (
 	RequestTypeDecisions RequestType = "decisions"
 )
 
+// AllRequestTypes returns all declared RequestType values. The caller owns the returned slice.
+func AllRequestTypes() []RequestType {
+	return []RequestType{
+		RequestTypeChat,
+		RequestTypeEmbedding,
+		RequestTypeRerank,
+		RequestTypeImage,
+		RequestTypeVideo,
+		RequestTypeCompact,
+		RequestTypeCompletion,
+		RequestTypeSpeech,
+		RequestTypeTranscription,
+		RequestTypeTranslation,
+		RequestTypeModeration,
+		RequestTypeAlphaSearch,
+		RequestTypeSystemOne,
+		RequestTypeDecisions,
+	}
+}
+
 func (r RequestType) String() string {
 	return string(r)
 }
@@ -38,9 +58,8 @@ const (
 	APIFormatOpenAIChatCompletion APIFormat = "openai/chat_completions"
 	APIFormatOpenAICompletion     APIFormat = "openai/completions"
 	APIFormatOpenAIResponse       APIFormat = "openai/responses"
-	// APIFormatOpenAIResponseWebSocket identifies a downstream Responses
-	// WebSocket request in persisted request/trace metadata. Upstream channel
-	// selection continues to use APIFormatOpenAIResponse with websocket transport.
+	// APIFormatOpenAIResponseWebSocket identifies the Responses WebSocket protocol
+	// for endpoint selection, transformation and persisted request/trace metadata.
 	APIFormatOpenAIResponseWebSocket APIFormat = "openai/responses-ws"
 	APIFormatOpenAIResponseCompact   APIFormat = "openai/responses_compact"
 	APIFormatOpenAIImageGeneration   APIFormat = "openai/image_generation"
@@ -78,6 +97,42 @@ const (
 	// endpoint and is intentionally absent from the configurable format list.
 	APIFormatModelScopeImage APIFormat = "modelscope/image_generation"
 )
+
+// AllAPIFormats returns all declared APIFormat values. The caller owns the returned slice.
+// This includes inbound-only and provider-only formats; it is not a list of
+// formats supported by a particular endpoint or request-body encoding.
+func AllAPIFormats() []APIFormat {
+	return []APIFormat{
+		APIFormatOpenAIChatCompletion,
+		APIFormatOpenAICompletion,
+		APIFormatOpenAIResponse,
+		APIFormatOpenAIResponseWebSocket,
+		APIFormatOpenAIResponseCompact,
+		APIFormatOpenAIImageGeneration,
+		APIFormatOpenAIImageEdit,
+		APIFormatOpenAIImageVariation,
+		APIFormatOpenAIEmbedding,
+		APIFormatOpenAIVideo,
+		APIFormatOpenAISpeech,
+		APIFormatOpenAITranscription,
+		APIFormatOpenAITranslation,
+		APIFormatOpenAIModeration,
+		APIFormatOpenAIAlphaSearch,
+		APIFormatGeminiContents,
+		APIFormatAnthropicMessage,
+		APIFormatAiSDKText,
+		APIFormatAiSDKDataStream,
+		APIFormatGeminiEmbedding,
+		APIFormatJinaRerank,
+		APIFormatJinaEmbedding,
+		APIFormatTypeSafeSystemOne,
+		APIFormatOpenAIDecisions,
+		APIFormatOllamaChat,
+		APIFormatSeedanceVideo,
+		APIFormatZenmuxVideo,
+		APIFormatModelScopeImage,
+	}
+}
 
 func (f APIFormat) String() string {
 	return string(f)

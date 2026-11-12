@@ -1,11 +1,19 @@
 package codex
 
+var codexImageModels = []string{
+	"gpt-image-2",
+	"gpt-image-2.5-sunburst",
+	"gpt-image-2.5-flare",
+	"gpt-image-2.6-sunburst",
+	"gpt-image-2.6-flare",
+}
+
 // DefaultModels returns a static list of Codex-capable model IDs.
 //
 // The ChatGPT Codex backend does not provide a stable public /models endpoint.
 // CLIProxyAPI keeps a local registry; we mirror that approach to power AxonHub "Fetch Models".
 func DefaultModels() []string {
-	return []string{
+	models := []string{
 		"gpt-5.6-sol",
 		"gpt-5.6-terra",
 		"gpt-5.6-luna",
@@ -15,11 +23,10 @@ func DefaultModels() []string {
 		"gpt-6.1-sol",
 		"codex-auto-review",
 	}
+	return append(models, codexImageModels...)
 }
 
 const (
-	defaultImageMainModel = "gpt-6-luna"
-
 	AxonHubOriginator = "axonhub"
 	AuthorizeURL      = "https://auth.openai.com/oauth/authorize"
 	//nolint:gosec // false alert.
@@ -29,6 +36,15 @@ const (
 	Scopes      = "openid profile email offline_access"
 
 	codexDefaultVersion = "0.159.0"
+
+	// codexDefaultUserAgent is the Codex-client-like User-Agent the transformer
+	// presents upstream when it owns the outbound identity (i.e. when the
+	// user-agent pass-through switch is off). It mirrors the Codex CLI
+	// fingerprint style and tracks codexDefaultVersion so the fabricated
+	// identity stays consistent with the Version header. Client UA forwarding
+	// belongs solely to the orchestrator's user-agent pass-through middleware,
+	// which overwrites this value when the switch is enabled.
+	codexDefaultUserAgent = "codex_cli_rs/" + codexDefaultVersion
 
 	// fabricatedBetaFeatures mirrors the X-Codex-Beta-Features value the current
 	// Codex CLI sends, used when a non-Codex inbound client omits the header.

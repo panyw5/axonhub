@@ -1,12 +1,15 @@
 package api
 
 import (
+	"io"
+
 	"github.com/gin-gonic/gin"
 	"go.uber.org/fx"
 
 	"github.com/looplj/axonhub/internal/log"
 	"github.com/looplj/axonhub/internal/server/biz"
 	"github.com/looplj/axonhub/internal/server/orchestrator"
+	"github.com/looplj/axonhub/internal/server/plugin"
 	"github.com/looplj/axonhub/llm/httpclient"
 	"github.com/looplj/axonhub/llm/streams"
 	"github.com/looplj/axonhub/llm/transformer/aisdk"
@@ -28,6 +31,7 @@ type AiSdkHandlersParams struct {
 	LiveStreamRegistry          *biz.LiveStreamRegistry
 	ChannelLimiterManager       *orchestrator.ChannelLimiterManager
 	ProviderQuotaStatusProvider orchestrator.ProviderQuotaStatusProvider
+	PluginManager               *plugin.Manager
 }
 
 type AiSDKHandlers struct {
@@ -51,7 +55,7 @@ func NewAiSDKHandlers(params AiSdkHandlersParams) *AiSDKHandlers {
 				params.LiveStreamRegistry,
 				params.ChannelLimiterManager,
 				params.ProviderQuotaStatusProvider,
-			),
+				orchestratorPlugins(params.PluginManager)),
 			StreamWriter: WriteJSONStream,
 		},
 	}
@@ -65,6 +69,8 @@ func (handlers *AiSDKHandlers) ChatCompletion(c *gin.Context) {
 func WriteJSONStream(c *gin.Context, stream streams.Stream[*httpclient.StreamEvent]) {
 	ctx := c.Request.Context()
 	clientDisconnected := false
+	terminalTracker := orchestrator.NewStreamTerminalTracker(streamExpectedChoices(stream))
+	terminalSeen := false
 
 	defer func() {
 		if clientDisconnected {
@@ -90,9 +96,26 @@ func WriteJSONStream(c *gin.Context, stream streams.Stream[*httpclient.StreamEve
 		default:
 			if stream.Next() {
 				cur := stream.Current()
-				_, _ = c.Writer.Write(cur.Data)
+				if err := writeStreamDelivery(ctx, stream, func() (bool, error) {
+					if n, err := c.Writer.Write(cur.Data); err != nil {
+						return false, err
+					} else if n != len(cur.Data) {
+						return false, io.ErrShortWrite
+					}
+					if err := flushResponseWriter(c.Writer); err != nil {
+						return false, err
+					}
+					terminal := !terminalSeen && terminalTracker.Observe(cur)
+					if terminal {
+						terminalSeen = true
+					}
+					return terminal, nil
+				}); err != nil {
+					clientDisconnected = true
+					log.Warn(ctx, "Failed to write AI SDK stream event", log.Cause(err))
+					return
+				}
 				log.Debug(ctx, "write stream event", log.Any("event", cur))
-				c.Writer.Flush()
 			} else {
 				if err := stream.Err(); err != nil {
 					log.Error(ctx, "Error in stream", log.Cause(err))

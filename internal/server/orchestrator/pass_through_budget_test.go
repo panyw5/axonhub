@@ -30,9 +30,23 @@ func TestPassThroughAnthropicStream_RawBudget(t *testing.T) {
 		data  string
 	}{
 		{name: "filtered event count", count: 1025, data: `{"type":"ping"}`},
-		{name: "filtered event bytes", count: 2, data: `{"type":"ping","padding":"` + strings.Repeat("x", 4*1024*1024) + `"}`},
+		{name: "filtered event bytes", count: 4, data: `{"type":"ping","padding":"` + strings.Repeat("x", 17*1024*1024) + `"}`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			if tc.name == "filtered event bytes" {
+				events := make([]*httpclient.StreamEvent, tc.count)
+				for i := range events {
+					events[i] = &httpclient.StreamEvent{Type: "ping", Data: []byte(tc.data)}
+				}
+				recorder := &rawEventRecorder{source: streams.SliceStream(events)}
+				for range tc.count - 1 {
+					require.True(t, recorder.Next())
+				}
+				require.False(t, recorder.Next())
+				require.ErrorIs(t, recorder.Err(), pipeline.ErrPreCommitBufferExceeded)
+				return
+			}
+
 			// Given: filtered raw pings exceed a pre-attachment budget.
 			events := make([]*httpclient.StreamEvent, 0, tc.count+9)
 			for range tc.count {
@@ -65,28 +79,70 @@ func TestPassThroughAnthropicStream_RawBudget(t *testing.T) {
 	}
 }
 
-func TestRawStreamBacklog_ExactBudgets(t *testing.T) {
-	t.Run("count", func(t *testing.T) {
-		backlog := &rawStreamBacklog{}
+func recordedEvents(count int, event *httpclient.StreamEvent) *rawEventRecorder {
+	events := make([]*httpclient.StreamEvent, count)
+	for i := range events {
+		events[i] = event
+	}
+
+	return &rawEventRecorder{source: streams.SliceStream(events)}
+}
+
+func TestRawEventRecorder_ExactBudgets(t *testing.T) {
+	t.Run("count before attach", func(t *testing.T) {
+		recorder := recordedEvents(1025, &httpclient.StreamEvent{})
 		for range 1024 {
-			held, err := backlog.hold(&httpclient.StreamEvent{})
-			require.NoError(t, err)
-			require.True(t, held)
+			require.True(t, recorder.Next())
 		}
-		_, err := backlog.hold(&httpclient.StreamEvent{})
-		require.ErrorIs(t, err, pipeline.ErrPreCommitBufferExceeded)
-		require.Len(t, backlog.attach(), 1024)
-		held, err := backlog.hold(&httpclient.StreamEvent{})
-		require.NoError(t, err)
-		require.False(t, held)
+		require.False(t, recorder.Next())
+		require.ErrorIs(t, recorder.Err(), pipeline.ErrPreCommitBufferExceeded)
+	})
+	t.Run("count is not bounded after attach", func(t *testing.T) {
+		recorder := recordedEvents(1025, &httpclient.StreamEvent{})
+		for range 1024 {
+			require.True(t, recorder.Next())
+		}
+		require.Len(t, recorder.take(), 1024)
+		require.True(t, recorder.Next())
+		require.NoError(t, recorder.Err())
 	})
 	t.Run("bytes include type and ID", func(t *testing.T) {
-		backlog := &rawStreamBacklog{}
-		_, err := backlog.hold(&httpclient.StreamEvent{Type: "ping", LastEventID: "1", Data: make([]byte, 8*1024*1024-5)})
-		require.NoError(t, err)
-		_, err = backlog.hold(&httpclient.StreamEvent{Data: []byte("x")})
-		require.ErrorIs(t, err, pipeline.ErrPreCommitBufferExceeded)
-		require.Len(t, backlog.attach(), 1)
+		recorder := &rawEventRecorder{source: streams.SliceStream([]*httpclient.StreamEvent{
+			{Type: "ping", LastEventID: "1", Data: make([]byte, 64*1024*1024-5)},
+			{Data: []byte("x")},
+		})}
+		require.True(t, recorder.Next())
+		require.False(t, recorder.Next())
+		require.ErrorIs(t, recorder.Err(), pipeline.ErrPreCommitBufferExceeded)
+		require.Len(t, recorder.take(), 1)
+	})
+}
+
+func TestRawEventRecorder_AttachedBudgets(t *testing.T) {
+	t.Run("single event size", func(t *testing.T) {
+		recorder := recordedEvents(1, &httpclient.StreamEvent{Data: make([]byte, 32*1024*1024+1)})
+		recorder.take()
+		require.False(t, recorder.Next())
+		require.ErrorIs(t, recorder.Err(), pipeline.ErrPreCommitBufferExceeded)
+	})
+	t.Run("retained bytes until taken", func(t *testing.T) {
+		recorder := recordedEvents(5, &httpclient.StreamEvent{Data: make([]byte, 32*1024*1024)})
+		recorder.take()
+		for range 4 {
+			require.True(t, recorder.Next())
+		}
+		require.False(t, recorder.Next())
+		require.ErrorIs(t, recorder.Err(), pipeline.ErrPreCommitBufferExceeded)
+	})
+	t.Run("taking releases bytes", func(t *testing.T) {
+		recorder := recordedEvents(5, &httpclient.StreamEvent{Data: make([]byte, 32*1024*1024)})
+		recorder.take()
+		for range 4 {
+			require.True(t, recorder.Next())
+		}
+		require.Len(t, recorder.take(), 4)
+		require.True(t, recorder.Next())
+		require.NoError(t, recorder.Err())
 	})
 }
 
@@ -200,7 +256,7 @@ func rawBudgetPipeline(t *testing.T, executor pipeline.Executor, endpoint string
 	inbound, outbound := NewPersistentTransformers(state, anthropic.NewInboundTransformer())
 	pipe := pipeline.NewFactory(executor).Pipeline(inbound, outbound,
 		pipeline.WithRetry(0, 1, 0),
-		pipeline.WithMiddlewares(applyPassThroughStream(outbound, nil), applyPassThroughRequestBody(outbound, nil), captureRawProviderStream(outbound, nil)),
+		pipeline.WithMiddlewares(applyPassThroughStream(outbound), applyPassThroughRequestBody(outbound, nil), captureRawProviderStream(outbound)),
 	)
 	return pipe.Process, &httpclient.Request{
 		Method: http.MethodPost, URL: "/v1/messages", ContentType: "application/json",

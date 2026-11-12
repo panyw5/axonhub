@@ -7,18 +7,53 @@ package gql
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
 	"github.com/looplj/axonhub/internal/authz"
 	"github.com/looplj/axonhub/internal/build"
 	"github.com/looplj/axonhub/internal/contexts"
+	"github.com/looplj/axonhub/internal/ent/channel"
 	"github.com/looplj/axonhub/internal/objects"
 	"github.com/looplj/axonhub/internal/scopes"
 	"github.com/looplj/axonhub/internal/server/biz"
 	"github.com/looplj/axonhub/internal/server/gc"
 	"github.com/samber/lo"
 )
+
+// UpdateCodexCompatibilitySettings is the resolver for the updateCodexCompatibilitySettings field.
+func (r *mutationResolver) UpdateCodexCompatibilitySettings(ctx context.Context, input biz.CodexCompatibilitySettings) (bool, error) {
+	if err := r.systemService.SetCodexCompatibilitySettings(ctx, input); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// TestCodexCatalog is the resolver for the testCodexCatalog field.
+func (r *mutationResolver) TestCodexCatalog(ctx context.Context, channelID int) (*CodexCatalogTestResult, error) {
+	if err := authz.RequireScope(ctx, scopes.ScopeWriteSettings); err != nil {
+		return nil, err
+	}
+	if err := authz.RequireScope(ctx, scopes.ScopeReadChannels); err != nil {
+		return nil, err
+	}
+	if _, err := r.client.Channel.Get(ctx, channelID); err != nil {
+		return nil, fmt.Errorf("catalog channel is unavailable or inaccessible")
+	}
+	catalog, err := r.channelService.FetchCodexCatalog(ctx, channelID, "")
+	if err != nil {
+		result := &CodexCatalogTestResult{Error: lo.ToPtr("Codex catalog request failed")}
+		if catalogErr, ok := errors.AsType[*biz.CodexCatalogError](err); ok {
+			result.Error = lo.ToPtr(catalogErr.Message)
+			if catalogErr.UpstreamStatus != 0 {
+				result.UpstreamStatus = lo.ToPtr(catalogErr.UpstreamStatus)
+			}
+		}
+		return result, nil
+	}
+	return &CodexCatalogTestResult{Success: true, ModelCount: catalog.Count()}, nil
+}
 
 // UpdateBrandSettings is the resolver for the updateBrandSettings field.
 func (r *mutationResolver) UpdateBrandSettings(ctx context.Context, input UpdateBrandSettingsInput) (bool, error) {
@@ -247,7 +282,7 @@ func (r *mutationResolver) CheckProviderQuotas(ctx context.Context) (bool, error
 }
 
 // ResetChannelQuotaNow is the resolver for the resetChannelQuotaNow field.
-func (r *mutationResolver) ResetChannelQuotaNow(ctx context.Context, channelID objects.GUID) (bool, error) {
+func (r *mutationResolver) ResetChannelQuotaNow(ctx context.Context, channelID objects.GUID, resetID *string) (bool, error) {
 	if !scopes.UserHasScope(ctx, scopes.ScopeWriteChannels) {
 		return false, fmt.Errorf("permission denied: requires write:channels scope")
 	}
@@ -256,7 +291,7 @@ func (r *mutationResolver) ResetChannelQuotaNow(ctx context.Context, channelID o
 		return false, fmt.Errorf("provider quota service is not available")
 	}
 
-	if err := r.providerQuotaService.ResetChannelQuotaNow(ctx, channelID.ID); err != nil {
+	if err := r.providerQuotaService.ResetChannelQuotaNow(ctx, channelID.ID, lo.FromPtr(resetID)); err != nil {
 		return false, fmt.Errorf("failed to reset channel quota: %w", err)
 	}
 
@@ -346,44 +381,21 @@ func (r *mutationResolver) UpdateCatalogSettings(ctx context.Context, input Upda
 		settings.UpstreamURL = *input.UpstreamURL
 	}
 
-	if input.RefreshSeconds != nil {
-		settings.RefreshSeconds = *input.RefreshSeconds
-	}
-
 	if err := r.systemService.SetCatalogSettings(ctx, settings); err != nil {
 		return false, fmt.Errorf("failed to update catalog settings: %w", err)
 	}
 
 	if r.catalogService != nil {
 		r.catalogService.Invalidate()
-		r.catalogService.Reschedule(ctx, r.scheduler)
 	}
 
 	return true, nil
 }
 
-// RefreshProvidersCatalog is the resolver for the refreshProvidersCatalog field.
-func (r *mutationResolver) RefreshProvidersCatalog(ctx context.Context) (*ProvidersCatalog, error) {
-	if !scopes.UserHasScope(ctx, scopes.ScopeWriteSettings) {
-		return nil, fmt.Errorf("permission denied: requires write_settings scope")
-	}
-
-	if r.catalogService == nil {
-		return nil, fmt.Errorf("catalog service is not configured")
-	}
-
-	snapshot, err := r.catalogService.Refresh(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("failed to refresh providers catalog: %w", err)
-	}
-
-	return providersCatalogFromSnapshot(snapshot), nil
-}
-
 // ClearCache is the resolver for the clearCache field.
 func (r *mutationResolver) ClearCache(ctx context.Context, input ClearCacheInput) (*ClearCachePayload, error) {
 	user, ok := contexts.GetUser(ctx)
-	if !ok || user == nil || !user.IsOwner {
+	if !ok || user == nil || !scopes.IsDirectOwner(ctx) {
 		return nil, ErrNotOwner
 	}
 
@@ -407,6 +419,18 @@ func (r *mutationResolver) ClearCache(ctx context.Context, input ClearCacheInput
 	}, nil
 }
 
+// UpdateClaudeCodeSafeguardsSettings is the resolver for the updateClaudeCodeSafeguardsSettings field.
+func (r *mutationResolver) UpdateClaudeCodeSafeguardsSettings(ctx context.Context, input biz.ClaudeCodeSafeguardsConfig) (bool, error) {
+	err := r.systemService.SetClaudeCodeSafeguardsSettings(ctx, input)
+	return err == nil, err
+}
+
+// ResetClaudeCodeSafeguardsSettings is the resolver for the resetClaudeCodeSafeguardsSettings field.
+func (r *mutationResolver) ResetClaudeCodeSafeguardsSettings(ctx context.Context) (bool, error) {
+	err := r.systemService.ResetClaudeCodeSafeguardsSettings(ctx)
+	return err == nil, err
+}
+
 // Providers is the resolver for the providers field.
 func (r *providerQuotaCollectionSettingsResolver) Providers(ctx context.Context, obj *biz.ProviderQuotaCollectionSettings) ([]*biz.ProviderQuotaCollectionProvider, error) {
 	providers := make([]*biz.ProviderQuotaCollectionProvider, 0, len(obj.Providers))
@@ -418,6 +442,35 @@ func (r *providerQuotaCollectionSettingsResolver) Providers(ctx context.Context,
 	}
 
 	return providers, nil
+}
+
+// CodexCompatibilitySettings is the resolver for the codexCompatibilitySettings field.
+func (r *queryResolver) CodexCompatibilitySettings(ctx context.Context) (*biz.CodexCompatibilitySettings, error) {
+	return r.systemService.CodexCompatibilitySettings(ctx)
+}
+
+// CodexCompatibilityEnabled is the resolver for the codexCompatibilityEnabled field.
+func (r *queryResolver) CodexCompatibilityEnabled(ctx context.Context) (bool, error) {
+	return r.systemService.CodexCompatibilityEnabled(ctx)
+}
+
+// CodexCatalogChannels is the resolver for the codexCatalogChannels field.
+func (r *queryResolver) CodexCatalogChannels(ctx context.Context) ([]*CodexCatalogChannel, error) {
+	if err := authz.RequireScope(ctx, scopes.ScopeReadSettings); err != nil {
+		return nil, err
+	}
+	if err := authz.RequireScope(ctx, scopes.ScopeReadChannels); err != nil {
+		return nil, err
+	}
+	channels, err := r.client.Channel.Query().Where(channel.TypeEQ(channel.TypeCodex)).All(ctx)
+	if err != nil {
+		return nil, err
+	}
+	result := make([]*CodexCatalogChannel, 0, len(channels))
+	for _, source := range channels {
+		result = append(result, &CodexCatalogChannel{ID: source.ID, Name: source.Name, Status: source.Status})
+	}
+	return result, nil
 }
 
 // PreviewGcCleanup is the resolver for the previewGcCleanup field.
@@ -513,21 +566,38 @@ func (r *queryResolver) BrandSettings(ctx context.Context) (*BrandSettings, erro
 
 // StoragePolicy is the resolver for the storagePolicy field.
 func (r *queryResolver) StoragePolicy(ctx context.Context) (*biz.StoragePolicy, error) {
+	if err := authz.RequireScope(ctx, scopes.ScopeReadSettings); err != nil {
+		return nil, err
+	}
+
 	return r.systemService.StoragePolicy(ctx)
 }
 
 // RetryPolicy is the resolver for the retryPolicy field.
 func (r *queryResolver) RetryPolicy(ctx context.Context) (*biz.RetryPolicy, error) {
+	// The channel availability dialog shows the global auto-disable rules to channel editors.
+	if !authz.HasScope(ctx, scopes.ScopeReadSettings) && !authz.HasScope(ctx, scopes.ScopeWriteChannels) {
+		return nil, authz.RequireScope(ctx, scopes.ScopeReadSettings)
+	}
+
 	return r.systemService.RetryPolicy(ctx)
 }
 
 // WebhookNotifierConfig is the resolver for the webhookNotifierConfig field.
 func (r *queryResolver) WebhookNotifierConfig(ctx context.Context) (*biz.WebhookNotifierConfig, error) {
+	if err := authz.RequireScope(ctx, scopes.ScopeReadSettings); err != nil {
+		return nil, err
+	}
+
 	return r.systemService.WebhookNotifierConfig(ctx)
 }
 
 // SystemModelSettings is the resolver for the systemModelSettings field.
 func (r *queryResolver) SystemModelSettings(ctx context.Context) (*biz.SystemModelSettings, error) {
+	if err := authz.RequireScope(ctx, scopes.ScopeReadSettings); err != nil {
+		return nil, err
+	}
+
 	settings, err := r.systemService.ModelSettings(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get system model settings: %w", err)
@@ -538,6 +608,10 @@ func (r *queryResolver) SystemModelSettings(ctx context.Context) (*biz.SystemMod
 
 // DefaultDataStorageID is the resolver for the defaultDataStorageID field.
 func (r *queryResolver) DefaultDataStorageID(ctx context.Context) (*objects.GUID, error) {
+	if err := authz.RequireScope(ctx, scopes.ScopeReadSettings); err != nil {
+		return nil, err
+	}
+
 	id, err := r.systemService.DefaultDataStorageID(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get default data storage ID: %w", err)
@@ -608,6 +682,10 @@ func (r *queryResolver) CheckForUpdate(ctx context.Context, includeBeta bool) (*
 
 // SystemChannelSettings is the resolver for the systemChannelSettings field.
 func (r *queryResolver) SystemChannelSettings(ctx context.Context) (*biz.SystemChannelSettings, error) {
+	if err := authz.RequireScope(ctx, scopes.ScopeReadSettings); err != nil {
+		return nil, err
+	}
+
 	setting, err := r.systemService.ChannelSetting(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get channel setting: %w", err)
@@ -618,31 +696,55 @@ func (r *queryResolver) SystemChannelSettings(ctx context.Context) (*biz.SystemC
 
 // SystemGeneralSettings is the resolver for the systemGeneralSettings field.
 func (r *queryResolver) SystemGeneralSettings(ctx context.Context) (*biz.SystemGeneralSettings, error) {
+	if err := authz.RequireScope(ctx, scopes.ScopeReadSettings); err != nil {
+		return nil, err
+	}
+
 	return r.systemService.GeneralSettings(ctx)
 }
 
 // VideoStorageSettings is the resolver for the videoStorageSettings field.
 func (r *queryResolver) VideoStorageSettings(ctx context.Context) (*biz.VideoStorageSettings, error) {
+	if err := authz.RequireScope(ctx, scopes.ScopeReadSettings); err != nil {
+		return nil, err
+	}
+
 	return r.systemService.VideoStorageSettings(ctx)
 }
 
 // QuotaRoutingSettings is the resolver for the quotaRoutingSettings field.
 func (r *queryResolver) QuotaRoutingSettings(ctx context.Context) (*biz.QuotaRoutingSettings, error) {
+	if err := authz.RequireScope(ctx, scopes.ScopeReadSettings); err != nil {
+		return nil, err
+	}
+
 	return r.systemService.QuotaRoutingSettings(ctx)
 }
 
 // ProviderQuotaCollectionSettings is the resolver for the providerQuotaCollectionSettings field.
 func (r *queryResolver) ProviderQuotaCollectionSettings(ctx context.Context) (*biz.ProviderQuotaCollectionSettings, error) {
+	if err := authz.RequireScope(ctx, scopes.ScopeReadSettings); err != nil {
+		return nil, err
+	}
+
 	return r.systemService.ProviderQuotaCollectionSettings(ctx)
 }
 
 // SecuritySettings is the resolver for the securitySettings field.
 func (r *queryResolver) SecuritySettings(ctx context.Context) (*biz.SecuritySettings, error) {
+	if err := authz.RequireScope(ctx, scopes.ScopeReadSettings); err != nil {
+		return nil, err
+	}
+
 	return r.systemService.SecuritySettings(ctx)
 }
 
 // ProxyPresets is the resolver for the proxyPresets field.
 func (r *queryResolver) ProxyPresets(ctx context.Context) ([]*biz.ProxyPreset, error) {
+	if err := authz.RequireScope(ctx, scopes.ScopeReadSettings); err != nil {
+		return nil, err
+	}
+
 	presets, err := r.systemService.ProxyPresets(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get proxy presets: %w", err)
@@ -653,6 +755,10 @@ func (r *queryResolver) ProxyPresets(ctx context.Context) ([]*biz.ProxyPreset, e
 
 // UserAgentPassThroughSettings is the resolver for the userAgentPassThroughSettings field.
 func (r *queryResolver) UserAgentPassThroughSettings(ctx context.Context) (*UserAgentPassThroughSettings, error) {
+	if err := authz.RequireScope(ctx, scopes.ScopeReadSettings); err != nil {
+		return nil, err
+	}
+
 	enabled, err := r.systemService.UserAgentPassThrough(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get user-agent pass-through settings: %w", err)
@@ -665,6 +771,10 @@ func (r *queryResolver) UserAgentPassThroughSettings(ctx context.Context) (*User
 
 // PassThroughSettings is the resolver for the passThroughSettings field.
 func (r *queryResolver) PassThroughSettings(ctx context.Context) (*PassThroughSettings, error) {
+	if err := authz.RequireScope(ctx, scopes.ScopeReadSettings); err != nil {
+		return nil, err
+	}
+
 	enabled, err := r.systemService.PassThrough(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get pass-through settings: %w", err)
@@ -677,6 +787,10 @@ func (r *queryResolver) PassThroughSettings(ctx context.Context) (*PassThroughSe
 
 // UsageCostInjectionSettings is the resolver for the usageCostInjectionSettings field.
 func (r *queryResolver) UsageCostInjectionSettings(ctx context.Context) (*UsageCostInjectionSettings, error) {
+	if err := authz.RequireScope(ctx, scopes.ScopeReadSettings); err != nil {
+		return nil, err
+	}
+
 	enabled, err := r.systemService.InjectUsageCostEnabled(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get usage cost injection settings: %w", err)
@@ -690,7 +804,7 @@ func (r *queryResolver) UsageCostInjectionSettings(ctx context.Context) (*UsageC
 // GetCacheDiagnostics is the resolver for the getCacheDiagnostics field.
 func (r *queryResolver) GetCacheDiagnostics(ctx context.Context, input *GetCacheDiagnosticsInput) (*GetCacheDiagnosticsPayload, error) {
 	user, ok := contexts.GetUser(ctx)
-	if !ok || user == nil || !user.IsOwner {
+	if !ok || user == nil || !scopes.IsDirectOwner(ctx) {
 		return nil, ErrNotOwner
 	}
 
@@ -723,6 +837,11 @@ func (r *queryResolver) GetCacheDiagnostics(ctx context.Context, input *GetCache
 		Content:  content,
 		Targets:  normalizeDiagnosticsTargets(targets),
 	}, nil
+}
+
+// ClaudeCodeSafeguardsSettings is the resolver for the claudeCodeSafeguardsSettings field.
+func (r *queryResolver) ClaudeCodeSafeguardsSettings(ctx context.Context) (*biz.ClaudeCodeSafeguardsSettings, error) {
+	return r.systemService.ClaudeCodeSafeguardsSettings(ctx)
 }
 
 // ProviderQuotaCollectionSettings returns ProviderQuotaCollectionSettingsResolver implementation.

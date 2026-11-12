@@ -150,6 +150,9 @@ func TestChatCompletionOrchestrator_Process_Streaming_PreservesGeminiGroundingAn
 		chunks = append(chunks, result.ChatCompletionStream.Current())
 	}
 	require.NoError(t, result.ChatCompletionStream.Err())
+	if acknowledger, ok := result.ChatCompletionStream.(streams.DeliveryAcknowledger); ok {
+		acknowledger.AcknowledgeDelivery()
+	}
 	require.NoError(t, result.ChatCompletionStream.Close())
 	assert.NotEmpty(t, chunks)
 
@@ -211,6 +214,9 @@ func TestChatCompletionOrchestrator_Process_Streaming_PreservesGeminiGroundingAn
 	for _, rawChunk := range requests[0].ResponseChunks {
 		err := json.Unmarshal(rawChunk, &persistedChunk)
 		require.NoError(t, err)
+		if string(persistedChunk.Data) == "[DONE]" {
+			continue
+		}
 
 		var streamResp openai.Response
 		err = json.Unmarshal(persistedChunk.Data, &streamResp)
@@ -315,6 +321,9 @@ func TestChatCompletionOrchestrator_Process_Streaming_PreservesAnthropicCitation
 		chunks = append(chunks, result.ChatCompletionStream.Current())
 	}
 	require.NoError(t, result.ChatCompletionStream.Err())
+	if acknowledger, ok := result.ChatCompletionStream.(streams.DeliveryAcknowledger); ok {
+		acknowledger.AcknowledgeDelivery()
+	}
 	require.NoError(t, result.ChatCompletionStream.Close())
 
 	require.NotEmpty(t, chunks)
@@ -368,6 +377,9 @@ func TestChatCompletionOrchestrator_Process_Streaming_PreservesAnthropicCitation
 	for _, rawChunk := range requests[0].ResponseChunks {
 		err := json.Unmarshal(rawChunk, &persistedChunk)
 		require.NoError(t, err)
+		if string(persistedChunk.Data) == "[DONE]" {
+			continue
+		}
 
 		var streamResp openai.Response
 		err = json.Unmarshal(persistedChunk.Data, &streamResp)
@@ -425,7 +437,8 @@ func TestChatCompletionOrchestrator_Process_Streaming(t *testing.T) {
 	}
 
 	executor := &mockExecutor{
-		streamEvents: streamEvents,
+		streamEvents:  streamEvents,
+		streamHeaders: http.Header{"X-Upstream-Id": {"up-1"}, "Authorization": {"Bearer secret"}},
 	}
 
 	// Create outbound transformer
@@ -470,6 +483,11 @@ func TestChatCompletionOrchestrator_Process_Streaming(t *testing.T) {
 	assert.Nil(t, result.ChatCompletion)
 	assert.NotNil(t, result.ChatCompletionStream)
 
+	// Headers and the selected channel stay in memory until the terminal updates.
+	inFlightExecution := client.RequestExecution.Query().OnlyX(ctx)
+	assert.Empty(t, inFlightExecution.ResponseHeaders)
+	assert.Zero(t, client.Request.Query().OnlyX(ctx).ChannelID)
+
 	// Consume the stream
 	var chunks []*httpclient.StreamEvent
 	for result.ChatCompletionStream.Next() {
@@ -490,6 +508,8 @@ func TestChatCompletionOrchestrator_Process_Streaming(t *testing.T) {
 	dbRequest := requests[0]
 	assert.Equal(t, "gpt-4", dbRequest.ModelID)
 	assert.Equal(t, project.ID, dbRequest.ProjectID)
+	assert.Equal(t, ch.ID, dbRequest.ChannelID)
+	assert.JSONEq(t, `{"X-Upstream-Id":["up-1"],"Authorization":["******"]}`, string(dbRequest.ResponseHeaders))
 
 	// Verify request execution was created
 	executions, err := client.RequestExecution.Query().All(ctx)
@@ -499,6 +519,7 @@ func TestChatCompletionOrchestrator_Process_Streaming(t *testing.T) {
 	dbExec := executions[0]
 	assert.Equal(t, ch.ID, dbExec.ChannelID)
 	assert.Equal(t, dbRequest.ID, dbExec.RequestID)
+	assert.JSONEq(t, `{"X-Upstream-Id":["up-1"],"Authorization":["******"]}`, string(dbExec.ResponseHeaders))
 }
 
 // TestChatCompletionOrchestrator_Process_StreamingError tests that mid-stream errors
@@ -669,6 +690,9 @@ func TestChatCompletionOrchestrator_Process_StreamingSuccess_NotMarkedAsError(t 
 	}
 
 	require.NoError(t, result.ChatCompletionStream.Err())
+	if acknowledger, ok := result.ChatCompletionStream.(streams.DeliveryAcknowledger); ok {
+		acknowledger.AcknowledgeDelivery()
+	}
 
 	err = result.ChatCompletionStream.Close()
 	require.NoError(t, err)

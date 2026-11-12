@@ -6,6 +6,8 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
+
+	"github.com/looplj/axonhub/llm/httpclient"
 )
 
 func TestStreamOutcomeFinalState(t *testing.T) {
@@ -72,6 +74,22 @@ func TestStreamOutcomeFinalState(t *testing.T) {
 	}
 }
 
+func TestStreamOutcomeDeadlineOrdering(t *testing.T) {
+	t.Run("deadline before terminal remains failed", func(t *testing.T) {
+		outcome := streamOutcome{}
+		outcome.observeContextError(context.DeadlineExceeded)
+		outcome.observeTerminal(streamTerminalCompleted)
+		require.Equal(t, streamTerminalFailed, outcome.finalState())
+	})
+
+	t.Run("terminal before deadline remains completed", func(t *testing.T) {
+		outcome := streamOutcome{}
+		outcome.observeTerminal(streamTerminalCompleted)
+		outcome.observeContextError(context.DeadlineExceeded)
+		require.Equal(t, streamTerminalCompleted, outcome.finalState())
+	})
+}
+
 func TestStreamOutcomeFinalDecisionSelectsCause(t *testing.T) {
 	transportErr := errors.New("unexpected EOF")
 
@@ -136,4 +154,21 @@ func TestStreamOutcomeFinalDecisionSelectsCause(t *testing.T) {
 			require.ErrorIs(t, decision.cause, tt.wantCause)
 		})
 	}
+}
+
+func TestStreamOutcomePreservesTerminalCause(t *testing.T) {
+	outcome := streamOutcome{}
+	outcome.observeTerminalEvent(streamTerminalFailed, &httpclient.StreamEvent{
+		Data: []byte(`{"response":{"error":{"message":"provider failed"}}}`),
+	})
+	outcome.observeTransportError(errors.New("late transport error"))
+	outcome.observeContextError(context.Canceled)
+	outcome.observeTerminal(streamTerminalCompleted)
+	decision := outcome.deliveryDecision()
+	require.Equal(t, streamTerminalFailed, decision.state)
+	require.EqualError(t, decision.cause, "provider failed")
+
+	outcome = streamOutcome{}
+	outcome.observeTerminal(streamTerminalIncomplete)
+	require.EqualError(t, outcome.deliveryDecision().cause, string(streamTerminalIncomplete))
 }

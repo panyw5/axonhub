@@ -11,19 +11,6 @@ import (
 	"github.com/looplj/axonhub/internal/server/biz/provider_quota"
 )
 
-func TestGetProviderType_OpenaiWithWaferURL(t *testing.T) {
-	svc := &ProviderQuotaService{
-		checkers: make(map[string]provider_quota.QuotaChecker),
-	}
-
-	ch := &ent.Channel{
-		Type:    channel.TypeOpenai,
-		BaseURL: "https://pass.wafer.ai",
-	}
-	result := svc.getProviderType(ch)
-	require.Equal(t, "wafer", result)
-}
-
 func TestGetProviderType_OpenaiWithUnknownURL(t *testing.T) {
 	svc := &ProviderQuotaService{
 		checkers: make(map[string]provider_quota.QuotaChecker),
@@ -57,6 +44,8 @@ func TestGetProviderType_ExistingTypesPreserved(t *testing.T) {
 		{"zhipu_anthropic", channel.TypeZhipuAnthropic, "zhipu"},
 		{"zai", channel.TypeZai, "zai"},
 		{"zai_anthropic", channel.TypeZaiAnthropic, "zai"},
+		{"deepseek", channel.TypeDeepseek, "deepseek"},
+		{"deepseek_anthropic", channel.TypeDeepseekAnthropic, "deepseek"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -93,6 +82,19 @@ func TestGetProviderType_OpenaiWithNeuralWattURL(t *testing.T) {
 	require.Equal(t, "neuralwatt", result)
 }
 
+func TestGetProviderType_OpenaiWithDeepSeekURL(t *testing.T) {
+	svc := &ProviderQuotaService{
+		checkers: make(map[string]provider_quota.QuotaChecker),
+	}
+
+	ch := &ent.Channel{
+		Type:    channel.TypeOpenai,
+		BaseURL: "https://api.deepseek.com/v1",
+	}
+	result := svc.getProviderType(ch)
+	require.Equal(t, "deepseek", result)
+}
+
 func TestGetProviderType_OpenaiWithEmptyURL(t *testing.T) {
 	svc := &ProviderQuotaService{
 		checkers: make(map[string]provider_quota.QuotaChecker),
@@ -106,10 +108,10 @@ func TestGetProviderType_OpenaiWithEmptyURL(t *testing.T) {
 	require.Equal(t, "", result)
 }
 
-func TestHasCredentialsForProvider_WaferAPIKey(t *testing.T) {
+func TestHasCredentialsForProvider_SyntheticAPIKey(t *testing.T) {
 	ch := &ent.Channel{
 		Type:    channel.TypeOpenai,
-		BaseURL: "https://wafer.ai",
+		BaseURL: "https://api.synthetic.new",
 		Credentials: objects.ChannelCredentials{
 			APIKey: "sk-test",
 		},
@@ -117,19 +119,19 @@ func TestHasCredentialsForProvider_WaferAPIKey(t *testing.T) {
 	require.True(t, hasCredentialsForProvider(ch))
 }
 
-func TestHasCredentialsForProvider_WaferNoKey(t *testing.T) {
+func TestHasCredentialsForProvider_SyntheticNoKey(t *testing.T) {
 	ch := &ent.Channel{
 		Type:        channel.TypeOpenai,
-		BaseURL:     "https://wafer.ai",
+		BaseURL:     "https://api.synthetic.new",
 		Credentials: objects.ChannelCredentials{},
 	}
 	require.False(t, hasCredentialsForProvider(ch))
 }
 
-func TestHasCredentialsForProvider_WaferOAuthIgnored(t *testing.T) {
+func TestHasCredentialsForProvider_SyntheticOAuthIgnored(t *testing.T) {
 	ch := &ent.Channel{
 		Type:    channel.TypeOpenai,
-		BaseURL: "https://wafer.ai",
+		BaseURL: "https://api.synthetic.new",
 		Credentials: objects.ChannelCredentials{
 			OAuth: &objects.OAuthCredentials{AccessToken: "token"},
 		},
@@ -226,19 +228,6 @@ func TestHasCredentialsForProvider_ClaudeCodeWithPlainAPIKey(t *testing.T) {
 	require.False(t, hasCredentialsForProvider(ch))
 }
 
-func TestGetProviderType_OpenaiWithWaferURLPort(t *testing.T) {
-	svc := &ProviderQuotaService{
-		checkers: make(map[string]provider_quota.QuotaChecker),
-	}
-
-	ch := &ent.Channel{
-		Type:    channel.TypeOpenai,
-		BaseURL: "https://pass.wafer.ai:443",
-	}
-	result := svc.getProviderType(ch)
-	require.Equal(t, "wafer", result)
-}
-
 func TestGetProviderType_OpenaiWithSyntheticURLPort(t *testing.T) {
 	svc := &ProviderQuotaService{
 		checkers: make(map[string]provider_quota.QuotaChecker),
@@ -272,7 +261,7 @@ func TestGetProviderType_OpenaiWithFalsePositiveURL(t *testing.T) {
 
 	ch := &ent.Channel{
 		Type:    channel.TypeOpenai,
-		BaseURL: "https://evilwafer.ai",
+		BaseURL: "https://fakeapi.synthetic.new",
 	}
 	result := svc.getProviderType(ch)
 	require.Equal(t, "", result)

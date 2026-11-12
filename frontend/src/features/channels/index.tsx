@@ -21,7 +21,6 @@ import {
   useChannelProbeData,
   type ChannelListColumnVisibility,
 } from './data/channels';
-import { useProvidersData } from '@/features/models/data/providers';
 import { useQuotaRoutingSettings } from '@/features/system/data/system';
 import { useQueryClient } from '@tanstack/react-query';
 import { useAuthStore } from '@/stores/authStore';
@@ -30,7 +29,6 @@ const ChannelsDialogs = lazy(() => import('./components/channels-dialogs').then(
 
 function ChannelsContent() {
   const { t } = useTranslation();
-  useProvidersData();
   const { channelPermissions, hasSystemScope } = usePermissions();
   const { data: quotaRoutingSettings } = useQuotaRoutingSettings();
   const queryClient = useQueryClient();
@@ -332,7 +330,7 @@ export default function ChannelsManagement() {
     <ChannelsProvider>
       <PageHeader title={t('channels.title')} description={t('channels.description')} actions={<ChannelsPrimaryButtons />} actionLayout='scroll' />
 
-      <Main fixed>
+      <Main fixed className='py-2 sm:py-6 [--page-body-min-height:34rem]'>
         <ChannelsContent />
       </Main>
       <Suspense fallback={null}>

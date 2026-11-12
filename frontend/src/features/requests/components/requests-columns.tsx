@@ -2,12 +2,20 @@
 
 import { format } from 'date-fns';
 import { ColumnDef } from '@tanstack/react-table';
-import { IconAlertTriangle, IconArrowsExchange, IconArrowsJoin2, IconCheck, IconQuestionMark, IconRoute } from '@tabler/icons-react';
-import { Ban, FileText } from 'lucide-react';
+import {
+  IconAlertTriangle,
+  IconArrowsExchange,
+  IconArrowsJoin2,
+  IconCheck,
+  IconCoin,
+  IconQuestionMark,
+  IconRoute,
+} from '@tabler/icons-react';
 import { zhCN, enUS } from 'date-fns/locale';
+import { Ban, FileText } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { toast } from 'sonner';
-import { extractNumberID, formatUserName } from '@/lib/utils';
+import { cn, extractNumberID, formatUserName } from '@/lib/utils';
 import { formatDuration } from '@/utils/format-duration';
 import { usePaginationSearch } from '@/hooks/use-pagination-search';
 import { usePermissions } from '@/hooks/usePermissions';
@@ -18,8 +26,15 @@ import { DataTableColumnHeader } from '@/components/data-table-column-header';
 import { useGeneralSettings, useSecuritySettings, useUpdateSecuritySettings } from '@/features/system/data/system';
 import { useRequestPermissions } from '../../../hooks/useRequestPermissions';
 import { Request } from '../data/schema';
-import { calculateTokensPerSecond, getTokensPerSecondValue } from '../utils/tokens-per-second';
+import { type MetricColorKey, metricColorTextClass } from '../utils/metric-colors';
+import {
+  calculateTokensPerSecond,
+  calculateTotalTimeTokensPerSecond,
+  getTokensPerSecondValue,
+  getTotalTimeTokensPerSecondValue,
+} from '../utils/tokens-per-second';
 import { getRequestModelAuditTooltip, getUpstreamModelAudit } from '../utils/upstream-model-audit';
+import { useMetricColorSettings } from '../utils/use-metric-colors';
 import { getStatusColor } from './help';
 
 interface UseRequestsColumnsOptions {
@@ -43,8 +58,37 @@ export const DEFAULT_MOBILE_HIDDEN_COLUMN_IDS = [
 
 export const MODEL_ID_COLUMN = 'modelID' as const;
 
+// Cache-rate display for the tokens column. The input line carries the cache
+// hit rate and the output line carries the reasoning count, so each metric
+// sits on the line of the tokens it qualifies; each renders only when its own
+// tokens are non-zero, and the rate is the cached share of the prompt (0
+// without prompt tokens). Top-level so tests can execute the display logic
+// without React.
+export interface TokensColumnCacheDisplay {
+  showReasoning: boolean;
+  showCacheRate: boolean;
+  cacheRate: string;
+}
+
+export function tokensColumnCacheDisplay(promptTokens: number, cachedTokens: number, reasoningTokens: number): TokensColumnCacheDisplay {
+  return {
+    showReasoning: reasoningTokens > 0,
+    showCacheRate: cachedTokens > 0,
+    cacheRate: (promptTokens > 0 ? (cachedTokens / promptTokens) * 100 : 0).toFixed(1),
+  };
+}
+
 export function useRequestsColumns(options?: UseRequestsColumnsOptions): ColumnDef<Request>[] {
   const { t, i18n } = useTranslation();
+  const metricColors = useMetricColorSettings();
+  // Colour class for a metric value. `base` keeps the caller's own classes
+  // (font weight / mono) while the tier only contributes the tone, so a
+  // switched-off metric or the neutral tier keeps the default look.
+  const metricTone = (key: MetricColorKey, value: number | null | undefined, base?: string) => {
+    const tone = metricColorTextClass(metricColors, key, value);
+
+    return base ? cn(base, tone) : tone;
+  };
   const locale = i18n.language === 'zh' ? zhCN : enUS;
   const permissions = useRequestPermissions();
   const { hasSystemScope } = usePermissions();
@@ -242,7 +286,9 @@ export function useRequestsColumns(options?: UseRequestsColumnsOptions): ColumnD
                     <IconRoute className='h-3.5 w-3.5' />
                   </span>
                 </TooltipTrigger>
-                <TooltipContent>{t(passThroughApplied ? 'requests.tooltips.passThroughApplied' : 'requests.tooltips.passThroughNotApplied')}</TooltipContent>
+                <TooltipContent>
+                  {t(passThroughApplied ? 'requests.tooltips.passThroughApplied' : 'requests.tooltips.passThroughNotApplied')}
+                </TooltipContent>
               </Tooltip>
               <Tooltip>
                 <TooltipTrigger asChild>
@@ -485,6 +531,11 @@ export function useRequestsColumns(options?: UseRequestsColumnsOptions): ColumnD
         const completionTokens = usageLog.completionTokens || 0;
         const reasoningTokens = usageLog.completionReasoningTokens || 0;
         const totalTokens = promptTokens + completionTokens;
+        const cachedTokens = usageLog.promptCachedTokens || 0;
+        const cacheDisplay = tokensColumnCacheDisplay(promptTokens, cachedTokens, reasoningTokens);
+        // Colour from the unrounded share so this column and read-cache agree;
+        // the label keeps rendering the rounded string above.
+        const cacheRateValue = promptTokens > 0 ? (cachedTokens / promptTokens) * 100 : 0;
 
         return (
           <div className='space-y-0.5 text-xs'>
@@ -493,14 +544,25 @@ export function useRequestsColumns(options?: UseRequestsColumnsOptions): ColumnD
               {(totalTokens || 0).toLocaleString()}
             </div>
             <div className='text-muted-foreground'>
-              {t('requests.columns.input')}: {promptTokens.toLocaleString()} | {t('requests.columns.output')}:{' '}
-              {completionTokens.toLocaleString()}
+              {t('requests.columns.input')}: {promptTokens.toLocaleString()}
+              {cacheDisplay.showCacheRate && (
+                <>
+                  {' | '}
+                  <span className={metricTone('cacheHitRate', cacheRateValue, 'font-medium')}>
+                    {t('requests.columns.cacheRate', { rate: cacheDisplay.cacheRate })}
+                  </span>
+                </>
+              )}
             </div>
-            {reasoningTokens > 0 && (
-              <div className='text-muted-foreground'>
-                {t('requests.columns.reasoning')}: {reasoningTokens.toLocaleString()}
-              </div>
-            )}
+            <div className='text-muted-foreground'>
+              {t('requests.columns.output')}: {completionTokens.toLocaleString()}
+              {cacheDisplay.showReasoning && (
+                <>
+                  {' | '}
+                  {t('requests.columns.reasoning')}: {reasoningTokens.toLocaleString()}
+                </>
+              )}
+            </div>
           </div>
         );
       },
@@ -535,12 +597,14 @@ export function useRequestsColumns(options?: UseRequestsColumnsOptions): ColumnD
         }
 
         const hitRate = promptTokens > 0 ? (cachedTokens / promptTokens) * 100 : 0;
-        const isLowHitRate = hitRate < 80 && promptTokens >= 40000;
+        // Same unrounded share as the tokens column, so one row never shows two
+        // different colours for the same rate.
+        const hitRateColor = metricTone('cacheHitRate', hitRate, 'font-medium');
 
         return (
           <div className='text-xs'>
             <div className='text-sm font-medium'>{cachedTokens.toLocaleString()}</div>
-            <div className={isLowHitRate ? 'font-medium text-red-600 dark:text-red-400' : 'text-muted-foreground'}>
+            <div className={hitRateColor}>
               {t('requests.columns.cacheHitRate', {
                 rate: hitRate.toFixed(1),
               })}
@@ -600,17 +664,35 @@ export function useRequestsColumns(options?: UseRequestsColumnsOptions): ColumnD
       enableSorting: false,
       enableHiding: true,
       cell: ({ row }) => {
-        const cost = row.original.usageLogs?.edges?.[0]?.node?.totalCost;
+        const usageLog = row.original.usageLogs?.edges?.[0]?.node;
+        const cost = usageLog?.totalCost;
         if (cost == null) return <span className='font-mono text-xs'>-</span>;
 
+        const isModelLibraryPrice = (usageLog?.costPriceReferenceID ?? '').startsWith('model_library:');
+
         return (
-          <span className='font-mono text-xs font-medium'>
+          <span className='inline-flex items-center gap-1 font-mono text-xs font-medium'>
             {t('currencies.format', {
               val: cost,
               currency: settings?.currencyCode ?? 'USD',
               locale: i18n.language === 'zh' ? 'zh-CN' : 'en-US',
               minimumFractionDigits: 6,
             })}
+            {isModelLibraryPrice && (
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <span
+                    className='inline-flex h-3.5 w-3.5 items-center justify-center text-amber-600 dark:text-amber-400'
+                    tabIndex={0}
+                    role='img'
+                    aria-label={t('usageLogs.modelLibraryPriceHint')}
+                  >
+                    <IconCoin className='h-3.5 w-3.5' />
+                  </span>
+                </TooltipTrigger>
+                <TooltipContent>{t('usageLogs.modelLibraryPriceHint')}</TooltipContent>
+              </Tooltip>
+            )}
           </span>
         );
       },
@@ -628,13 +710,25 @@ export function useRequestsColumns(options?: UseRequestsColumnsOptions): ColumnD
         }
 
         if (!request.stream) {
-          return <span className='font-mono text-xs'>{t('requests.duration.total', { duration: formatDuration(request.metricsLatencyMs) })}</span>;
+          return (
+            <span className='font-mono text-xs'>
+              {t('requests.duration.total', { duration: formatDuration(request.metricsLatencyMs) })}
+            </span>
+          );
         }
+
+        const firstTokenColor = metricTone('firstTokenLatency', (request.metricsFirstTokenLatencyMs ?? 0) / 1000);
 
         return (
           <div className='min-w-[128px] font-mono text-xs'>
-            {request.metricsFirstTokenLatencyMs != null && <div>{t('requests.duration.firstToken', { duration: formatDuration(request.metricsFirstTokenLatencyMs) })}</div>}
-            <div className='text-muted-foreground'>{t('requests.duration.total', { duration: formatDuration(request.metricsLatencyMs) })}</div>
+            {request.metricsFirstTokenLatencyMs != null && (
+              <div className={firstTokenColor}>
+                {t('requests.duration.firstToken', { duration: formatDuration(request.metricsFirstTokenLatencyMs) })}
+              </div>
+            )}
+            <div className='text-muted-foreground'>
+              {t('requests.duration.total', { duration: formatDuration(request.metricsLatencyMs) })}
+            </div>
           </div>
         );
       },
@@ -646,7 +740,29 @@ export function useRequestsColumns(options?: UseRequestsColumnsOptions): ColumnD
       header: ({ column }) => <DataTableColumnHeader column={column} title={t('requests.columns.tokensPerSecond')} />,
       enableSorting: true,
       enableHiding: true,
-      cell: ({ row }) => <span className='font-mono text-xs'>{calculateTokensPerSecond(row.original)}</span>,
+      cell: ({ row }) => {
+        const tps = getTokensPerSecondValue(row.original);
+        // Missing data renders "-" — keep it uncoloured instead of reading as red.
+        // Rates above 500 are measurement artifacts (tiny effective latency from
+        // TTFT subtraction can inflate the rate) — also uncoloured.
+        const tpsColor = tps !== null && tps > 500 ? '' : metricTone('throughput', tps, 'font-mono text-xs');
+        const totalTpsValue = getTotalTimeTokensPerSecondValue(row.original);
+        const totalTps = calculateTotalTimeTokensPerSecond(row.original);
+        // The total rate keeps the muted tone when the metric is off or neutral, and
+        // stays uncoloured above the same 500 tok/s artefact threshold as the
+        // generation-rate line above.
+        const totalTpsColor =
+          totalTpsValue !== null && totalTpsValue > 500
+            ? ''
+            : metricTone('throughputIncludingFirstToken', totalTpsValue) || 'text-muted-foreground';
+
+        return (
+          <div className='font-mono text-xs'>
+            <div className={tpsColor}>{calculateTokensPerSecond(row.original)}</div>
+            {totalTps !== '-' && <div className={totalTpsColor}>{t('requests.columns.tokensPerSecondTotal', { value: totalTps })}</div>}
+          </div>
+        );
+      },
       sortingFn: (rowA, rowB) => (getTokensPerSecondValue(rowA.original) ?? 0) - (getTokensPerSecondValue(rowB.original) ?? 0),
     },
     {
@@ -678,9 +794,7 @@ export function useRequestsColumns(options?: UseRequestsColumnsOptions): ColumnD
       enableSorting: true,
       enableHiding: true,
       cell: ({ row }) => (
-        <span className='text-xs whitespace-nowrap'>
-          {format(new Date(row.original.createdAt), 'yyyy-MM-dd HH:mm:ss', { locale })}
-        </span>
+        <span className='text-xs whitespace-nowrap'>{format(new Date(row.original.createdAt), 'yyyy-MM-dd HH:mm:ss', { locale })}</span>
       ),
     },
     {

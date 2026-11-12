@@ -26,19 +26,32 @@ var ErrResetUnsupported = errors.New("provider quota reset is not supported")
 
 // Reset is a provider-agnostic quota reset that can be consumed.
 type Reset struct {
-	ID        string     `json:"id"`
-	Status    string     `json:"status"`
-	Type      string     `json:"type,omitempty"`
-	GrantedAt *time.Time `json:"grantedAt,omitempty"`
-	ExpiresAt *time.Time `json:"expiresAt,omitempty"`
-	Title     string     `json:"title,omitempty"`
+	Clears      []string `json:"clears,omitempty"`
+	Recommended bool     `json:"recommended,omitempty"`
+	Remaining   *int     `json:"remaining,omitempty"`
+	Redeemable  *bool    `json:"redeemable,omitempty"`
+	// UnavailableReason explains why Redeemable is false; empty when redeemable or unknown.
+	UnavailableReason string `json:"unavailableReason,omitempty"`
+	// UpstreamReason is the provider's own short reason code, kept for display.
+	UpstreamReason string     `json:"upstreamReason,omitempty"`
+	ID             string     `json:"id"`
+	Status         string     `json:"status"`
+	Type           string     `json:"type,omitempty"`
+	GrantedAt      *time.Time `json:"grantedAt,omitempty"`
+	ExpiresAt      *time.Time `json:"expiresAt,omitempty"`
+	Title          string     `json:"title,omitempty"`
 }
 
 // ResetList describes a provider's optional reset capability and current resets.
 type ResetList struct {
-	Supported bool    `json:"supported"`
-	Resets    []Reset `json:"resets"`
-	Error     string  `json:"error,omitempty"`
+	IneligibleReason string     `json:"ineligibleReason,omitempty"`
+	Eligible         *bool      `json:"eligible,omitempty"`
+	CooldownUntil    *time.Time `json:"cooldownUntil,omitempty"`
+	// WindowModels maps a reset window to the model whose weekly limit it clears.
+	WindowModels map[string]string `json:"windowModels,omitempty"`
+	Supported    bool              `json:"supported"`
+	Resets       []Reset           `json:"resets"`
+	Error        string            `json:"error,omitempty"`
 }
 
 // Resetter is an optional capability implemented by quota providers that can
@@ -48,12 +61,23 @@ type Resetter interface {
 	Reset(ctx context.Context, channel *ent.Channel) error
 }
 
+// SelectiveResetter can redeem a specific provider grant without changing the default reset behavior.
+type SelectiveResetter interface {
+	ResetSelected(ctx context.Context, channel *ent.Channel, resetID string) error
+}
+
 type QuotaLimitType string
 
 const (
 	QuotaLimitTypeImage             QuotaLimitType = "image"
 	QuotaLimitTypeToken             QuotaLimitType = "token"
 	QuotaLimitTypeSubscriptionCycle QuotaLimitType = "subscription_cycle"
+	// QuotaLimitTypeSearch marks counters for capabilities AxonHub does not
+	// route (Synthetic's hourly search requests). No request modality maps to
+	// it, so EvaluateQuotaRouting/EffectiveStatus already ignore it, and
+	// normalization.go keeps it out of the channel status and channel reset:
+	// it is listed for the operator, never enforced.
+	QuotaLimitTypeSearch QuotaLimitType = "search"
 )
 
 // ApertisDefaultBaseURL is the default base URL for the Apertis API.
@@ -89,13 +113,15 @@ type QuotaLimitStatus struct {
 	// aggregation below possible.
 	PeriodStart *time.Time `json:"period_start,omitempty"`
 
-	// PeriodCost is the cost accumulated in [PeriodStart, now) on this channel
-	// according to AxonHub usage logs. Filled by the quota service, not by the
-	// checkers.
+	// PeriodCost is the money spent in the period on this channel: either the
+	// cost accumulated in [PeriodStart, now) according to AxonHub usage logs
+	// (filled by the quota service) or the provider's own figure for the
+	// period (Synthetic's weekly credits), set by the checker.
 	PeriodCost *float64 `json:"period_cost,omitempty"`
 
-	// PeriodQuota is the estimated total money quota of the period, derived
-	// from PeriodCost and UsageRatio. See EstimatePeriodQuota.
+	// PeriodQuota is the total money quota of the period: either derived from
+	// PeriodCost and UsageRatio (see EstimatePeriodQuota) or reported directly
+	// by providers that bill in money (Synthetic's maxCredits).
 	PeriodQuota *float64 `json:"period_quota,omitempty"`
 }
 
@@ -107,7 +133,22 @@ type QuotaData struct {
 	NextResetAt  *time.Time         `json:"next_reset_at"` // Next quota reset timestamp
 	Ready        bool               `json:"ready"`         // True if status is available or warning
 	Limits       []QuotaLimitStatus `json:"limits"`
+	Balances     []QuotaBalance     `json:"balances,omitempty"`
 	Resets       *ResetList         `json:"resets,omitempty"`
+}
+
+// QuotaBalance is a provider-reported account amount that is not a usage
+// window, such as a prepaid credit balance. The UI renders it as money instead
+// of a percentage bar.
+type QuotaBalance struct {
+	// Account labels the credential an amount belongs to when one channel
+	// draws from several accounts (the same role as QuotaLimitStatus.Account).
+	// It is a display label and never holds a credential.
+	Account  string   `json:"account,omitempty"`
+	Currency string   `json:"currency,omitempty"`
+	Total    float64  `json:"total"`
+	Granted  *float64 `json:"granted,omitempty"`
+	ToppedUp *float64 `json:"topped_up,omitempty"`
 }
 
 // WarningThresholdRatio is the usage ratio at which a channel transitions to "warning" status.

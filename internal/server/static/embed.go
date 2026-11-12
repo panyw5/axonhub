@@ -22,6 +22,7 @@ var staticFS static.ServeFileSystem
 var apiPrefixes = []string{
 	"/admin",
 	"/anthropic",
+	"/codex",
 	"/doubao",
 	"/gemini",
 	"/jina",

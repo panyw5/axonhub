@@ -47,7 +47,7 @@ import { useChannels } from '../context/channels-context';
 import { useTestChannel, useUpdateChannel } from '../data/channels';
 import { CHANNEL_CONFIGS, getProvider } from '../data/config_channels';
 import { Channel } from '../data/schema';
-import { parseQuotaLimits } from '../../system/data/quotas';
+import { formatQuotaBalance, parseQuotaBalances, parseQuotaLimits } from '../../system/data/quotas';
 import type { QuotaRoutingMode } from '../../system/data/system';
 import { getChannelQuotaRoutingIndicator } from '../utils/quota-routing-status';
 import { ChannelHealthCell } from './channel-health-cell';
@@ -76,6 +76,7 @@ const QUOTA_WINDOW_LABEL_KEYS: Record<string, string> = {
   credits: 'quota.label.credits_remaining',
   cycle: 'quota.window.cycle',
   overage: 'quota.label.overage_window',
+  search_hourly: 'quota.window.search_hourly',
 };
 
 function getQuotaLimits(channel: Channel) {
@@ -489,6 +490,7 @@ const ProviderCell = memo(({ row }: { row: Row<Channel> }) => {
 
 ProviderCell.displayName = 'ProviderCell';
 
+// QuotaCell renders normalized balance rows and usage limits for the channel table.
 const QuotaCell = memo(({ row }: { row: Row<Channel> }) => {
   const { t } = useTranslation();
   const [isExpanded, setIsExpanded] = useState(false);
@@ -502,8 +504,11 @@ const QuotaCell = memo(({ row }: { row: Row<Channel> }) => {
     );
   }
 
+  const quotaStatus = channel.providerQuotaStatus;
+  const balances = parseQuotaBalances(quotaStatus.quotaData);
   const allLimits = getQuotaLimits(channel);
-  if (allLimits.length === 0) {
+
+  if (balances.length === 0 && allLimits.length === 0) {
     return (
       <div className='flex justify-center'>
         <span className='text-muted-foreground text-xs'>{t('quota.label.unavailable')}</span>
@@ -517,8 +522,29 @@ const QuotaCell = memo(({ row }: { row: Row<Channel> }) => {
   const limits = collapseQuotaLimitsByWindow(allLimits);
   const visibleLimits = isExpanded ? limits : limits.slice(0, QUOTA_VISIBLE_LIMIT);
   const hiddenCount = limits.length - QUOTA_VISIBLE_LIMIT;
+  // balanceLabel builds the label for one normalized balance row.
+  const balanceLabel = (currency?: string, account?: string) =>
+    `${t('quota.label.account_balance')}${currency ? ` · ${currency}` : ''}${account ? ` · ${account}` : ''}`;
   const content = (
     <div className='flex min-w-0 flex-col items-stretch gap-1.5 text-[11px]'>
+      {balances.map((balance, index) => {
+        const currency = balance.currency?.trim().toUpperCase();
+        const total = formatQuotaBalance(balance.total);
+        return (
+          <div key={`balance-${currency ?? 'unknown'}-${balance.account ?? ''}-${index}`} className='flex min-w-0 items-center gap-1'>
+            <span className='text-muted-foreground w-28 shrink-0 truncate text-left' title={balanceLabel(currency, balance.account)}>
+              {balanceLabel(currency, balance.account)}
+            </span>
+            <span
+              className={`min-w-0 flex-1 truncate text-right font-medium ${
+                quotaStatus.status === 'exhausted' ? 'text-red-500' : 'text-foreground'
+              }`}
+            >
+              {total ?? t('quota.label.unavailable')}
+            </span>
+          </div>
+        );
+      })}
       {visibleLimits.map((limit, index) => {
         const usageRatio = limit.usageRatio;
         const remaining = Math.round(Math.max(0, Math.min(100, 100 - usageRatio * 100)));
@@ -561,7 +587,30 @@ const QuotaCell = memo(({ row }: { row: Row<Channel> }) => {
     <Tooltip>
       <TooltipTrigger asChild>{content}</TooltipTrigger>
       <TooltipContent className='space-y-1'>
-        <div className='font-medium'>{t(`quota.status.${channel.providerQuotaStatus.status}`)}</div>
+        <div className='font-medium'>{t(`quota.status.${quotaStatus.status}`)}</div>
+        {balances.map((balance, index) => {
+          const currency = balance.currency?.trim().toUpperCase();
+          const total = formatQuotaBalance(balance.total);
+          const granted = formatQuotaBalance(balance.granted);
+          const toppedUp = formatQuotaBalance(balance.topped_up);
+          return (
+            <div key={`balance-${currency ?? 'unknown'}-${balance.account ?? ''}-${index}`} className='space-y-0.5 text-xs'>
+              <div>
+                {balanceLabel(currency, balance.account)}: {total ?? t('quota.label.unavailable')}
+              </div>
+              {granted !== undefined && (
+                <div>
+                  {t('quota.label.granted_balance')}: {granted}
+                </div>
+              )}
+              {toppedUp !== undefined && (
+                <div>
+                  {t('quota.label.topped_up_balance')}: {toppedUp}
+                </div>
+              )}
+            </div>
+          );
+        })}
         {allLimits.map((limit, index) => {
           const usageRatio = limit.usageRatio;
           const remaining = Math.round(Math.max(0, Math.min(100, 100 - usageRatio * 100)));
@@ -669,7 +718,7 @@ const SupportedModelsCell = memo(({ row }: { row: Row<Channel> }) => {
 
   return (
     <div className='flex min-w-0 items-center justify-center gap-2'>
-      <div className='flex min-w-0 flex-wrap justify-center gap-1 overflow-hidden'>
+      <div className='flex min-w-0 max-w-72 sm:max-w-80 flex-wrap justify-center gap-1 overflow-hidden'>
         {models.slice(0, 5).map((model) => (
           <Badge key={model} variant='secondary' className='block max-w-48 truncate text-left text-xs'>
             {model}
@@ -923,7 +972,7 @@ export const createColumns = (
       header: ({ column }) => <DataTableColumnHeader column={column} title={t('common.columns.name')} />,
       cell: ({ row }: { row: Row<Channel> }) => <NameCell row={row} globalDefaultMode={globalDefaultMode} />,
       meta: {
-        className: 'w-[13%] min-w-0 text-left',
+        className: 'w-[15%] min-w-40 text-left',
       },
       enableHiding: false,
       enableSorting: true,
@@ -934,7 +983,7 @@ export const createColumns = (
       header: ({ column }) => <DataTableColumnHeader column={column} title={t('channels.columns.provider')} className='justify-center' />,
       cell: ProviderCell,
       meta: {
-         className: 'w-[9%] min-w-0 text-center',
+        className: 'w-[19%] min-w-28 text-center',
       },
       filterFn: (row, _id, value) => {
         return value.includes(row.original.type);
@@ -947,7 +996,7 @@ export const createColumns = (
       header: ({ column }) => <DataTableColumnHeader column={column} title={t('common.columns.status')} className='justify-center' />,
       cell: StatusSwitchCell,
       meta: {
-         className: 'w-[8%] min-w-0 text-center',
+        className: 'w-[15%] min-w-20 text-center',
       },
       enableSorting: true,
       enableHiding: false,
@@ -958,7 +1007,7 @@ export const createColumns = (
       header: ({ column }) => <DataTableColumnHeader column={column} title={t('channels.columns.quota')} className='justify-center' />,
       cell: QuotaCell,
       meta: {
-         className: 'hidden w-[13%] min-w-0 2xl:table-cell text-center',
+        className: 'w-[10%] min-w-36 text-center',
       },
       enableSorting: false,
       enableHiding: true,
@@ -969,7 +1018,7 @@ export const createColumns = (
       header: ({ column }) => <DataTableColumnHeader column={column} title={t('channels.columns.tags')} className='justify-center' />,
       cell: TagsCell,
       meta: {
-        className: 'hidden min-w-0 xl:table-cell text-center',
+        className: 'w-[10%] min-w-28 text-center',
       },
       filterFn: (row, id, value) => {
         const tags = (row.getValue(id) as string[]) || [];
@@ -997,7 +1046,7 @@ export const createColumns = (
       ),
       cell: SupportedModelsCell,
       meta: {
-         className: 'w-[20%] min-w-0 max-w-none text-center',
+        className: 'w-[18%] min-w-48 max-w-none text-center',
       },
       enableSorting: false,
     },
@@ -1020,7 +1069,7 @@ export const createColumns = (
       header: ({ column }) => <DataTableColumnHeader column={column} title={t('channels.columns.proxy')} className='justify-center' />,
       cell: ProxyCell,
       meta: {
-        className: 'hidden min-w-0 2xl:table-cell text-center',
+        className: 'w-[13%] min-w-28 text-center',
       },
       enableSorting: false,
       enableHiding: true,
@@ -1063,10 +1112,10 @@ export const createColumns = (
       header: ({ column }) => <DataTableColumnHeader column={column} title={t('common.columns.createdAt')} className='justify-center' />,
       cell: CreatedAtCell,
       meta: {
-        className: 'hidden w-28 min-w-28 xl:table-cell text-center',
+        className: 'w-28 min-w-28 text-center',
       },
       enableSorting: true,
-      enableHiding: false,
+      enableHiding: true,
     },
     ...(canWrite
       ? [

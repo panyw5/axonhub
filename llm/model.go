@@ -4,7 +4,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/looplj/axonhub/llm/httpclient"
@@ -23,6 +25,10 @@ var (
 	// terminal event. Pipelines may retry it only before meaningful output is
 	// committed to the caller.
 	ErrStreamIncomplete = errors.New("stream ended without terminal event")
+
+	// ErrEmptyResponse means a streaming response completed without meaningful
+	// content. Pipelines may retry it before content is committed.
+	ErrEmptyResponse = errors.New("empty response detected")
 )
 
 // Request is the unified llm request model for AxonHub, to keep compatibility with major app and framework.
@@ -822,10 +828,41 @@ type TopLogprob struct {
 	Bytes   []int   `json:"bytes,omitempty"`
 }
 
+type AccountingEvidence string
+
+const (
+	AccountingEvidenceUnavailable       AccountingEvidence = "unavailable"
+	AccountingEvidenceExplicitFinal     AccountingEvidence = "explicit-final"
+	AccountingEvidenceCleanEndCandidate AccountingEvidence = "clean-end-candidate"
+)
+
+type SourceEndReason string
+
+const (
+	SourceEndUnknown  SourceEndReason = "unknown"
+	SourceEndCleanEOF SourceEndReason = "clean-eof"
+	SourceEndSemantic SourceEndReason = "semantic"
+	SourceEndError    SourceEndReason = "error"
+	SourceEndCanceled SourceEndReason = "canceled"
+	SourceEndBudget   SourceEndReason = "budget"
+)
+
+func (m ResponseMeta) AccountingFinal(sourceEnd SourceEndReason) bool {
+	switch m.AccountingEvidence {
+	case AccountingEvidenceExplicitFinal:
+		return true
+	case AccountingEvidenceCleanEndCandidate:
+		return sourceEnd == SourceEndCleanEOF || sourceEnd == SourceEndSemantic
+	default:
+		return false
+	}
+}
+
 type ResponseMeta struct {
-	ID        string `json:"id"`
-	Usage     *Usage `json:"usage"`
-	Completed bool   `json:"completed,omitempty"`
+	ID                 string             `json:"id"`
+	Usage              *Usage             `json:"usage"`
+	Completed          bool               `json:"completed,omitempty"`
+	AccountingEvidence AccountingEvidence `json:"-"`
 }
 
 // Usage Represents the total token usage per request to OpenAI.
@@ -858,6 +895,63 @@ type Usage struct {
 	Cost *float64 `json:"cost,omitempty"`
 }
 
+// UnmarshalJSON tolerates both numeric and structured (object) cost values.
+// Some OpenAI-compatible providers (e.g. Mogick) return usage.cost as
+// {"currency":"CNY","amount":"0.001"} while AxonHub's unified Usage.Cost is a
+// plain number. Parse the amount when present and ignore unknown shapes.
+func (u *Usage) UnmarshalJSON(data []byte) error {
+	type usageAlias Usage
+	aux := struct {
+		*usageAlias
+		Cost json.RawMessage `json:"cost"`
+	}{usageAlias: (*usageAlias)(u)}
+
+	if err := json.Unmarshal(data, &aux); err != nil {
+		return err
+	}
+
+	u.Cost = nil
+	if len(aux.Cost) == 0 || string(aux.Cost) == "null" {
+		return nil
+	}
+
+	var raw any
+	if err := json.Unmarshal(aux.Cost, &raw); err != nil {
+		return nil
+	}
+
+	switch v := raw.(type) {
+	case float64:
+		u.Cost = &v
+	case string:
+		u.Cost = parseFiniteCost(v)
+	case map[string]any:
+		amount, ok := v["amount"]
+		if !ok {
+			return nil
+		}
+		switch a := amount.(type) {
+		case string:
+			u.Cost = parseFiniteCost(a)
+		case float64:
+			u.Cost = &a
+		}
+	}
+
+	return nil
+}
+
+// parseFiniteCost parses a numeric cost string and rejects non-finite values
+// such as "NaN" and "Infinity", which json.Marshal cannot encode.
+func parseFiniteCost(value string) *float64 {
+	f, err := strconv.ParseFloat(value, 64)
+	if err != nil || math.IsNaN(f) || math.IsInf(f, 0) {
+		return nil
+	}
+
+	return &f
+}
+
 func (u *Usage) GetCompletionTokens() *int64 {
 	if u == nil {
 		return nil
@@ -872,6 +966,28 @@ func (u *Usage) GetPromptTokens() *int64 {
 	}
 
 	return &u.PromptTokens
+}
+
+// HasRealCounts reports whether the usage object carries actual token counts
+// rather than being an all-zero placeholder.
+//
+// Some OpenAI-compatible providers stream a zeroed usage object on every chunk
+// and report the real counts only in the trailing usage-only chunk. Others put
+// the real counts on the finish_reason chunk and never send a usage-only chunk.
+// Callers that decide "the stream is complete" from a usage object can use this
+// to tell the two apart without keying on the shape of `choices`.
+//
+// The question answered here is "did upstream report anything?", not "are all
+// fields final?". A response that was filtered or produced no output
+// legitimately reports a zero completion total, so requiring a positive count
+// on both fields would delay the terminal event until the stream drains — the
+// very symptom this guard exists to prevent.
+func (u *Usage) HasRealCounts() bool {
+	if u == nil {
+		return false
+	}
+
+	return u.PromptTokens > 0 || u.CompletionTokens > 0
 }
 
 // CompletionTokensDetails Breakdown of tokens used in a completion.
@@ -906,8 +1022,9 @@ type PromptTokensDetails struct {
 
 // ResponseError represents an error response.
 type ResponseError struct {
-	StatusCode int         `json:"-"`
-	Detail     ErrorDetail `json:"error"`
+	StatusCode         int         `json:"-"`
+	Detail             ErrorDetail `json:"error"`
+	SuppressStatusText bool        `json:"-"`
 
 	// Cause keeps the underlying error (for example a transport failure) so callers
 	// can still match it with errors.Is / errors.As after classification.
@@ -924,7 +1041,7 @@ func (e *ResponseError) Unwrap() error {
 
 func (e ResponseError) Error() string {
 	sb := strings.Builder{}
-	if e.StatusCode != 0 {
+	if e.StatusCode != 0 && !e.SuppressStatusText {
 		fmt.Fprintf(&sb, "Request failed: %s, ", http.StatusText(e.StatusCode))
 	}
 

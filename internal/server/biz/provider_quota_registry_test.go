@@ -23,8 +23,8 @@ func TestProviderQuotaService_RegistryCoverageMatrix(t *testing.T) {
 	expectedCheckers := []string{
 		"devin",
 		"apertis", "antigravity", "charm_hyper", "claudecode", "cline", "codex",
-		"commandcode", "github_copilot", "kimi_code", "minimax", "nanogpt",
-		"neuralwatt", "opencode_go", "synthetic", "wafer", "xai_subscription",
+		"commandcode", "deepseek", "github_copilot", "kimi_code", "minimax", "nanogpt",
+		"neuralwatt", "opencode_go", "synthetic", "xai_subscription",
 		"ollama", "zenmux", "zhipu", "zai",
 	}
 	require.ElementsMatch(t, expectedCheckers, mapKeys(svc.checkers))
@@ -48,8 +48,6 @@ func TestProviderQuotaService_RegistryCoverageMatrix(t *testing.T) {
 		{"zenmux", channel.TypeZenmuxGemini, ""},
 		{"zenmux", channel.TypeZenmuxVideo, ""},
 		{"cline", channel.TypeCline, ""},
-		{"wafer", channel.TypeOpenai, "https://pass.wafer.ai"},
-		{"wafer", channel.TypeOpenaiResponses, "https://pass.wafer.ai"},
 		{"synthetic", channel.TypeOpenai, "https://api.synthetic.new"},
 		{"synthetic", channel.TypeOpenaiResponses, "https://api.synthetic.new"},
 		{"neuralwatt", channel.TypeOpenai, "https://api.neuralwatt.com"},
@@ -65,6 +63,10 @@ func TestProviderQuotaService_RegistryCoverageMatrix(t *testing.T) {
 		{"zhipu", channel.TypeZhipuAnthropic, ""},
 		{"zai", channel.TypeZai, ""},
 		{"zai", channel.TypeZaiAnthropic, ""},
+		{"deepseek", channel.TypeDeepseek, ""},
+		{"deepseek", channel.TypeDeepseekAnthropic, ""},
+		{"deepseek", channel.TypeOpenai, "https://api.deepseek.com"},
+		{"deepseek", channel.TypeOpenaiResponses, "https://api.deepseek.com"},
 		{"charm_hyper", channel.TypeOpenai, "https://hyper.charm.land"},
 		{"charm_hyper", channel.TypeOpenaiResponses, "https://hyper.charm.land"},
 		{"commandcode", channel.TypeCommandcode, ""},

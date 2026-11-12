@@ -99,7 +99,7 @@ var (
 		{Name: "created_at", Type: field.TypeTime, Default: schema.Expr("CURRENT_TIMESTAMP")},
 		{Name: "updated_at", Type: field.TypeTime, Default: schema.Expr("CURRENT_TIMESTAMP")},
 		{Name: "deleted_at", Type: field.TypeInt, Default: 0},
-		{Name: "type", Type: field.TypeEnum, Enums: []string{"openai", "openai_responses", "atlascloud", "cline", "codex", "devin", "vercel", "anthropic", "anthropic_aws", "anthropic_gcp", "gemini_openai", "gemini", "gemini_vertex", "deepseek", "deepseek_anthropic", "deepinfra", "qiniu", "fireworks", "doubao", "doubao_anthropic", "moonshot", "moonshot_anthropic", "zhipu", "zai", "zhipu_anthropic", "zai_anthropic", "anthropic_fake", "openai_fake", "openrouter", "xiaomi", "xiaomi_anthropic", "xai", "xai_responses", "xai_subscription", "ppio", "siliconflow", "volcengine", "volcengine_anthropic", "longcat", "longcat_anthropic", "minimax", "minimax_anthropic", "aihubmix", "aihubmix_anthropic", "burncloud", "modelscope", "bailian", "bailian_responses", "bailian_anthropic", "moonshot_coding", "jina", "github", "github_copilot", "claudecode", "cerebras", "antigravity", "nanogpt", "nanogpt_responses", "opencode_go", "opencode_go_anthropic", "ollama", "ollama_anthropic", "evolink", "evolink_anthropic", "groq", "qiniu_anthropic", "fenno", "zenmux", "zenmux_responses", "zenmux_anthropic", "zenmux_gemini", "zenmux_video", "commandcode", "commandcode_anthropic", "typesafe"}},
+		{Name: "type", Type: field.TypeEnum, Enums: []string{"openai", "openai_responses", "atlascloud", "cline", "codex", "devin", "vercel", "anthropic", "anthropic_aws", "anthropic_gcp", "gemini_openai", "gemini", "gemini_vertex", "deepseek", "deepseek_anthropic", "deepinfra", "qiniu", "fireworks", "doubao", "doubao_anthropic", "moonshot", "moonshot_anthropic", "zhipu", "zai", "zhipu_anthropic", "zai_anthropic", "anthropic_fake", "openai_fake", "openrouter", "xiaomi", "xiaomi_anthropic", "xai", "xai_responses", "xai_subscription", "ppio", "siliconflow", "volcengine", "volcengine_anthropic", "longcat", "longcat_anthropic", "minimax", "minimax_anthropic", "aihubmix", "aihubmix_anthropic", "burncloud", "modelscope", "bailian", "bailian_responses", "bailian_anthropic", "moonshot_coding", "jina", "github", "github_copilot", "claudecode", "cerebras", "antigravity", "nanogpt", "nanogpt_responses", "opencode_go", "opencode_go_anthropic", "ollama", "ollama_anthropic", "evolink", "evolink_anthropic", "groq", "qiniu_anthropic", "fenno", "zenmux", "zenmux_responses", "zenmux_anthropic", "zenmux_gemini", "zenmux_video", "commandcode", "commandcode_anthropic", "typesafe", "cloudflare"}},
 		{Name: "base_url", Type: field.TypeString, Nullable: true},
 		{Name: "name", Type: field.TypeString},
 		{Name: "status", Type: field.TypeEnum, Enums: []string{"enabled", "disabled", "archived"}, Default: "disabled"},
@@ -398,6 +398,62 @@ var (
 			},
 		},
 	}
+	// PluginsColumns holds the columns for the "plugins" table.
+	PluginsColumns = []*schema.Column{
+		{Name: "id", Type: field.TypeInt, Increment: true},
+		{Name: "created_at", Type: field.TypeTime, Default: schema.Expr("CURRENT_TIMESTAMP")},
+		{Name: "updated_at", Type: field.TypeTime, Default: schema.Expr("CURRENT_TIMESTAMP")},
+		{Name: "deleted_at", Type: field.TypeInt, Default: 0},
+		{Name: "plugin_id", Type: field.TypeString, Size: 64},
+		{Name: "name", Type: field.TypeString, Nullable: true, Size: 1024, Default: ""},
+		{Name: "version", Type: field.TypeString, Nullable: true, Size: 128, Default: ""},
+		{Name: "description", Type: field.TypeString, Nullable: true, Size: 4096, Default: ""},
+		{Name: "manifest", Type: field.TypeJSON, Nullable: true},
+		{Name: "package", Type: field.TypeBytes, Nullable: true, SchemaType: map[string]string{"mysql": "longblob"}},
+		{Name: "package_sha256", Type: field.TypeString, Nullable: true, Size: 64, Default: ""},
+		{Name: "enabled", Type: field.TypeBool, Default: false},
+		{Name: "priority", Type: field.TypeInt, Default: 100},
+		{Name: "granted_permissions", Type: field.TypeJSON, Nullable: true},
+		{Name: "granted_network", Type: field.TypeJSON, Nullable: true},
+		{Name: "config", Type: field.TypeJSON, Nullable: true},
+	}
+	// PluginsTable holds the schema information for the "plugins" table.
+	PluginsTable = &schema.Table{
+		Name:       "plugins",
+		Columns:    PluginsColumns,
+		PrimaryKey: []*schema.Column{PluginsColumns[0]},
+		Indexes: []*schema.Index{
+			{
+				Name:    "plugins_by_plugin_id",
+				Unique:  true,
+				Columns: []*schema.Column{PluginsColumns[4], PluginsColumns[3]},
+			},
+		},
+	}
+	// PluginStoragesColumns holds the columns for the "plugin_storages" table.
+	PluginStoragesColumns = []*schema.Column{
+		{Name: "id", Type: field.TypeInt, Increment: true},
+		{Name: "created_at", Type: field.TypeTime, Default: schema.Expr("CURRENT_TIMESTAMP")},
+		{Name: "updated_at", Type: field.TypeTime, Default: schema.Expr("CURRENT_TIMESTAMP")},
+		{Name: "installation_id", Type: field.TypeInt},
+		{Name: "namespace", Type: field.TypeString, Size: 128, Default: "default"},
+		{Name: "key", Type: field.TypeString, Size: 128},
+		{Name: "value", Type: field.TypeString, SchemaType: map[string]string{"mysql": "mediumtext"}},
+		{Name: "expires_at", Type: field.TypeTime, Nullable: true},
+	}
+	// PluginStoragesTable holds the schema information for the "plugin_storages" table.
+	PluginStoragesTable = &schema.Table{
+		Name:       "plugin_storages",
+		Columns:    PluginStoragesColumns,
+		PrimaryKey: []*schema.Column{PluginStoragesColumns[0]},
+		Indexes: []*schema.Index{
+			{
+				Name:    "plugin_storages_by_installation_namespace_key",
+				Unique:  true,
+				Columns: []*schema.Column{PluginStoragesColumns[3], PluginStoragesColumns[4], PluginStoragesColumns[5]},
+			},
+		},
+	}
 	// ProjectsColumns holds the columns for the "projects" table.
 	ProjectsColumns = []*schema.Column{
 		{Name: "id", Type: field.TypeInt, Increment: true},
@@ -494,7 +550,7 @@ var (
 		{Name: "created_at", Type: field.TypeTime, Default: schema.Expr("CURRENT_TIMESTAMP")},
 		{Name: "updated_at", Type: field.TypeTime, Default: schema.Expr("CURRENT_TIMESTAMP")},
 		{Name: "deleted_at", Type: field.TypeInt, Default: 0},
-		{Name: "provider_type", Type: field.TypeEnum, Enums: []string{"claudecode", "codex", "devin", "antigravity", "xai_subscription", "github_copilot", "nanogpt", "cline", "wafer", "synthetic", "neuralwatt", "apertis", "opencode_go", "kimi_code", "minimax", "zhipu", "zai", "charm_hyper", "zenmux", "commandcode", "ollama"}},
+		{Name: "provider_type", Type: field.TypeEnum, Enums: []string{"claudecode", "codex", "devin", "antigravity", "xai_subscription", "github_copilot", "nanogpt", "cline", "wafer", "synthetic", "neuralwatt", "apertis", "opencode_go", "kimi_code", "minimax", "zhipu", "zai", "charm_hyper", "zenmux", "commandcode", "deepseek", "ollama"}},
 		{Name: "status", Type: field.TypeEnum, Enums: []string{"available", "warning", "exhausted", "unknown"}},
 		{Name: "quota_data", Type: field.TypeJSON},
 		{Name: "next_reset_at", Type: field.TypeTime, Nullable: true},
@@ -815,6 +871,7 @@ var (
 		{Name: "updated_at", Type: field.TypeTime, Default: schema.Expr("CURRENT_TIMESTAMP")},
 		{Name: "trace_id", Type: field.TypeString, Unique: true},
 		{Name: "status", Type: field.TypeEnum, Enums: []string{"active", "archived", "retained"}, Default: "active"},
+		{Name: "last_request_at", Type: field.TypeTime, Default: schema.Expr("'1970-01-02 00:00:00'")},
 		{Name: "project_id", Type: field.TypeInt},
 		{Name: "thread_id", Type: field.TypeInt, Nullable: true},
 	}
@@ -826,13 +883,13 @@ var (
 		ForeignKeys: []*schema.ForeignKey{
 			{
 				Symbol:     "traces_projects_traces",
-				Columns:    []*schema.Column{TracesColumns[5]},
+				Columns:    []*schema.Column{TracesColumns[6]},
 				RefColumns: []*schema.Column{ProjectsColumns[0]},
 				OnDelete:   schema.NoAction,
 			},
 			{
 				Symbol:     "traces_threads_traces",
-				Columns:    []*schema.Column{TracesColumns[6]},
+				Columns:    []*schema.Column{TracesColumns[7]},
 				RefColumns: []*schema.Column{ThreadsColumns[0]},
 				OnDelete:   schema.SetNull,
 			},
@@ -841,7 +898,7 @@ var (
 			{
 				Name:    "traces_by_project_id",
 				Unique:  false,
-				Columns: []*schema.Column{TracesColumns[5]},
+				Columns: []*schema.Column{TracesColumns[6]},
 			},
 			{
 				Name:    "traces_by_trace_id",
@@ -851,12 +908,17 @@ var (
 			{
 				Name:    "traces_by_thread_id",
 				Unique:  false,
-				Columns: []*schema.Column{TracesColumns[6]},
+				Columns: []*schema.Column{TracesColumns[7]},
 			},
 			{
 				Name:    "traces_by_project_id_status",
 				Unique:  false,
-				Columns: []*schema.Column{TracesColumns[5], TracesColumns[4]},
+				Columns: []*schema.Column{TracesColumns[6], TracesColumns[4]},
+			},
+			{
+				Name:    "traces_by_project_id_last_request_at",
+				Unique:  false,
+				Columns: []*schema.Column{TracesColumns[6], TracesColumns[5]},
 			},
 		},
 	}
@@ -1070,6 +1132,8 @@ var (
 		InvitationsTable,
 		ModelsTable,
 		OidcIdentitiesTable,
+		PluginsTable,
+		PluginStoragesTable,
 		ProjectsTable,
 		PromptsTable,
 		PromptProtectionRulesTable,

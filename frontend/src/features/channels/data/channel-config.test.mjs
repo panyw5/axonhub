@@ -215,6 +215,10 @@ test('quota selection follows quota column visibility and preserves normalized f
   assert.equal(zhSystem['quota.window.5h'], '5小时窗口');
   assert.equal(zhSystem['quota.window.7d'], '7天窗口');
   assert.equal(zhSystem['quota.window.cycle'], '周期窗口');
+  assert.equal(enSystem['quota.window.search_hourly'], 'Search · hourly');
+  assert.equal(zhSystem['quota.window.search_hourly'], '搜索 · 每小时');
+  assert.equal(enSystem['quota.label.search_requests'], 'Search requests');
+  assert.equal(zhSystem['quota.label.search_requests'], '搜索请求');
 });
 
 test('filter-only model column stays hidden while model filtering remains configured', () => {
@@ -385,16 +389,143 @@ test('Ollama exposes OpenAI and Anthropic channel variants with a quota cookie f
   );
 });
 
-test('Ollama has localized channel, provider, cookie field, and quota-collection labels', () => {
+test('Cloudflare Workers AI is available as a channel type in frontend schemas and configs', () => {
+  const schema = read('features/channels/data/schema.ts');
+  const channelsConfig = read('features/channels/data/config_channels.ts');
+  const providersConfig = read('features/channels/data/config_providers.ts');
+  const protocolOptions = read('features/channels/data/protocol-options.ts');
+
+  assert.match(schema, /channelTypeSchema[\s\S]*'cloudflare'/, 'channelTypeSchema should accept cloudflare');
+  assert.match(
+    channelsConfig,
+    /cloudflare:\s*{[\s\S]*?channelType:\s*'cloudflare'[\s\S]*?baseURL:\s*'https:\/\/api\.cloudflare\.com\/client\/v4\/accounts\/<account_id>\/ai'[\s\S]*?apiFormat:\s*OPENAI_CHAT_COMPLETIONS,/,
+    'Cloudflare should use the account-scoped Workers AI base URL with OpenAI chat completions'
+  );
+  assert.match(
+    channelsConfig,
+    /CHANNEL_TYPE_TO_PROVIDER[\s\S]*cloudflare:\s*'cloudflare'/,
+    'Cloudflare should map to the Cloudflare provider'
+  );
+  assert.match(
+    providersConfig,
+    /cloudflare:\s*{[\s\S]*?channelTypes:\s*\[\s*'cloudflare'\s*\]/,
+    'PROVIDER_CONFIGS should expose a Cloudflare provider'
+  );
+  assert.match(
+    protocolOptions,
+    /channelType === 'cloudflare' \|\| format !== 'typesafe\/systemone'/,
+    'System One should be configurable for Cloudflare channels only'
+  );
+  assert.match(
+    schema,
+    /Replace placeholders such as <account_id> with real values/,
+    'the channel base URL should reject unresolved placeholders'
+  );
+  assert.doesNotMatch(
+    channelsConfig,
+    /@cf\/cloudflare\/clef/,
+    'Cloudflare default models must be servable by the default endpoints'
+  );
+});
+
+test('Cloudflare has localized channel and provider labels', () => {
   for (const locale of ['en', 'zh-CN']) {
     const channels = parseLocale(locale);
-    const system = JSON.parse(read(`locales/${locale}/system.json`));
+
+    assert.equal(channels['channels.types.cloudflare'], 'Cloudflare');
+    assert.equal(channels['channels.providers.cloudflare'], 'Cloudflare');
+  }
+});
+
+test('Ollama has localized channel, provider, and cookie-field labels', () => {
+  for (const locale of ['en', 'zh-CN']) {
+    const channels = parseLocale(locale);
 
     assert.equal(channels['channels.types.ollama'], 'Ollama');
     assert.equal(channels['channels.providers.ollama'], 'Ollama');
     assert.ok(channels['channels.types.ollama_anthropic']);
     assert.ok(channels['channels.dialogs.fields.ollamaQuota.authCookie.placeholder'].includes('__Secure-session'));
     assert.ok(channels['channels.dialogs.fields.ollamaQuota.authCookie.description']);
-    assert.ok(system['system.quota.collection.providers.ollama']);
   }
+});
+
+test('Anthropic channel defaults do not preload retiring Claude models', () => {
+  const channelsConfig = read('features/channels/data/config_channels.ts');
+  const retiring = new Set(['claude-sonnet-4-5', 'claude-opus-4-5']);
+
+  for (const key of ['anthropic', 'claudecode']) {
+    const block = channelsConfig.match(new RegExp(`\\n  ${key}: {([\\s\\S]*?)\\n  },`))?.[1] ?? '';
+    const modelsBlock = block.match(/defaultModels:\s*\[([\s\S]*?)\]/)?.[1] ?? '';
+    const models = [...modelsBlock.matchAll(/'([^']+)'/g)].map((match) => match[1]);
+    assert.ok(models.length > 0, `${key} should define default models`);
+    assert.deepEqual(
+      models.filter((model) => retiring.has(model)),
+      [],
+      `${key} defaults should not include retiring models`
+    );
+  }
+});
+
+test('Gemini channels default to current models, not the retired 2.5 family', () => {
+  const channelsConfig = read('features/channels/data/config_channels.ts');
+
+  for (const channel of ['gemini_openai', 'gemini', 'gemini_vertex']) {
+    const match = channelsConfig.match(new RegExp(`\\n  ${channel}: {[\\s\\S]*?defaultModels: \\[([^\\]]*)\\]`));
+    assert.ok(match, `${channel} should define defaultModels`);
+    assert.doesNotMatch(match[1], /gemini-2\.5/, `${channel} should not default to retired gemini-2.5 models`);
+    assert.match(match[1], /gemini-3\.1-pro-preview/);
+    assert.match(match[1], /gemini-3\.8-flash/);
+  }
+});
+
+test('OpenAI and ZenMux Gemini channels default to current models, not retired ones', () => {
+  const channelsConfig = read('features/channels/data/config_channels.ts');
+  const defaultsOf = (channel) => {
+    const match = channelsConfig.match(new RegExp(`\\n  ${channel}: {[\\s\\S]*?defaultModels: \\[([^\\]]*)\\]`));
+    assert.ok(match, `${channel} should define defaultModels`);
+    return match[1];
+  };
+
+  for (const channel of ['openai', 'openai_responses']) {
+    const models = defaultsOf(channel);
+    assert.doesNotMatch(models, /'gpt-4o|'gpt-5'|'gpt-5\.1'/, `${channel} should not default to retired OpenAI models`);
+    assert.match(models, /gpt-5\.6-sol/);
+  }
+
+  assert.doesNotMatch(defaultsOf('zenmux_gemini'), /gemini-2\.5/);
+  assert.match(defaultsOf('zenmux_gemini'), /gemini-3\.1-pro-preview/);
+});
+
+test('Claude, ZenMux, AiHubMix and OpenRouter channels default to current models, not retired ones', () => {
+  const channelsConfig = read('features/channels/data/config_channels.ts');
+  const defaultsOf = (channel) => {
+    const match = channelsConfig.match(new RegExp(`\\n  ${channel}: {[\\s\\S]*?defaultModels: (\\[[^\\]]*\\]|[A-Z_]+)`));
+    assert.ok(match, `${channel} should define defaultModels`);
+    return match[1];
+  };
+
+  assert.match(defaultsOf('anthropic_aws'), /anthropic\.claude-opus-5-5/);
+  assert.doesNotMatch(defaultsOf('anthropic_aws'), /claude-(opus-4|sonnet-4|3-)/);
+  assert.match(defaultsOf('anthropic_gcp'), /'claude-opus-5-5'/);
+  assert.doesNotMatch(defaultsOf('anthropic_gcp'), /claude-(opus-4|sonnet-4|3-)/);
+
+  for (const channel of ['zenmux', 'zenmux_responses']) {
+    assert.doesNotMatch(defaultsOf(channel), /gpt-5'/, `${channel} should not default to retiring gpt-5`);
+    assert.match(defaultsOf(channel), /openai\/gpt-5\.6-sol/);
+  }
+  for (const channel of ['zenmux', 'zenmux_anthropic']) {
+    assert.doesNotMatch(defaultsOf(channel), /claude-sonnet-4/);
+  }
+
+  assert.doesNotMatch(defaultsOf('aihubmix_anthropic'), /claude-sonnet-4|gpt-4o/);
+  assert.doesNotMatch(defaultsOf('aihubmix'), /claude-sonnet-4|gpt-4o|'gemini-3-(pro|flash)'|DeepSeek-V3\.2-Exp|Kimi-K2-0905/);
+  assert.match(defaultsOf('aihubmix'), /'gemini-3\.8-flash'/);
+  assert.doesNotMatch(defaultsOf('aihubmix'), /gemini-3\.6-flash/);
+  assert.match(defaultsOf('aihubmix'), /'claude-sonnet-5-5'/);
+  assert.match(defaultsOf('aihubmix'), /'gpt-5\.6-sol'/);
+  assert.doesNotMatch(defaultsOf('aihubmix_anthropic'), /gemini-3-pro|DeepSeek-V3\.2-Exp/);
+
+  assert.doesNotMatch(defaultsOf('openrouter'), /claude-(opus|sonnet)-4'|kimi-k2:free/);
+  assert.match(defaultsOf('openrouter'), /anthropic\/claude-opus-5\.5/);
+  assert.match(defaultsOf('openrouter'), /anthropic\/claude-sonnet-5\.5/);
 });

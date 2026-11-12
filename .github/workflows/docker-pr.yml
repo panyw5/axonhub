@@ -1,0 +1,37 @@
+# Test full Docker image build on PRs to unstable
+# Delegates the native-architecture build matrix to the shared reusable
+# workflow docker-build.yml (mode: test), which never logs in, tags, or
+# pushes an image.
+
+name: Docker build (PR)
+
+on:
+  pull_request:
+    branches:
+      - unstable
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
+jobs:
+  changes:
+    name: Changes
+    uses: ./.github/workflows/changes.yml
+    permissions:
+      contents: read
+      pull-requests: read
+
+  docker-build:
+    name: Docker build (test)
+    needs: changes
+    if: needs.changes.outputs.docker == 'true'
+    uses: ./.github/workflows/docker-build.yml
+    with:
+      mode: test
+      ref: ${{ github.sha }}
+    permissions:
+      contents: read

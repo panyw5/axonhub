@@ -33,6 +33,7 @@ import {
   Ollama,
   OpenCode,
   Groq,
+  Cloudflare,
 } from '@lobehub/icons';
 import { Bot } from 'lucide-react';
 import { AtlasCloudIcon } from '../components/atlas-cloud-icon';
@@ -175,6 +176,12 @@ export const PROVIDER_CONFIGS: Record<string, ProviderConfig> = {
     icon: TypeSafeIcon,
     color: 'bg-blue-100 text-blue-800 border-blue-200',
     channelTypes: ['typesafe'],
+  },
+  cloudflare: {
+    provider: 'cloudflare',
+    icon: Cloudflare,
+    color: 'bg-orange-100 text-orange-800 border-orange-200',
+    channelTypes: ['cloudflare'],
   },
   xai: {
     provider: 'xai',

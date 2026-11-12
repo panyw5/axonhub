@@ -14,6 +14,7 @@ import (
 	"github.com/looplj/axonhub/internal/ent/providerquotastatus"
 	"github.com/looplj/axonhub/internal/log"
 	"github.com/looplj/axonhub/internal/objects"
+	"github.com/looplj/axonhub/internal/server/biz"
 	"github.com/samber/lo"
 )
 
@@ -115,6 +116,14 @@ func (r *channelResolver) ProviderQuotaStatus(ctx context.Context, obj *ent.Chan
 			return nil, fmt.Errorf("failed to load provider quota type: %w", err)
 		}
 		pqs.ProviderType = provider.ProviderType
+	}
+
+	if !biz.IsSupportedProviderQuotaType(pqs.ProviderType.String()) {
+		// Rows created before a provider type was retired (e.g. 'wafer')
+		// remain in the database until purge runs. Surface them as "no
+		// status" instead of an unsupported-type error so one orphan row
+		// cannot break the quota view for every channel.
+		return nil, nil
 	}
 
 	enabled, err := r.systemService.IsProviderQuotaCollectionEnabled(ctx, pqs.ProviderType.String())
@@ -547,10 +556,6 @@ func (r *queryResolver) Threads(ctx context.Context, after *entgql.Cursor[int], 
 func (r *queryResolver) Traces(ctx context.Context, after *entgql.Cursor[int], first *int, before *entgql.Cursor[int], last *int, orderBy *ent.TraceOrder, where *ent.TraceWhereInput) (*ent.TraceConnection, error) {
 	if err := validatePaginationArgs(first, last); err != nil {
 		return nil, err
-	}
-
-	if orderBy != nil && orderBy.Field.String() == "CREATED_AT" {
-		orderBy.Field = ent.DefaultTraceOrder.Field
 	}
 
 	return r.client.Trace.Query().Paginate(ctx, after, first, before, last,

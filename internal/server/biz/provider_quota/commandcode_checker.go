@@ -13,6 +13,7 @@ import (
 	"github.com/looplj/axonhub/internal/ent"
 	"github.com/looplj/axonhub/internal/ent/channel"
 	"github.com/looplj/axonhub/llm/httpclient"
+	"github.com/looplj/axonhub/llm/transformer/commandcode"
 )
 
 const (
@@ -29,6 +30,7 @@ const (
 	//nolint:gosec // Public endpoint URL, not a credential.
 	commandCodeInternalSubscriptionsURL = commandCodeAPIBaseURL + "/internal/billing/subscriptions"
 	commandCodeQuotaUserAgent           = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+	commandCodeCLIUserAgent             = "cli"
 	commandCodeMaxResetEpochMillis      = 1e15
 )
 
@@ -192,20 +194,29 @@ func commandCodeFetchQuota(
 }
 
 // commandCodeGet authenticates with the API key when one is supplied, otherwise
-// with the session cookie.
+// with the session cookie. API-key calls hit the /alpha/* surface the CLI uses
+// and send the CLI's header shape; cookie calls keep the Studio browser shape.
 func commandCodeGet(ctx context.Context, hc *httpclient.HttpClient, url, cookie, apiKey string) ([]byte, error) {
 	builder := httpclient.NewRequestBuilder().
 		WithMethod(http.MethodGet).
-		WithURL(url).
-		WithHeader("Accept", "application/json, text/plain, */*").
-		WithHeader("Accept-Language", "en-US,en;q=0.9").
-		WithHeader("User-Agent", commandCodeQuotaUserAgent).
-		WithHeader("Origin", "https://commandcode.ai").
-		WithHeader("Referer", "https://commandcode.ai/")
+		WithURL(url)
 	if apiKey != "" {
-		builder = builder.WithBearerToken(apiKey)
+		builder = builder.
+			WithHeader("Accept", "*/*").
+			WithHeader("Accept-Language", "*").
+			WithHeader("Sec-Fetch-Mode", "cors").
+			WithHeader("User-Agent", commandCodeCLIUserAgent).
+			WithHeader("X-Command-Code-Version", commandcode.Version).
+			WithHeader("X-Cli-Environment", "production").
+			WithBearerToken(apiKey)
 	} else {
-		builder = builder.WithHeader("Cookie", cookie)
+		builder = builder.
+			WithHeader("Accept", "application/json, text/plain, */*").
+			WithHeader("Accept-Language", "en-US,en;q=0.9").
+			WithHeader("User-Agent", commandCodeQuotaUserAgent).
+			WithHeader("Origin", "https://commandcode.ai").
+			WithHeader("Referer", "https://commandcode.ai/").
+			WithHeader("Cookie", cookie)
 	}
 
 	resp, err := hc.Do(ctx, builder.Build())

@@ -497,6 +497,7 @@ func (svc *ChannelService) buildNonDefaultEndpointOutbound(
 					BaseURL:        baseURL,
 					EndpointPath:   ep.Path,
 					APIKeyProvider: provider,
+					HTTPClient:     ch.HTTPClient,
 				})
 			})
 		}
@@ -1445,6 +1446,7 @@ func (svc *ChannelService) buildChannelWithTransformer(c *ent.Channel, apiKeyOve
 		transformer, err := commandcodetransformer.NewOutboundTransformerWithConfig(&commandcodetransformer.Config{
 			BaseURL:        c.BaseURL,
 			APIKeyProvider: apiKeyProvider,
+			HTTPClient:     ch.HTTPClient,
 		})
 		if err != nil {
 			return nil, fmt.Errorf("failed to create outbound transformer: %w", err)

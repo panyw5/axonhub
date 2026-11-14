@@ -888,8 +888,14 @@ func (f *ModelFetcher) prepareModelsEndpointWithVertexBinding(channelType channe
 		baseURL = strings.TrimSuffix(baseURL, "/anthropic")
 		baseURL = strings.TrimSuffix(baseURL, "/claude")
 		// CLI inference uses the root host, but the public model catalog is under /provider/v1.
+		// The official CLI GETs /provider/v1/models?view=client with a plain
+		// accept: application/json header and no auth headers.
 		if !useRawURL && baseURL == "https://api.commandcode.ai" {
-			return baseURL + "/provider/v1/models", headers
+			headers.Set("Accept", "application/json")
+			headers.Set("Accept-Language", "*")
+			headers.Set("Sec-Fetch-Mode", "cors")
+			headers.Set("User-Agent", "node")
+			return baseURL + "/provider/v1/models?view=client", headers
 		}
 
 		if useRawURL {

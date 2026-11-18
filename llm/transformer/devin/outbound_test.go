@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/samber/lo"
@@ -253,6 +254,171 @@ func TestDevinStreamIdentityAndBinarySignature(t *testing.T) {
 		require.Equal(t, data, restored)
 		require.Empty(t, typ)
 	}
+}
+
+func streamChat(t *testing.T, baseURL string) (func() bool, func() string, func() error, func() error) {
+	t.Helper()
+	pipe := pipeline.NewFactory(httpclient.NewHttpClient()).Pipeline(openai.NewInboundTransformer(), testOutbound(t, baseURL))
+	result, err := pipe.Process(context.Background(), &httpclient.Request{
+		Method: "POST", URL: "http://local",
+		Headers: http.Header{"Content-Type": {"application/json"}},
+		Body:    []byte(`{"model":"swe-2","stream":true,"messages":[{"role":"user","content":"Hello"}]}`),
+	})
+	require.NoError(t, err)
+	var output strings.Builder
+	return func() bool {
+			if result.EventStream.Next() {
+				output.Write(result.EventStream.Current().Data)
+				return true
+			}
+			return false
+		}, func() string { return output.String() },
+		func() error { return result.EventStream.Err() },
+		func() error { return result.EventStream.Close() }
+}
+
+func TestDevinStreamResume(t *testing.T) {
+	frame := func(outputID, text string) []byte {
+		return append(pbString(1, outputID), pbString(3, text)...)
+	}
+	truncated := func(frames ...[]byte) []byte {
+		var body []byte
+		for _, f := range frames {
+			body = append(body, WrapConnectEnvelope(f)...)
+		}
+		return body
+	}
+
+	t.Run("replay is deduplicated", func(t *testing.T) {
+		var attempts int32
+		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", connectContentType)
+			if atomic.AddInt32(&attempts, 1) == 1 {
+				_, _ = w.Write(truncated(frame("gen-1", "Hel"), frame("gen-1", "lo")))
+				return
+			}
+			_, _ = w.Write(responseBody(frame("gen-1", "Hel"), frame("gen-1", "lo"), frame("gen-1", " world")))
+		}))
+		defer upstream.Close()
+		next, out, errFn, closeFn := streamChat(t, upstream.URL)
+		defer closeFn()
+		for next() {
+		}
+		require.NoError(t, errFn())
+		require.Equal(t, int32(2), atomic.LoadInt32(&attempts))
+		require.Equal(t, 1, strings.Count(out(), `"Hel"`), "replayed frames must not reach the client twice")
+		require.Equal(t, 1, strings.Count(out(), `"lo"`))
+		require.Equal(t, 1, strings.Count(out(), `" world"`))
+	})
+
+	t.Run("resume before any frame", func(t *testing.T) {
+		var attempts int32
+		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", connectContentType)
+			if atomic.AddInt32(&attempts, 1) == 1 {
+				return
+			}
+			_, _ = w.Write(responseBody(frame("gen-1", "done")))
+		}))
+		defer upstream.Close()
+		next, out, errFn, closeFn := streamChat(t, upstream.URL)
+		defer closeFn()
+		for next() {
+		}
+		require.NoError(t, errFn())
+		require.Equal(t, int32(2), atomic.LoadInt32(&attempts))
+		require.Contains(t, out(), "done")
+	})
+
+	t.Run("continuation without replay", func(t *testing.T) {
+		var attempts int32
+		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", connectContentType)
+			if atomic.AddInt32(&attempts, 1) == 1 {
+				_, _ = w.Write(truncated(frame("gen-1", "Hel")))
+				return
+			}
+			_, _ = w.Write(responseBody(frame("gen-1", "lo"), frame("gen-1", " world")))
+		}))
+		defer upstream.Close()
+		next, out, errFn, closeFn := streamChat(t, upstream.URL)
+		defer closeFn()
+		for next() {
+		}
+		require.NoError(t, errFn())
+		require.Equal(t, 1, strings.Count(out(), `"Hel"`))
+		require.Equal(t, 1, strings.Count(out(), `"lo"`))
+		require.Equal(t, 1, strings.Count(out(), `" world"`))
+	})
+
+	t.Run("fresh generation aborts", func(t *testing.T) {
+		var attempts int32
+		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", connectContentType)
+			if atomic.AddInt32(&attempts, 1) == 1 {
+				_, _ = w.Write(truncated(frame("gen-1", "Hel")))
+				return
+			}
+			_, _ = w.Write(responseBody(frame("gen-2", "restart")))
+		}))
+		defer upstream.Close()
+		next, _, errFn, closeFn := streamChat(t, upstream.URL)
+		defer closeFn()
+		for next() {
+		}
+		require.ErrorIs(t, errFn(), llm.ErrStreamIncomplete)
+	})
+
+	t.Run("trailer-only resume aborts", func(t *testing.T) {
+		var attempts int32
+		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", connectContentType)
+			if atomic.AddInt32(&attempts, 1) == 1 {
+				_, _ = w.Write(truncated(frame("gen-1", "Hel")))
+				return
+			}
+			_, _ = w.Write(responseBody())
+		}))
+		defer upstream.Close()
+		next, _, errFn, closeFn := streamChat(t, upstream.URL)
+		defer closeFn()
+		for next() {
+		}
+		require.ErrorIs(t, errFn(), llm.ErrStreamIncomplete)
+	})
+
+	t.Run("trailer error is not resumed", func(t *testing.T) {
+		var attempts int32
+		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			atomic.AddInt32(&attempts, 1)
+			w.Header().Set("Content-Type", connectContentType)
+			_, _ = w.Write(append(truncated(frame("gen-1", "Hel")),
+				WrapConnectEnvelopeWithFlag(ConnectFlagEndStream, []byte(`{"error":{"code":"unavailable","message":"failed"}}`))...))
+		}))
+		defer upstream.Close()
+		next, _, errFn, closeFn := streamChat(t, upstream.URL)
+		defer closeFn()
+		for next() {
+		}
+		require.Error(t, errFn())
+		require.Equal(t, int32(1), atomic.LoadInt32(&attempts))
+	})
+
+	t.Run("resume budget exhausted", func(t *testing.T) {
+		var attempts int32
+		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			atomic.AddInt32(&attempts, 1)
+			w.Header().Set("Content-Type", connectContentType)
+			_, _ = w.Write(truncated(frame("gen-1", "Hel")))
+		}))
+		defer upstream.Close()
+		next, _, errFn, closeFn := streamChat(t, upstream.URL)
+		defer closeFn()
+		for next() {
+		}
+		require.ErrorIs(t, errFn(), llm.ErrStreamIncomplete)
+		require.Equal(t, int32(1+maxResumeAfterFrames), atomic.LoadInt32(&attempts))
+	})
 }
 
 func TestDevinRejectsBrokenStreams(t *testing.T) {

@@ -319,7 +319,11 @@ func (e *executor) DoStream(ctx context.Context, req *httpclient.Request) (strea
 	if err != nil {
 		return nil, err
 	}
-	return e.inner.DoStream(ctx, wire)
+	source, err := e.inner.DoStream(ctx, wire)
+	if err != nil {
+		return nil, err
+	}
+	return &resumeStream{ctx: ctx, exec: e.inner, req: wire, source: source}, nil
 }
 
 func (t *OutboundTransformer) TransformResponse(ctx context.Context, response *httpclient.Response) (*llm.Response, error) {

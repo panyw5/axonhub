@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -571,10 +572,11 @@ func (f *ModelFetcher) FetchModels(ctx context.Context, input FetchModelsInput) 
 		httpClient = httpClient.WithRejectRedirects()
 		catalogBaseURL := httpModelsBaseURL(input.BaseURL)
 		parsedCatalogURL, err := url.Parse(strings.TrimRight(catalogBaseURL, "/#"))
-		if err != nil || !strings.EqualFold(parsedCatalogURL.Scheme, "https") || parsedCatalogURL.Host == "" {
+		if err != nil || parsedCatalogURL.Host == "" ||
+			(!strings.EqualFold(parsedCatalogURL.Scheme, "https") && !isLoopbackHTTPURL(parsedCatalogURL)) {
 			return &FetchModelsResult{
 				Models: []ModelIdentify{},
-				Error:  lo.ToPtr("failed to prepare Codex models request: Codex catalog URL must use HTTPS"),
+				Error:  lo.ToPtr("failed to prepare Codex models request: Codex catalog URL must use HTTPS (HTTP is allowed only for loopback hosts)"),
 			}, nil
 		}
 		req, err = codex.ModelsRequest(ctx, oauth.NewAPIKeyTokenProvider(func(context.Context) string {
@@ -953,6 +955,22 @@ func (f *ModelFetcher) prepareModelsEndpointWithVertexBinding(channelType channe
 
 		return baseURL + "/v1/models", headers
 	}
+}
+
+// isLoopbackHTTPURL reports whether the URL targets this machine over plain
+// HTTP. Loopback traffic never leaves the host, so sending the channel
+// credential in clear text is acceptable for local relays. Anything else
+// (including non-loopback "localhost." subdomains) still requires HTTPS.
+func isLoopbackHTTPURL(u *url.URL) bool {
+	if !strings.EqualFold(u.Scheme, "http") {
+		return false
+	}
+	host := strings.TrimSuffix(u.Hostname(), ".")
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 // httpModelsBaseURL converts a channel's WebSocket endpoint to the matching

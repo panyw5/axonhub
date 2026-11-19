@@ -197,6 +197,10 @@ func TestCommandCodeStreamCompletion(t *testing.T) {
 		{name: "EOF without finish"},
 		{name: "DONE without finish", trailer: "data: [DONE]"},
 	} {
+		wantEvidence := llm.AccountingEvidenceUnavailable
+		if tt.completed {
+			wantEvidence = llm.AccountingEvidenceExplicitFinal
+		}
 		t.Run(tt.name, func(t *testing.T) {
 			body := `{"type":"text-delta","text":"Hello"}` + "\n" + tt.trailer
 			raw := newJSONLDecoder(context.Background(), io.NopCloser(strings.NewReader(body)))
@@ -228,6 +232,8 @@ func TestCommandCodeStreamCompletion(t *testing.T) {
 			_, meta, err := outbound.AggregateStreamChunks(context.Background(), nil, chunks)
 			require.NoError(t, err)
 			require.Equal(t, tt.completed, meta.Completed)
+			require.Equal(t, wantEvidence, meta.AccountingEvidence)
+			require.Equal(t, tt.completed, meta.AccountingFinal(llm.SourceEndUnknown))
 		})
 	}
 }

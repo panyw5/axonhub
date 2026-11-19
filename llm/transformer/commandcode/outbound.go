@@ -909,7 +909,13 @@ func (t *OutboundTransformer) AggregateStreamChunks(ctx context.Context, req *ht
 	if err != nil {
 		return nil, llm.ResponseMeta{}, fmt.Errorf("failed to marshal Command Code response: %w", err)
 	}
-	return body, llm.ResponseMeta{ID: response.ID, Usage: response.Usage, Completed: completed}, nil
+	// The finish event is this protocol's terminal, usage-bearing event: when it
+	// arrives, totalUsage is the provider's authoritative final accounting.
+	evidence := llm.AccountingEvidenceUnavailable
+	if completed {
+		evidence = llm.AccountingEvidenceExplicitFinal
+	}
+	return body, llm.ResponseMeta{ID: response.ID, Usage: response.Usage, Completed: completed, AccountingEvidence: evidence}, nil
 }
 
 var _ transformer.Outbound = (*OutboundTransformer)(nil)

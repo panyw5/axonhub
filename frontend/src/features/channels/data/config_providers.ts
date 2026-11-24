@@ -5,6 +5,7 @@ import {
   Cline,
   Google,
   DeepSeek,
+  Mistral,
   Doubao,
   Moonshot,
   Zhipu,
@@ -92,6 +93,12 @@ export const PROVIDER_CONFIGS: Record<string, ProviderConfig> = {
     icon: FennoIcon,
     color: 'bg-[#EEF2FF] text-[#3155C6] border-[#C7D2FE]',
     channelTypes: ['fenno'],
+  },
+  mistral: {
+    provider: 'mistral',
+    icon: Mistral,
+    color: 'bg-orange-100 text-orange-800 border-orange-200',
+    channelTypes: ['mistral_vibe'],
   },
   deepseek: {
     provider: 'deepseek',

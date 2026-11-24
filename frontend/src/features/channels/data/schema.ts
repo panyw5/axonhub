@@ -91,6 +91,7 @@ export const channelTypeSchema = z.enum([
   'gemini_openai',
   'gemini',
   'gemini_vertex',
+  'mistral_vibe',
   'deepseek',
   'deepseek_anthropic',
   'deepinfra',

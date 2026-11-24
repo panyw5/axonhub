@@ -1280,6 +1280,7 @@ enum ChannelType @goModel(model: "github.com/looplj/axonhub/internal/ent/channel
   gemini_openai
   gemini
   gemini_vertex
+  mistral_vibe
   deepseek
   deepseek_anthropic
   deepinfra

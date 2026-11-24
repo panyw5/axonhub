@@ -273,6 +273,7 @@ var defaultEndpointsForChannelType = map[channel.Type][]objects.ChannelEndpoint{
 		{APIFormat: llm.APIFormatGeminiContents.String()},
 		{APIFormat: llm.APIFormatGeminiEmbedding.String()},
 	},
+	channel.TypeMistralVibe:       {{APIFormat: llm.APIFormatOpenAIChatCompletion.String()}},
 	channel.TypeDeepseek:          {{APIFormat: llm.APIFormatOpenAIChatCompletion.String()}, {APIFormat: llm.APIFormatOpenAICompletion.String()}},
 	channel.TypeDeepseekAnthropic: {{APIFormat: llm.APIFormatAnthropicMessage.String()}},
 	channel.TypeDeepinfra:         openAICompatibleDefaultEndpoints,

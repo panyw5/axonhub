@@ -39,6 +39,7 @@ import (
 	"github.com/looplj/axonhub/llm/transformer/jina"
 	"github.com/looplj/axonhub/llm/transformer/longcat"
 	"github.com/looplj/axonhub/llm/transformer/minimax"
+	"github.com/looplj/axonhub/llm/transformer/mistral"
 	"github.com/looplj/axonhub/llm/transformer/modelscope"
 	"github.com/looplj/axonhub/llm/transformer/moonshot"
 	"github.com/looplj/axonhub/llm/transformer/nanogpt"
@@ -482,6 +483,10 @@ func (svc *ChannelService) buildNonDefaultEndpointOutbound(
 			return devin.NewOutboundTransformerWithConfig(&devin.Config{BaseURL: baseURL, EndpointPath: ep.Path, APIKeyProvider: provider})
 		})
 	case llm.APIFormatOpenAIChatCompletion.String():
+		if c.Type == channel.TypeMistralVibe {
+			outbound, _, err := newProviderChatOutbound(c.Type, ch, baseURL, ep.Path)
+			return outbound, err
+		}
 		if c.Type == channel.TypeCline {
 			return withAPIKey(func(provider auth.APIKeyProvider) (transformer.Outbound, error) {
 				return cline.NewOutboundTransformerWithConfig(&cline.Config{
@@ -694,6 +699,13 @@ func newProviderChatOutbound(
 	// Resolve the key only after the type matches, so a channel without an API
 	// key is not rejected before the generic builder gets a chance to handle it.
 	switch channelType {
+	case channel.TypeMistralVibe:
+		apiKeyProvider, err := getAPIKeyProvider(ch)
+		if err != nil {
+			return nil, true, err
+		}
+		outbound, err := mistral.NewOutboundTransformer(baseURL, endpointPath, apiKeyProvider)
+		return outbound, true, err
 	case channel.TypeZai, channel.TypeZhipu, channel.TypeZhipuAnthropic, channel.TypeZaiAnthropic:
 		apiKeyProvider, err := getAPIKeyProvider(ch)
 		if err != nil {
@@ -957,7 +969,7 @@ func (svc *ChannelService) buildChannelWithTransformer(c *ent.Channel, apiKeyOve
 		ch.Outbound = transformer
 
 		return ch, nil
-	case channel.TypeZai, channel.TypeZhipu:
+	case channel.TypeMistralVibe, channel.TypeZai, channel.TypeZhipu:
 		transformer, _, err := newProviderChatOutbound(c.Type, ch, c.BaseURL, "")
 		if err != nil {
 			return nil, fmt.Errorf("failed to create outbound transformer: %w", err)

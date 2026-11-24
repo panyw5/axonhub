@@ -5,6 +5,7 @@ import {
   Cline,
   Google,
   DeepSeek,
+  Mistral,
   Doubao,
   Moonshot,
   Zhipu,
@@ -151,6 +152,14 @@ export const CHANNEL_CONFIGS: Record<ChannelType, ChannelConfig> = {
     apiFormat: GEMINI_CONTENTS,
     color: 'bg-green-100 text-green-800 border-green-200',
     icon: Google,
+  },
+  mistral_vibe: {
+    channelType: 'mistral_vibe',
+    baseURL: 'https://api.mistral.ai/v1',
+    defaultModels: ['mistral-vibe-cli-latest'],
+    apiFormat: OPENAI_CHAT_COMPLETIONS,
+    color: 'bg-orange-100 text-orange-800 border-orange-200',
+    icon: Mistral,
   },
   deepseek: {
     channelType: 'deepseek',
@@ -963,6 +972,7 @@ export type Provider =
   | 'cline'
   | 'anthropic'
   | 'claudecode'
+  | 'mistral'
   | 'deepseek'
   | 'deepinfra'
   | 'gemini'
@@ -1019,6 +1029,7 @@ export const CHANNEL_TYPE_TO_PROVIDER: Record<ChannelType, Provider> = {
   anthropic_aws: 'anthropic',
   anthropic_gcp: 'anthropic',
   anthropic_fake: 'anthropic',
+  mistral_vibe: 'mistral',
   deepseek: 'deepseek',
   deepseek_anthropic: 'deepseek',
   deepinfra: 'deepinfra',
